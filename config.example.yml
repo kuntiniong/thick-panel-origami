@@ -1,0 +1,17 @@
+simulations:
+  - name: mountain-thick
+    use_gui: true
+    fast: true
+    material_type: 1
+    ref_target: false
+    thick_mode: true
+    unit_edge_max: 4
+
+  # === Add more simulations below as needed ===
+  # - name: bird4
+  #   use_gui: false
+  #   fast: true
+  #   material_type: 1
+  #   ref_target: false
+  #   thick_mode: false
+  #   unit_edge_max: 4

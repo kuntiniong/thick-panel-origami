@@ -3,6 +3,7 @@ import taichi.math as tm
 import json
 import time, os
 from ori_sim_sys import *
+import yaml
 
 data_type = ti.f64
 numpy_data_type = np.float64
@@ -2434,14 +2435,50 @@ class PD_Origami_Simulator:
             self.appendCreaseInfo()
 
 if __name__ == '__main__':
-    ori_name_list = ["mountain-thick"]
-    output_fig = 0
-    fast_mode = not output_fig
 
-    # TARGET DEFINITION INTERFACE
-    for ori_name in ori_name_list:
-        if ori_name in ["mountain-thick", "bird4", "auxetic", "miura", "mountain-big-new", "huffman-box", "miyamotoTower"]:
-            ori = PD_Origami_Simulator(ori_name, use_gui=True, fast=fast_mode, material_type=1, ref_target=0)
-            ori.start(ori_name, 4, thick_mode=0)
-    
-    ori.run()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(base_dir, "config.yml")
+    example_path = os.path.join(base_dir, "config.example.yml")
+
+    # load config.yml with fallback to config.example.yml
+    if os.path.exists(config_path):
+        config_file_used = config_path
+    elif os.path.exists(example_path):
+        config_file_used = example_path
+        print("config.yml not found. Falling back to config.example.yml")
+
+    with open(config_file_used, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    simulations = config.get("simulations", [])
+    if not simulations:
+        print("No simulations defined in config file.")
+        exit(0)
+
+    for sim in simulations:
+        name = sim["name"]
+
+        print(f"\n{'='*60}")
+        print(f"Starting simulation: {name}")
+        print(f"{'='*60}")
+
+        ori = PD_Origami_Simulator(
+            origami_name=name,
+            use_gui=sim.get("use_gui", True),          # headless mode if False
+            fast=sim.get("fast", True),                # save images only when not in fast simulation mode
+            material_type=sim.get("material_type", 1),
+
+            ref_target=sim.get("ref_target", False),
+            damping=sim.get("damping", 0.95),
+            pd_local_time=sim.get("pd_local_time", 1),
+            pd_global_time=sim.get("pd_global_time", 1),
+            pd_iter_time=sim.get("pd_iter_time", 5),
+        )
+
+        ori.start(
+            filepath=name,
+            unit_edge_max=sim.get("unit_edge_max", 4),
+            thick_mode=sim.get("thick_mode", False),   # thick origami if True
+        )
+
+        ori.run()

@@ -1,3 +1,10 @@
+# environment config & cache files
 __pycache__/
 .vscode/
-physResult
+imgui.ini
+
+# results
+physResult/
+
+# config file
+config.yml
