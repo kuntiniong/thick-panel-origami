@@ -377,7 +377,7 @@ class ThickPanelDesignFramework:
             self.simulator = OrigamiSimulator(
                 origami_name=batch_json_name,
                 use_gui=self.use_gui,
-                fast=True, ref_target=1
+                fast=True, ref_target=1, verbose=0,
             )
 
             self.simulator.ID = algo_step
@@ -600,8 +600,8 @@ def main():
         return
     
     # 参数设置
-    BATCH_SIZE = 25  # 每次仿真评估的候选解数量（CMA-ES种群大小）
-    POPULATION_SIZE = BATCH_SIZE * 4
+    BATCH_SIZE = 50  # 每次仿真评估的候选解数量（CMA-ES种群大小）
+    POPULATION_SIZE = BATCH_SIZE * 5
     
     # 创建设计框架
     framework = ThickPanelDesignFramework(
@@ -618,7 +618,7 @@ def main():
     best_solution, best_fitness = framework.optimize(
         population_size=POPULATION_SIZE,  # CMA-ES种群大小等于batch_size
         generations=200,       # 最大迭代代数
-        sigma_init=50.0,       # 初始变异强度
+        sigma_init=5.0,       # 初始变异强度
         verbose=True
     )
     
