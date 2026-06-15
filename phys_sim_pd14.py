@@ -4,8 +4,8 @@ import json
 import time, os
 from ori_sim_sys import *
 
-data_type = ti.f64
-numpy_data_type = np.float64
+data_type = ti.f32
+numpy_data_type = np.float32
 use_gpu = 0
 
 if use_gpu:
@@ -15,7 +15,7 @@ else:
 
 @ti.data_oriented
 class PD_Origami_Simulator:
-    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.95, material_type=1, ref_target=False):
+    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.95, material_type=1, ref_target=False, verbose=False):
         self.use_gui = use_gui
         self.ID = 0
 
@@ -25,6 +25,7 @@ class PD_Origami_Simulator:
 
         self.material_type = material_type
         self.ref_target = ref_target
+        self.verbose = verbose
 
         self.split_origami_num = 1
         self.split_start_index = []
@@ -255,13 +256,16 @@ class PD_Origami_Simulator:
         self.bending_num_param = ti.field(dtype=int, shape=())
         self.facet_bending_num_param = ti.field(dtype=int, shape=())
 
-        self.spring_cons_num = int(np.count_nonzero(np.array(self.connection_matrix)) // 2 + 3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))]))
+        # self.spring_cons_num = int(np.count_nonzero(np.array(self.connection_matrix)) // 2 + 3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))]))
+        self.spring_cons_num = int(np.count_nonzero(np.array(self.connection_matrix)) // 2 + self.maximum_number_of_thick_panel_spring)
         self.bending_cons_num = len(self.crease_pairs)
-        self.facet_bending_cons_num = len(self.facet_crease_pairs)
+        # self.facet_bending_cons_num = len(self.facet_crease_pairs)
+        self.facet_bending_cons_num = self.maximum_facet_crease_number
 
-        print(f"# of Spring constraints: {np.count_nonzero(np.array(self.connection_matrix)) // 2} + {3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))])}\n" + \
-              f"# of Bending constraints: {self.bending_cons_num}\n" + \
-              f"# of Facet bending constraints: {self.facet_bending_cons_num}")
+        if self.verbose:
+            print(f"# of Spring constraints: {np.count_nonzero(np.array(self.connection_matrix)) // 2} in-panel + {3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))])} out-of-panel in practice, using maximum value {self.maximum_number_of_thick_panel_spring} to maximize the space\n" + \
+                f"# of Bending constraints: {self.bending_cons_num}\n" + \
+                f"# of Facet bending constraints: {self.facet_bending_cons_num} in practice, using maximum value {self.maximum_facet_crease_number} to maximize the space")
 
         # === 约束拓扑索引（拆分为 3 种约束各自独立的 field，避免 base 偏移计算） ===
 
@@ -454,6 +458,9 @@ class PD_Origami_Simulator:
             
         else:
             unit_mapping = []
+            self.maximum_number_of_thick_panel = 0
+            self.maximum_number_of_thick_panel_spring = 0
+            self.maximum_facet_crease_number = 0
             for i in range(len(input_json["lines"])):
                 line_start = input_json["lines"][i][START]
 
@@ -505,6 +512,7 @@ class PD_Origami_Simulator:
                 kps = deepcopy(input_json["units"][i])
                 # check different height
                 height_parameters = []
+                current_possible_thick_panel_number = 0
                 for j in range(0, -len(kps), -1):
                     crease_type = BORDER
                     hard = False
@@ -513,10 +521,16 @@ class PD_Origami_Simulator:
                     for line in self.lines:
                         if (distance(line[START], current_kp) < 1e-3 and distance(line[END], next_kp) < 1e-3) or \
                             (distance(line[END], current_kp) < 1e-3 and distance(line[START], next_kp) < 1e-3):
+                                self.maximum_number_of_thick_panel += 1
+                                current_possible_thick_panel_number += 1
+                                self.maximum_facet_crease_number += len(kps) - 3
                                 if (line.getType() == VALLEY or line.getType() == MOUNTAIN) and line.thick_panel_height not in height_parameters:
                                     height_parameters.append(line.thick_panel_height)
                                 break
-                
+
+                self.maximum_number_of_thick_panel_spring += 3 * len(kps) * (current_possible_thick_panel_number - 1)    
+                height_parameters.sort()
+
                 unit_mapping.append([len(self.units) + k for k in range(len(height_parameters))])
                 if i == 0 and len(height_parameters) >= 2:
                     self.connected_unit_pairs += [[0, x] for x in range(1, len(height_parameters))]
@@ -578,6 +592,9 @@ class PD_Origami_Simulator:
                         self.contributions.append(new_contribution)
                     except:
                         pass
+            
+            if self.verbose:
+                print(f"Maximum thick panels in theory: {self.maximum_number_of_thick_panel}\nMaximum thick panel spring in theory: {self.maximum_number_of_thick_panel_spring}\nMaximum facet crease in theory: {self.maximum_facet_crease_number}")
                         
         if len(self.contributions) == 0:
             self.contributions.append([])
@@ -601,11 +618,15 @@ class PD_Origami_Simulator:
         # calculate max length of view
         self.max_size, max_x, max_y = getMaxDistance(self.kps)
         self.total_bias = getTotalBias(self.units)
+        self.unit_mapping = unit_mapping
         
         self.commonStart_1(unit_edge_max, thick_mode)
     
         self.commonStart_2()
 
+    def getUnitMapping(self):
+        return self.unit_mapping
+    
     @ti.kernel
     def fill_line_vertex(self):
         for i in ti.ndrange(self.line_total_indice_num):
@@ -669,6 +690,7 @@ class PD_Origami_Simulator:
                         numpy_split_connection      : ti.types.ndarray(),
                         numpy_additional_kp_ori_id  : ti.types.ndarray(),
                         numpy_target_angle          : ti.types.ndarray(),
+                        verbose                     : bool,
         ):
         self.fix_id_list.fill(-1)
         self.AK_field.fill(0.)
@@ -955,7 +977,7 @@ class PD_Origami_Simulator:
                     thick_count += 1
                 current_connection_pos += 1
             
-        if (spring_count + thick_count) < self.spring_num_param[None]:
+        if verbose and (spring_count + thick_count) < self.spring_num_param[None]:
             print(f"Warning: real spring count is {spring_count} + {thick_count} = {(spring_count + thick_count)}, less than {self.spring_num_param[None]}")
             self.spring_num_param[None] = spring_count + thick_count
 
@@ -1309,7 +1331,8 @@ class PD_Origami_Simulator:
             numpy_split_facet_id,
             numpy_split_connection,
             numpy_additional_kp_origami_id,
-            numpy_target_angle
+            numpy_target_angle,
+            self.verbose,
         )
 
         # print(self.spring_selection_corresponding_origami_id, self.bending_selection_corresponding_origami_id, self.facet_bending_selection_corresponding_origami_id)
@@ -2440,8 +2463,8 @@ if __name__ == '__main__':
 
     # TARGET DEFINITION INTERFACE
     for ori_name in ori_name_list:
-        if ori_name in ["mountain-thick", "bird4", "auxetic", "miura", "mountain-big-new", "huffman-box", "miyamotoTower"]:
+        if ori_name in ["mountain-thick", "bird4", "auxetic", "miura", "mountain-big-new_batch_25", "huffman-box", "miyamotoTower"]:
             ori = PD_Origami_Simulator(ori_name, use_gui=True, fast=fast_mode, material_type=1, ref_target=0)
-            ori.start(ori_name, 4, thick_mode=0)
+            ori.start(ori_name, 4, thick_mode=1)
     
     ori.run()
