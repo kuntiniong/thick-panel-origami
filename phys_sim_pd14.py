@@ -5,9 +5,14 @@ import time, os
 from ori_sim_sys import *
 import yaml
 
-data_type = ti.f64
-numpy_data_type = np.float64
-use_gpu = 0
+use_gpu = 1
+
+if use_gpu:
+    data_type = ti.f32
+    numpy_data_type = np.float32
+else:
+    data_type = ti.f64
+    numpy_data_type = np.float64
 
 if use_gpu:
     ti.init(arch=ti.gpu, default_fp=data_type, fast_math=False, advanced_optimization=False, kernel_profiler=True)
@@ -1269,7 +1274,7 @@ class PD_Origami_Simulator:
         if len(self.target):
             numpy_target_angle = np.array(self.target, dtype=numpy_data_type)
         else:
-            numpy_target_angle = np.array([0.])
+            numpy_target_angle = np.array([0.], dtype=numpy_data_type)
                     
         # initialize!
         self.initialize(

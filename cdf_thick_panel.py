@@ -23,7 +23,7 @@ import gc
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from phys_sim_pd14 import PD_Origami_Simulator as OrigamiSimulator
-from phys_sim_pd14 import ti, data_type, numpy_data_type
+from phys_sim_pd14 import ti, data_type, use_gpu
 
 class ThickPanelDesignFramework:
     """
@@ -312,13 +312,19 @@ class ThickPanelDesignFramework:
                     constrained[i] = self._discretize_offset(constrained[i])
         
         return constrained
-    
+
     def _init_ti(self):
         """安全初始化 Taichi，避免重复初始化。
         Safely initialize Taichi to avoid re-init errors."""
         try:
-            ti.init(arch=ti.cpu, default_fp=data_type,
-                    fast_math=False, advanced_optimization=False, verbose=False)
+            if use_gpu:
+                ti.init(arch=ti.gpu, default_fp=data_type,
+                        fast_math=False, advanced_optimization=False, kernel_profiler=True)
+            else:
+                ti.init(arch=ti.cpu, default_fp=data_type,
+                        fast_math=False, advanced_optimization=False,
+                        cpu_max_num_threads=1, kernel_profiler=False, verbose=False)
+            # ti.init(arch=ti.cpu, default_fp=data_type, fast_math=False, advanced_optimization=False, cpu_max_num_threads=1, kernel_profiler=False, verbose=False)
         except Exception:
             pass
 
@@ -600,8 +606,8 @@ def main():
         return
     
     # 参数设置
-    BATCH_SIZE = 25  # 每次仿真评估的候选解数量（CMA-ES种群大小）
-    POPULATION_SIZE = BATCH_SIZE * 1
+    BATCH_SIZE = 40  # 每次仿真评估的候选解数量（CMA-ES种群大小）
+    POPULATION_SIZE = BATCH_SIZE * 10
     
     # 创建设计框架
     framework = ThickPanelDesignFramework(
