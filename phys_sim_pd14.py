@@ -5,7 +5,7 @@ import time, os
 from ori_sim_sys import *
 import yaml
 
-use_gpu = 1
+use_gpu = 0
 
 if use_gpu:
     data_type = ti.f32
@@ -14,14 +14,45 @@ else:
     data_type = ti.f64
     numpy_data_type = np.float64
 
-if use_gpu:
-    ti.init(arch=ti.gpu, default_fp=data_type, fast_math=False, advanced_optimization=False, kernel_profiler=True)
-else:
-    ti.init(arch=ti.cpu, default_fp=data_type, fast_math=False, advanced_optimization=False, cpu_max_num_threads=1, kernel_profiler=False, verbose=False)
+_taichi_initialized = False
+
+
+def ensure_taichi_init(force_cpu: bool = False):
+    """Lazy Taichi init so multiprocessing workers do not JIT-compile concurrently at import."""
+    global _taichi_initialized
+    if _taichi_initialized:
+        return
+    if use_gpu and not force_cpu:
+        ti.init(
+            arch=ti.gpu,
+            default_fp=data_type,
+            fast_math=False,
+            advanced_optimization=False,
+            kernel_profiler=True,
+        )
+    else:
+        ti.init(
+            arch=ti.cpu,
+            default_fp=data_type,
+            fast_math=False,
+            advanced_optimization=False,
+            cpu_max_num_threads=1,
+            kernel_profiler=False,
+            verbose=False,
+        )
+    _taichi_initialized = True
+
+
+def mark_taichi_reset():
+    """Call after ti.reset() so the next simulation re-initializes Taichi."""
+    global _taichi_initialized
+    _taichi_initialized = False
+
 
 @ti.data_oriented
 class PD_Origami_Simulator:
     def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.95, material_type=1, ref_target=False):
+        ensure_taichi_init()
         self.use_gui = use_gui
         self.ID = 0
 
@@ -65,6 +96,7 @@ class PD_Origami_Simulator:
 
         self.time = time.strftime('%Y%m%d-%H%M%S', time.localtime())
         self.origami_name = origami_name
+        self.json_stem = origami_name
 
         self.image_id = 0
         if not self.fast_simulation_mode and use_gui:
@@ -374,9 +406,9 @@ class PD_Origami_Simulator:
     def start(self, filepath, unit_edge_max, thick_mode=False):
         # 存储厚板模式标志 / Store thick mode flag
         self.thick_mode_flag = thick_mode
-        self.origami_name = filepath
+        self.json_stem = filepath
 
-        with open("./descriptionData/" + filepath + ".json", 'r', encoding='utf-8') as fw:
+        with open("./descriptionData/" + self.json_stem + ".json", 'r', encoding='utf-8') as fw:
             input_json = json.load(fw)
         self.input_json = input_json
         self.kps = []
@@ -2309,10 +2341,10 @@ class PD_Origami_Simulator:
 
         self.canvas.scene(self.scene)
         try:
-            folder = f'./physResult/cdf-' + self.origami_name
+            folder = os.path.join('./physResult', self.origami_name)
             if not os.path.exists(folder):
                 os.makedirs(folder)
-            self.window.save_image(f'./physResult/cdf-' + self.origami_name + "/" + str(self.ID).zfill(8) + '.png')
+            self.window.save_image(os.path.join(folder, str(self.ID).zfill(8) + '.png'))
             print(f"Picture ID {str(self.ID).zfill(8)} is saved.")
         except:
             pass
@@ -2423,7 +2455,7 @@ class PD_Origami_Simulator:
         self.input_json["crease_info"] = [
             [self.kps[self.crease_pairs[i, 0]], self.kps[self.crease_pairs[i, 1]]] for i in range(self.crease_pairs_num)
         ]
-        with open("./descriptionData/" + self.origami_name + ".json", 'w', encoding='utf-8') as fw:
+        with open("./descriptionData/" + self.json_stem + ".json", 'w', encoding='utf-8') as fw:
             json.dump(self.input_json, fw, indent=4)
 
     def run(self):

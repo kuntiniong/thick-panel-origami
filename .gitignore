@@ -6,5 +6,13 @@ imgui.ini
 # results
 physResult/
 
+# generated batch simulation JSON (e.g. mountain-thick_batch_25.json)
+**/*_batch*.json
+
 # config file
 config.yml
+optimization/config.yml
+symmetry_grouping/config.yml
+
+# draft
+cdf_thick_panel-symm.py
