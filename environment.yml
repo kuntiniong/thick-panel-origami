@@ -1,13 +1,17 @@
 name: pygamic
 channels:
+  - conda-forge
   - defaults
+# optimization/framework.py uses stdlib multiprocessing (spawn on Windows); no extra package required
 dependencies:
-  - python=3.9.12
-  - pip=23.3.1
+  - python=3.10
+  - pip>=23.3
   - numpy<=1.26
   - pyyaml
+  - scipy
+  - scikit-learn
   - pip:
-    - taichi
+    - taichi>=1.7.4,<2
     - matplotlib
     - dxfgrabber
     - ezdxf
@@ -15,3 +19,4 @@ dependencies:
     - pyqt5-tools
     - cmaes
     - pandas
+    - scikit-optimize

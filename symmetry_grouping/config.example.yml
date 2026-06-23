@@ -1,0 +1,10 @@
+simulations:
+  - name: miura
+    # output: output/miura_visualization.png  # optional; defaults to output/{name}_visualization.png
+
+  # === Add more visualizations below as needed ===
+  # - name: miura-thick
+  #   output: output/miura-thick_visualization.png
+
+  # - name: mountain-thick
+  #   output: output/mountain-thick_visualization.png
