@@ -157,6 +157,22 @@ def _load_bo_framework_class():
     return ThickPanelBOFramework
 
 
+def _load_cma_margin_framework_class():
+    cma_margin_path = os.path.join(_optimization_dir(), "cma-es-margin.py")
+    spec = importlib.util.spec_from_file_location("optimization_cma_es_margin", cma_margin_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ThickPanelCMAMarginFramework
+
+
+def _load_cma_elitist_margin_framework_class():
+    path = os.path.join(_optimization_dir(), "cma-es-elitist-margin.py")
+    spec = importlib.util.spec_from_file_location("optimization_cma_es_elitist_margin", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ThickPanelCMAElitistMarginFramework
+
+
 def _common_optimize_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
     opt_cfg = config.get("optimization", {})
     framework_cfg = config.get("framework", {})
@@ -173,6 +189,24 @@ def _common_optimize_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
 def _cma_es_optimize_kwargs(config: Dict[str, Any], common: Dict[str, Any]) -> Dict[str, Any]:
     cma_cfg = config.get("cma_es", {})
     return {**common, "sigma_init": cma_cfg.get("sigma_init", 5.0)}
+
+
+def _cma_es_margin_optimize_kwargs(config: Dict[str, Any], common: Dict[str, Any]) -> Dict[str, Any]:
+    cma_cfg = config.get("cma_es_margin", config.get("cma_es", {}))
+    kwargs = {**common, "sigma_init": cma_cfg.get("sigma_init", 5.0)}
+    if "margin" in cma_cfg:
+        kwargs["margin"] = cma_cfg["margin"]
+    return kwargs
+
+
+def _cma_es_elitist_margin_optimize_kwargs(config: Dict[str, Any], common: Dict[str, Any]) -> Dict[str, Any]:
+    cma_cfg = config.get("cma_es_elitist_margin", config.get("cma_es_margin", config.get("cma_es", {})))
+    kwargs = {**common, "sigma_init": cma_cfg.get("sigma_init", 10.0)}
+    if "margin" in cma_cfg:
+        kwargs["margin"] = cma_cfg["margin"]
+    if "enc_m" in cma_cfg:
+        kwargs["enc_m"] = cma_cfg["enc_m"]
+    return kwargs
 
 
 def _bo_optimize_kwargs(config: Dict[str, Any], common: Dict[str, Any]) -> Dict[str, Any]:
@@ -212,7 +246,7 @@ def _build_result_prefix(spec: AlgorithmSpec, optimize_kwargs: Dict[str, Any]) -
                 f"rs{_format_param_token(optimize_kwargs['random_state'])}",
             ]
         )
-    elif spec.key == "cma_es":
+    elif spec.key in ("cma_es", "cma_es_margin", "cma_es_elitist_margin"):
         parts.append(f"sigma{_format_param_token(optimize_kwargs['sigma_init'])}")
 
     return "-".join(parts)
@@ -237,6 +271,26 @@ def register_builtin_algorithms() -> None:
             config_key="bo",
             framework_loader=_load_bo_framework_class,
             optimize_kwargs_builder=_bo_optimize_kwargs,
+        )
+    )
+    register_algorithm(
+        AlgorithmSpec(
+            key="cma_es_margin",
+            aliases=("cma-es-margin", "cma_es_margin", "cmaeswm"),
+            result_prefix="cma_es_margin",
+            config_key="cma_es_margin",
+            framework_loader=_load_cma_margin_framework_class,
+            optimize_kwargs_builder=_cma_es_margin_optimize_kwargs,
+        )
+    )
+    register_algorithm(
+        AlgorithmSpec(
+            key="cma_es_elitist_margin",
+            aliases=("cma-es-elitist-margin", "cma_es_elitist_margin", "cmaeswm_elitist"),
+            result_prefix="cma_es_elitist_margin",
+            config_key="cma_es_elitist_margin",
+            framework_loader=_load_cma_elitist_margin_framework_class,
+            optimize_kwargs_builder=_cma_es_elitist_margin_optimize_kwargs,
         )
     )
 

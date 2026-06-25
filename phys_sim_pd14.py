@@ -5,7 +5,7 @@ import time, os
 from ori_sim_sys import *
 import yaml
 
-use_gpu = 0
+use_gpu = 1
 
 if use_gpu:
     data_type = ti.f32
@@ -2376,11 +2376,25 @@ class PD_Origami_Simulator:
                 self.step_once = False
             self.current_t += self.dt
 
-    def reward(self):
+    def reward(self, mode: int = 2):
+        """
+        Compute per-origami reward.
+
+        mode 0 — energy divided by average folding percent (original):
+                    reward_i = E_i / avg(theta_i / pi)
+        mode 1 — pure folding penalty:
+                    reward_i = 1 - avg(theta_i / pi)
+        mode 2 — normalized version of mode 0 (max-normalized):
+                raw_i    = E_i / avg(theta_i / pi)
+                reward_i = raw_i / max(raw)
+
+        :param mode: selects the reward formulation (0, 1, or 2)
+        """
+
         reward_list = np.zeros(self.split_origami_num)
         individual_crease_num = self.crease_pairs_num // self.split_origami_num
 
-        if 1:
+        if mode == 0:
             for i in range(self.split_origami_num):
                 reward_list[i] = self.split_energy[i]
                 start_index = individual_crease_num * i
@@ -2391,7 +2405,7 @@ class PD_Origami_Simulator:
                 avg_folding_percent /= individual_crease_num
                 avg_folding_percent = max(1e-6, avg_folding_percent)
                 reward_list[i] /= avg_folding_percent
-        else:
+        elif mode == 1:
             for i in range(self.split_origami_num):
                 start_index = individual_crease_num * i
                 end_index = individual_crease_num * (i + 1)
@@ -2400,6 +2414,26 @@ class PD_Origami_Simulator:
                     avg_folding_percent += self.crease_angle[j]
                 avg_folding_percent /= individual_crease_num
                 reward_list[i] = 1. - avg_folding_percent
+        elif mode == 2:
+            # Normalized mode 0:
+            # raw_i = E_i / avg(theta_i/pi), then normalize by max(raw).
+            for i in range(self.split_origami_num):
+                start_index = individual_crease_num * i
+                end_index = individual_crease_num * (i + 1)
+                avg_folding_percent = 0.
+                for j in range(start_index, end_index):
+                    avg_folding_percent += self.crease_angle[j]
+                avg_folding_percent /= individual_crease_num
+                avg_folding_percent = max(1e-6, avg_folding_percent)
+                reward_list[i] = self.split_energy[i] / avg_folding_percent
+
+            raw_max = np.max(reward_list)
+            if raw_max > 1e-12:
+                reward_list = reward_list / raw_max
+            else:
+                reward_list.fill(0.)
+        else:
+            raise ValueError(f"Unknown reward mode {mode}. Choose 0, 1, or 2.")
 
         return reward_list
     

@@ -18,8 +18,26 @@ class ThickPanelBOFramework(ThickPanelDesignFramework):
     algorithm_key = "bo" # config.yml key for this algo
     result_prefix = "bo" # output result folder prefix
 
-    def _build_search_space(self) -> List[Real]:
-        """Build independent search dimensions matching CMA-ES bounds."""
+    def _build_search_space(self, normalize_by_length: bool = False) -> List[Real]:
+        """
+        Build independent search dimensions for Bayesian optimization.
+
+        :param normalize_by_length: When True, each dimension's bounds are
+            divided by the representative crease's length so the optimizer
+            works in length-normalized units.  Pass the returned candidates
+            through ``_denormalize_offsets_by_crease_length`` before
+            sending them to the simulator.
+        """
+        if normalize_by_length:
+            lengths = self._compute_crease_lengths()
+            return [
+                Real(
+                    -self.max_offset / max(lengths[self.independent_indices[group_idx]], 1.0),
+                    self.max_offset / max(lengths[self.independent_indices[group_idx]], 1.0),
+                    name=f"group_{group_idx}_crease_{self.independent_indices[group_idx]}",
+                )
+                for group_idx in range(self.num_independent)
+            ]
         return [
             Real(
                 -self.max_offset,
@@ -122,6 +140,7 @@ class ThickPanelBOFramework(ThickPanelDesignFramework):
                 print(f"  高度偏移量/Height offsets: {best_solution}")
                 print(f"  本轮最小/Iter min: {array_all_data.min():.4f}")
 
+            self._record_best_offset(constrained_list[current_best_idx])
             self.save_extract_data()
 
         print("\n" + "=" * 60)

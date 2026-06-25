@@ -1,8 +1,14 @@
 # Paste multiple full config blocks in this file to run them sequentially (first to last).
 # Each block can start with this header comment, a top-level "algorithm:" line, or "---".
 
-# Which optimizer to run: cma-es | bo
+# Which optimizer to run: cma-es | cma-es-margin | cma-es-elitist-margin | bo
 # Trade-off: cma-es is better for many cheap evals and larger populations;
+#            cma-es-margin adds a margin correction that prevents the search
+#            distribution from collapsing away from discrete grid boundaries,
+#            making it more robust for quantised offset problems;
+#            cma-es-elitist-margin is the (1+λ) elite-preserving variant — faster
+#            per-step updates with SSA step-size control, best for low-to-medium
+#            dimensions or when sigma must stay tightly controlled;
 #            bo is better when sims are expensive and dimensionality is moderate.
 algorithm: bo
 
@@ -69,7 +75,48 @@ cma_es:
   #            lower = faster local refinement, but higher risk of getting trapped near the initial guess.
   sigma_init: 10.0
 
-# Bayesian optimization settings (only used when algorithm: bo)
+# CMA-ES with Margin settings (only used when algorithm: cma-es-margin)
+# Reference: Hamano et al., "CMA-ES with Margin: Lower-Bounding Marginal
+#            Probability for Mixed-Integer Black-Box Optimization" (2022)
+cma_es_margin:
+  # Initial mutation spread in mm (same role as cma_es.sigma_init)
+  sigma_init: 10.0
+
+ # Margin parameter α: minimum probability mass preserved on each side of a
+  # discrete grid boundary after every update.  Prevents the distribution from
+  # prematurely ignoring discrete alternatives before convergence.
+  # Trade-off: higher = stronger boundary enforcement and more cautious moves,
+  #            but may slow convergence near the true optimum;
+  #            lower = allows faster commitment to a grid cell, but risks
+  #            premature collapse before the optimum is located.
+  # Rule of thumb: leave null to use the paper default 1/(dim·λ); set
+  #            explicitly only when you observe premature discrete collapse.
+  margin: null
+
+# (1+λ)-CMA-ES with Margin settings (only used when algorithm: cma-es-elitist-margin)
+# Reference: Watanabe et al., "(1+1)-CMA-ES with Margin for Discrete and
+#            Mixed-Integer Problems", GECCO 2023.
+# At each generation λ=population_size candidates are evaluated; only the best
+# offspring is used to update the covariance and mean (elitist selection).
+# Step-size is adapted every generation via a success probability tracker (SSA).
+cma_es_elitist_margin:
+  # Initial mutation spread in mm; controls how far offspring are sampled around the mean at the start
+  # Trade-off: higher = wider early exploration and less premature convergence, but more random early evals;
+  #            lower = faster local refinement, but higher risk of getting trapped near the initial guess.
+  #            SSA adapts sigma every generation, so the starting value matters less than in vanilla CMA-ES.
+  sigma_init: 10.0
+
+  # Margin parameter α; if null defaults to 1/dim (elitist paper default, larger
+  # than the (1+λ) default because there is no λ factor to dilute it)
+  # Trade-off: same as cma_es_margin.margin above.
+  margin: null
+
+  # Discretize the mean vector after each successful update
+  # Trade-off: true = mean stays on the discrete grid, cleaner convergence for
+  #            fully-integer problems; false = mean floats continuously between
+  #            grid points, which can help on mixed or near-continuous problems.
+  enc_m: true
+
 bo:
   # Random points evaluated before the GP surrogate starts guiding search; null defaults to framework.population_size
   # Trade-off: higher = better surrogate fit in early rounds, but more purely random simulation cost up front;

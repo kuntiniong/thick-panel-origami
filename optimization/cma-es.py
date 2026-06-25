@@ -116,6 +116,7 @@ class ThickPanelCMAFramework(ThickPanelDesignFramework):
                 print(f"  高度偏移量/Height offsets: {best_solution}")
                 print(f"  当前sigma/Current sigma: {optimizer._sigma:.4f}")
 
+            self._record_best_offset(constrained_list[current_best_idx])
             self.save_extract_data()
 
         print("\n" + "=" * 60)

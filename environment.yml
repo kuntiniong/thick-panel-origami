@@ -3,10 +3,14 @@ channels:
   - conda-forge
   - defaults
 # optimization/framework.py uses stdlib multiprocessing (spawn on Windows); no extra package required
+# CMA-ES_with_Margin (Hamano et al., 2022) is inlined in optimization/cma-es-margin.py;
+# elitist-cmaes-with-margin (Watanabe et al., 2023) is inlined in optimization/cma-es-elitist-margin.py;
+# both use only numpy, scipy, and pandas — already listed below, no extra packages needed.
 dependencies:
   - python=3.10
   - pip>=23.3
   - numpy<=1.26
+  - pandas
   - pyyaml
   - scipy
   - scikit-learn
@@ -18,5 +22,4 @@ dependencies:
     - PyQt5
     - pyqt5-tools
     - cmaes
-    - pandas
     - scikit-optimize

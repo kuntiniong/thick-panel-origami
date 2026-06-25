@@ -139,6 +139,8 @@ class ThickPanelDesignFramework:
             "std": [],
             "min": [],
             "num": self.population_size,
+            "best_offset": [],
+            "best_offset_normalized": [],
         }
 
         if not self._quiet:
@@ -191,11 +193,61 @@ class ThickPanelDesignFramework:
     def result_dir(self) -> str:
         return os.path.join("./physResult", self.simulator_origami_name())
 
+    def _record_best_offset(self, best_solution: Optional[np.ndarray]) -> None:
+        """
+        Append the current best offset (denormalized and normalized by crease
+        length) to extract_data.  Call once per generation after stats are
+        recorded.
+
+        :param best_solution: Full crease offset vector (num_creases,), or None
+            if no best solution has been found yet (first generation with no
+            improvement).
+        """
+        if best_solution is None:
+            self.extract_data["best_offset"].append(None)
+            self.extract_data["best_offset_normalized"].append(None)
+        else:
+            offsets = np.asarray(best_solution, dtype=float)
+            normalized = self._normalize_offsets_by_crease_length(offsets)
+            self.extract_data["best_offset"].append(offsets.tolist())
+            self.extract_data["best_offset_normalized"].append(normalized.tolist())
+
+    @staticmethod
+    def _compact_json_arrays(text: str) -> str:
+        """Collapse inner numeric arrays of best_offset / best_offset_normalized onto one line each."""
+        import re
+
+        _num = r"-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?"
+        _item = rf"(?:{_num}|null)"
+        inner_pat = re.compile(
+            rf"\[\s*({_item}(?:\s*,\s*{_item})*)\s*\]",
+            re.DOTALL,
+        )
+
+        def _collapse_inner(section: str) -> str:
+            return inner_pat.sub(
+                lambda m: "[" + re.sub(r"\s+", " ", m.group(1)).strip() + "]",
+                section,
+            )
+
+        # Only target the value blocks of the two offset keys.
+        # json.dumps(indent=4) closes a top-level array value with "\n    ]".
+        for key in ("best_offset", "best_offset_normalized"):
+            key_re = re.compile(
+                rf'("{re.escape(key)}":\s*)(\[.*?\n    \])',
+                re.DOTALL,
+            )
+            text = key_re.sub(lambda m: m.group(1) + _collapse_inner(m.group(2)), text)
+
+        return text
+
     def save_extract_data(self) -> None:
         result_dir = self.result_dir()
         os.makedirs(result_dir, exist_ok=True)
+        raw = json.dumps(self.extract_data, indent=4)
+        compact = self._compact_json_arrays(raw)
         with open(os.path.join(result_dir, "data.json"), "w", encoding="utf-8") as f:
-            json.dump(self.extract_data, f, indent=4)
+            f.write(compact)
 
     def _load_json(self, path: str) -> Dict:
         """加载JSON文件 / Load JSON file"""
@@ -386,6 +438,49 @@ class ThickPanelDesignFramework:
                     batch_data["crease_angle"].append(copy.deepcopy(target))
 
         return batch_data
+
+    def _compute_crease_lengths(self) -> np.ndarray:
+        """
+        计算每条折痕的欧氏长度 / Compute the Euclidean length of each crease.
+
+        :return: 长度数组，索引对应 crease_info / Array of lengths indexed by crease_info position.
+        """
+        lines = self.original_data.get("lines", [])
+        lengths = np.zeros(self.num_creases, dtype=float)
+        for i, info in enumerate(self.crease_info):
+            line_idx = info["line_index"]
+            if line_idx < len(lines):
+                p0 = lines[line_idx][0]
+                p1 = lines[line_idx][1]
+                lengths[i] = np.hypot(p1[0] - p0[0], p1[1] - p0[1])
+            else:
+                lengths[i] = 1.0  # fallback to avoid division by zero
+        return lengths
+
+    def _normalize_offsets_by_crease_length(self, offsets: np.ndarray) -> np.ndarray:
+        """
+        按折痕长度归一化高度偏移量 / Normalize height offsets by crease length.
+
+        Each offset is divided by the length of its corresponding crease so
+        that the resulting values are dimensionless fractions of crease length.
+        This puts creases of different sizes on a comparable scale and is
+        available to all optimization algorithms.
+
+        :param offsets: 绝对高度偏移量 (num_creases,) / Absolute height offsets.
+        :return: 归一化偏移量 / Normalized offsets (offset / crease_length).
+        """
+        lengths = self._compute_crease_lengths()
+        return offsets / np.where(lengths > 0, lengths, 1.0)
+
+    def _denormalize_offsets_by_crease_length(self, normalized_offsets: np.ndarray) -> np.ndarray:
+        """
+        将归一化偏移量还原为绝对值 / Denormalize offsets back to absolute values.
+
+        :param normalized_offsets: 归一化偏移量 / Normalized offsets (offset / crease_length).
+        :return: 绝对高度偏移量 / Absolute height offsets (normalized * crease_length).
+        """
+        lengths = self._compute_crease_lengths()
+        return normalized_offsets * lengths
 
     def _discretize_offset(self, offset: float) -> float:
         """离散化高度偏移量 / Discretize height offset."""
