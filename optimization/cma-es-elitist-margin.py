@@ -430,6 +430,7 @@ class ThickPanelCMAElitistMarginFramework(ThickPanelDesignFramework):
         self.extract_data["avg"].clear()
         self.extract_data["std"].clear()
         self.extract_data["min"].clear()
+        self.extract_data["min_without_var"].clear()
 
         # Discrete space: valid quantised offsets, gap at zero enforced by min_thickness
         eps = self.discrete_step * 0.5
@@ -438,11 +439,9 @@ class ThickPanelCMAElitistMarginFramework(ThickPanelDesignFramework):
         all_vals = np.sort(np.concatenate([neg_vals, pos_vals]))
         discrete_space = np.tile(all_vals, (self.num_independent, 1))
 
-        # Initial mean
-        mean_full = np.zeros(self.num_creases)
-        for i, info in enumerate(self.crease_info):
-            mean_full[i] = self.min_thickness if info["type"] == 0 else -self.min_thickness
-        mean = self._reduce_offsets(mean_full)
+        # Initial mean: built by the framework so horiz_bias is applied
+        # uniformly regardless of which algorithm is used.
+        mean = self._build_initial_mean()
 
         dim = self.num_independent
         margin_val = margin if margin is not None else 1.0 / dim

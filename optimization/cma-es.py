@@ -41,14 +41,9 @@ class ThickPanelCMAFramework(ThickPanelDesignFramework):
         self.extract_data["avg"].clear()
         self.extract_data["std"].clear()
         self.extract_data["min"].clear()
+        self.extract_data["min_without_var"].clear()
 
-        mean_full = np.zeros(self.num_creases)
-        for i, info in enumerate(self.crease_info):
-            if info["type"] == 0:
-                mean_full[i] = self.min_thickness
-            else:
-                mean_full[i] = -self.min_thickness
-        mean = self._reduce_offsets(mean_full)
+        mean = self._build_initial_mean()
 
         bounds = np.array(
             [[-self.max_offset, self.max_offset] for _ in range(self.num_independent)]

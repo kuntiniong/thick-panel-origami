@@ -81,6 +81,7 @@ class ThickPanelBOFramework(ThickPanelDesignFramework):
         self.extract_data["avg"].clear()
         self.extract_data["std"].clear()
         self.extract_data["min"].clear()
+        self.extract_data["min_without_var"].clear()
         self.extract_data["num"] = population_size
 
         dimensions = self._build_search_space()

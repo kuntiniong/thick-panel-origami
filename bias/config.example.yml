@@ -1,0 +1,15 @@
+simulations:
+  - name: mountain-thick
+    # min_thickness must match the value used during optimization
+    min_thickness: 2.0
+    # Show computed mm values on each crease midpoint
+    show_values: true
+    # Each entry is one subplot: vary horiz_bias weight and/or max_offset
+    # to see how the initial mean distribution changes.
+    variants:
+      - max_offset: 25.0
+        horiz_bias: 0.2   # 20% of usable range → up to 4.6 mm extra
+      - max_offset: 25.0
+        horiz_bias: 0.5   # 50% → up to 11.5 mm extra
+      - max_offset: 25.0
+        horiz_bias: 1.0   # 100% → horizontal creases start at max_offset

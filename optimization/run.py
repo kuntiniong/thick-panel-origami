@@ -130,7 +130,7 @@ def _framework_kwargs(config: Dict[str, Any], json_path: str) -> Dict[str, Any]:
 
     n_processes = resolve_n_processes(framework_cfg.get("n_processes"))
 
-    return {
+    kwargs = {
         "json_path": json_path,
         "batch_size": batch_size,
         "population_size": population_size,
@@ -141,6 +141,9 @@ def _framework_kwargs(config: Dict[str, Any], json_path: str) -> Dict[str, Any]:
         "use_gui": framework_cfg.get("use_gui", False),
         "symm_mode": framework_cfg.get("symm_mode", True),
     }
+    if "horiz_bias" in framework_cfg:
+        kwargs["horiz_bias"] = framework_cfg["horiz_bias"]
+    return kwargs
 
 
 def _load_cma_framework_class():

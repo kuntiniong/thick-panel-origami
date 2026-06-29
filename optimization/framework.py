@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from phys_sim_pd14 import PD_Origami_Simulator as OrigamiSimulator
 from phys_sim_pd14 import data_type, ensure_taichi_init, mark_taichi_reset, ti, use_gpu
-from symmetry_grouping.symmetry import detect_crease_symmetry_groups
+# from symmetry_grouping.symmetry import detect_crease_symmetry_groups
 
 
 @dataclass(frozen=True)
@@ -97,6 +97,7 @@ class ThickPanelDesignFramework:
         max_offset: float = 50.0,
         use_gui: bool = False,
         symm_mode: bool = True,
+        horiz_bias: float = 0.0,
         algorithm_key: Optional[str] = None,
         result_prefix: Optional[str] = None,
         _batch_json_suffix: str = "",
@@ -119,6 +120,7 @@ class ThickPanelDesignFramework:
         self.max_offset = max_offset
         self.use_gui = use_gui
         self.symm_mode = symm_mode
+        self.horiz_bias = horiz_bias
         self.algorithm_key = algorithm_key or self.algorithm_key
         self.result_prefix = result_prefix or self.result_prefix or self.algorithm_key
 
@@ -126,7 +128,14 @@ class ThickPanelDesignFramework:
 
         self.crease_info = self._parse_crease_info()
         self.num_creases = len(self.crease_info)
-        self._init_symmetry_state()
+
+        # --- symmetry state (disabled) ---
+        # self._init_symmetry_state()
+        self.line_symmetry_groups = []
+        self.symmetry_groups = []
+        self.optimization_groups = [[i] for i in range(self.num_creases)]
+        self.independent_indices = np.arange(self.num_creases, dtype=int)
+        self.num_independent = self.num_creases
 
         self.batch_json_path = self._create_batch_json()
 
@@ -138,38 +147,24 @@ class ThickPanelDesignFramework:
             "avg": [],
             "std": [],
             "min": [],
+            "min_without_var": [],
             "num": self.population_size,
             "best_offset": [],
             "best_offset_normalized": [],
+            "pop_rewards": [],
+            "pop_variances": [],
+            "pop_fitness": [],
         }
 
         if not self._quiet:
             print("[初始化] 厚板折纸设计框架初始化完成")
             print("[Init] Thick panel design framework initialized")
-            print(f"  - 对称模式/Symmetry mode: {'on' if self.symm_mode else 'off'}")
+            print(f"  - 对称模式/Symmetry mode: off (disabled)")
             print(f"  - 折痕数量/Number of creases: {self.num_creases}")
-        if self.symm_mode and not self._quiet:
-            print(f"  - 折痕线对称分组/Line symmetry groups: {len(self.line_symmetry_groups)}")
-            for group_idx, group in enumerate(self.line_symmetry_groups):
-                if group[0] == group[1]:
-                    print(f"      [{group_idx}] line {group[0]} (on axis)")
-                else:
-                    print(f"      [{group_idx}] lines {group[0]} <-> {group[1]}")
-            print(f"  - 优化折痕分组/Crease symmetry groups: {len(self.symmetry_groups)}")
-            for group_idx, group in enumerate(self.symmetry_groups):
-                print(f"      [{group_idx}] creases {group}")
-            print(
-                f"  - 独立优化维度/Independent optimization dimension: {self.num_independent} "
-                f"(full creases: {self.num_creases})"
-            )
-            for group_idx, group in enumerate(self.optimization_groups):
-                rep = self.independent_indices[group_idx]
-                if len(group) == 1:
-                    print(f"      [{group_idx}] crease {rep}")
-                else:
-                    print(f"      [{group_idx}] crease {rep} -> group {group}")
-        elif not self._quiet:
-            print(f"  - 优化维度/Optimization dimension: {self.num_independent}")
+        # --- symmetry print block (disabled) ---
+        # if self.symm_mode and not self._quiet:
+        #     print(f"  - 折痕线对称分组/Line symmetry groups: ...")
+        #     ...
         if not self._quiet:
             print(f"  - 批量大小/Batch size: {batch_size}")
             print(f"  - 并行进程数/Parallel processes (n_processes): {self.n_processes}")
@@ -230,9 +225,15 @@ class ThickPanelDesignFramework:
                 section,
             )
 
-        # Only target the value blocks of the two offset keys.
+        # Only target the value blocks of the listed keys.
         # json.dumps(indent=4) closes a top-level array value with "\n    ]".
-        for key in ("best_offset", "best_offset_normalized"):
+        for key in (
+            "best_offset",
+            "best_offset_normalized",
+            "pop_rewards",
+            "pop_variances",
+            "pop_fitness",
+        ):
             key_re = re.compile(
                 rf'("{re.escape(key)}":\s*)(\[.*?\n    \])',
                 re.DOTALL,
@@ -285,21 +286,23 @@ class ThickPanelDesignFramework:
 
     def _init_symmetry_state(self) -> None:
         """Initialize symmetry groups and independent optimization variables."""
-        if self.symm_mode:
-            self.line_symmetry_groups, self.symmetry_groups, _ = self._detect_symmetry_groups()
-            self.optimization_groups, self.independent_indices = self._build_optimization_groups()
-        else:
-            self.line_symmetry_groups = []
-            self.symmetry_groups = []
-            self.optimization_groups = [[i] for i in range(self.num_creases)]
-            self.independent_indices = np.arange(self.num_creases, dtype=int)
-
+        # --- symmetry detection disabled; always use flat (no-symm) init ---
+        # if self.symm_mode:
+        #     self.line_symmetry_groups, self.symmetry_groups, _ = self._detect_symmetry_groups()
+        #     self.optimization_groups, self.independent_indices = self._build_optimization_groups()
+        # else:
+        self.line_symmetry_groups = []
+        self.symmetry_groups = []
+        self.optimization_groups = [[i] for i in range(self.num_creases)]
+        self.independent_indices = np.arange(self.num_creases, dtype=int)
         self.num_independent = len(self.optimization_groups)
 
     def _detect_symmetry_groups(self) -> Tuple[List[List[int]], List[List[int]], Optional[dict]]:
         """Detect mirror-symmetric line pairs via PCA and map to crease indices."""
-        crease_line_indices = [info["index"] for info in self.crease_info]
-        return detect_crease_symmetry_groups(self.original_data, crease_line_indices)
+        # --- disabled ---
+        # crease_line_indices = [info["index"] for info in self.crease_info]
+        # return detect_crease_symmetry_groups(self.original_data, crease_line_indices)
+        return [], [], None
 
     def _build_optimization_groups(self) -> Tuple[List[List[int]], np.ndarray]:
         """
@@ -308,22 +311,23 @@ class ThickPanelDesignFramework:
         Each symmetry-linked crease set shares one variable; unpaired creases
         remain singleton groups. Returns (groups, representative crease indices).
         """
-        assigned = set()
-        groups: List[List[int]] = []
-
-        for group in self.symmetry_groups:
-            if len(group) < 2:
-                continue
-            sorted_group = sorted(group)
-            groups.append(sorted_group)
-            assigned.update(sorted_group)
-
-        for crease_idx in range(self.num_creases):
-            if crease_idx not in assigned:
-                groups.append([crease_idx])
-
-        groups.sort(key=lambda group: group[0])
-        independent_indices = np.array([group[0] for group in groups], dtype=int)
+        # --- disabled; always return flat singleton groups ---
+        # assigned = set()
+        # groups: List[List[int]] = []
+        # for group in self.symmetry_groups:
+        #     if len(group) < 2:
+        #         continue
+        #     sorted_group = sorted(group)
+        #     groups.append(sorted_group)
+        #     assigned.update(sorted_group)
+        # for crease_idx in range(self.num_creases):
+        #     if crease_idx not in assigned:
+        #         groups.append([crease_idx])
+        # groups.sort(key=lambda group: group[0])
+        # independent_indices = np.array([group[0] for group in groups], dtype=int)
+        # return groups, independent_indices
+        groups = [[i] for i in range(self.num_creases)]
+        independent_indices = np.arange(self.num_creases, dtype=int)
         return groups, independent_indices
 
     def _expand_offsets(self, reduced: np.ndarray) -> np.ndarray:
@@ -469,8 +473,10 @@ class ThickPanelDesignFramework:
         :param offsets: 绝对高度偏移量 (num_creases,) / Absolute height offsets.
         :return: 归一化偏移量 / Normalized offsets (offset / crease_length).
         """
-        lengths = self._compute_crease_lengths()
-        return offsets / np.where(lengths > 0, lengths, 1.0)
+        # lengths = self._compute_crease_lengths()
+        # return offsets / np.where(lengths > 0, lengths, 1.0)
+
+        return offsets  # disabled; return raw offsets without normalization
 
     def _denormalize_offsets_by_crease_length(self, normalized_offsets: np.ndarray) -> np.ndarray:
         """
@@ -479,8 +485,50 @@ class ThickPanelDesignFramework:
         :param normalized_offsets: 归一化偏移量 / Normalized offsets (offset / crease_length).
         :return: 绝对高度偏移量 / Absolute height offsets (normalized * crease_length).
         """
-        lengths = self._compute_crease_lengths()
-        return normalized_offsets * lengths
+        # lengths = self._compute_crease_lengths()
+        # return normalized_offsets * lengths
+        
+        return normalized_offsets  # disabled; return raw offsets without denormalization
+
+    def _horizontal_crease_mask(self, angle_threshold_deg: float = 10.0) -> np.ndarray:
+        """
+        Return a boolean array (num_creases,) that is True for creases within
+        angle_threshold_deg degrees of horizontal (|dy|/length < sin(threshold)).
+        """
+        lines = self.original_data.get("lines", [])
+        sin_threshold = np.sin(np.deg2rad(angle_threshold_deg))
+        mask = np.zeros(self.num_creases, dtype=bool)
+        for i, info in enumerate(self.crease_info):
+            idx = info["line_index"]
+            if idx < len(lines):
+                p0, p1 = lines[idx][0], lines[idx][1]
+                dx = p1[0] - p0[0]
+                dy = p1[1] - p0[1]
+                length = np.hypot(dx, dy)
+                if length > 0 and abs(dy) / length < sin_threshold:
+                    mask[i] = True
+        return mask
+
+    def _build_initial_mean(self) -> np.ndarray:
+        """
+        Build the initial mean vector for optimization algorithms.
+
+        All creases start at min_thickness.  When horiz_bias > 0, every
+        horizontal crease receives a flat uniform bonus of
+        horiz_bias * (max_offset - min_thickness) mm on top of min_thickness.
+        Diagonal creases are unaffected.
+
+        :return: Mean vector of shape (num_creases,).
+        """
+        max_bias_mm = self.horiz_bias * (self.max_offset - self.min_thickness)
+        horizontal = self._horizontal_crease_mask()
+        mean = np.zeros(self.num_creases, dtype=float)
+        for i, info in enumerate(self.crease_info):
+            base = self.min_thickness + (max_bias_mm if horizontal[i] else 0.0)
+            mean[i] = base if info["type"] == 0 else -base
+        return mean
+        # --- symmetry reduction (disabled) ---
+        # return self._reduce_offsets(mean)
 
     def _discretize_offset(self, offset: float) -> float:
         """离散化高度偏移量 / Discretize height offset."""
@@ -502,18 +550,18 @@ class ThickPanelDesignFramework:
         Corresponding creases share the same signed height offset (averaged
         within each group).
         """
-        if not self.symm_mode or not self.symmetry_groups:
-            return np.copy(offsets)
-
-        constrained = np.copy(offsets)
-        for group in self.symmetry_groups:
-            if len(group) < 2:
-                continue
-            avg = float(np.mean([constrained[i] for i in group]))
-            for i in group:
-                constrained[i] = avg
-
-        return constrained
+        # --- disabled ---
+        # if not self.symm_mode or not self.symmetry_groups:
+        #     return np.copy(offsets)
+        # constrained = np.copy(offsets)
+        # for group in self.symmetry_groups:
+        #     if len(group) < 2:
+        #         continue
+        #     avg = float(np.mean([constrained[i] for i in group]))
+        #     for i in group:
+        #         constrained[i] = avg
+        # return constrained
+        return np.copy(offsets)
 
     def _apply_constraints(self, offsets: np.ndarray) -> np.ndarray:
         """
@@ -531,7 +579,7 @@ class ThickPanelDesignFramework:
             else:
                 constrained[i] = -abs(constrained[i])
 
-        constrained = self._enforce_symmetry(constrained)
+        # constrained = self._enforce_symmetry(constrained)  # disabled
 
         for i in range(len(constrained)):
             constrained[i] = self._discretize_offset(constrained[i])
@@ -554,7 +602,7 @@ class ThickPanelDesignFramework:
                 for i in range(len(constrained)):
                     constrained[i] = self._discretize_offset(constrained[i])
 
-        constrained = self._enforce_symmetry(constrained)
+        # constrained = self._enforce_symmetry(constrained)  # disabled
 
         return constrained
 
@@ -705,6 +753,7 @@ class ThickPanelDesignFramework:
             "max_offset": self.max_offset,
             "use_gui": self.use_gui,
             "symm_mode": self.symm_mode,
+            "horiz_bias": self.horiz_bias,
             "algorithm_key": self.algorithm_key,
             "result_prefix": self.result_prefix,
             "simulator_name": self._shared_simulator_name(),
@@ -714,6 +763,41 @@ class ThickPanelDesignFramework:
             "batch_size_actual": task["batch_size_actual"],
             "batch_idx": task["batch_idx"],
         }
+
+    def _composite_fitness(
+        self,
+        rewards: List[float],
+        constrained: List[np.ndarray],
+        diversity_weight: float = 0,
+    ) -> List[float]:
+        """
+        Combined fitness for minimization with optimal value of 0.
+
+        score_i = reward_i / (1 + diversity_weight * std(constrained_offsets_i))
+
+        - reward_i = 0 (best folding, mode 1 or 2) → score = 0 always. ✓
+        - Higher reward (worse folding) → larger numerator → higher score.
+        - Higher offset std → larger denominator → lower score (exploration bonus).
+        - Always in [0, 1] for reward values in [0, 1].
+
+        :param rewards: Raw values from simulator.reward() — lower is better.
+        :param constrained: Constrained offset vectors for each candidate.
+        :param diversity_weight: Weight alpha on the std term; tune to balance
+            exploitation vs. exploration (default 0.3).
+            Offsets are signed (valley +, mountain -) so std across creases is
+            non-trivial even at minimum thickness.  Practical scale:
+              0.01–0.05  mild     (5–20% max score reduction)
+              0.05–0.15  moderate (up to ~50% reduction)
+              0.15–0.40  strong   (routinely cuts score to <50% of raw reward)
+              >0.40      diversity dominates over folding quality
+            At the default 0.3 the score is typically reduced by 55–80% for
+            mixed mountain/valley patterns — this is on the strong end.
+        :return: Composite score list; intended to be minimized by the caller.
+        """
+        return [
+            r / (1.0 + diversity_weight * float(np.std(c)))
+            for r, c in zip(rewards, constrained)
+        ]
 
     def evaluate_population(
         self,
@@ -804,6 +888,16 @@ class ThickPanelDesignFramework:
                     fitness_list.append(float(fitnesses[i]))
                     constrained_list.append(constrained[i])
 
+        raw_rewards = list(fitness_list)
+        _dw = type(self)._composite_fitness.__defaults__[0]
+        variances = [_dw * float(np.var(c)) for c in constrained_list]
+        fitness_list = self._composite_fitness(fitness_list, constrained_list)
+
+        self.extract_data["pop_rewards"].append(raw_rewards)
+        self.extract_data["pop_variances"].append(variances)
+        self.extract_data["pop_fitness"].append(list(fitness_list))
+        self.extract_data["min_without_var"].append(float(min(raw_rewards)))
+
         return fitness_list, constrained_list
 
 
@@ -844,6 +938,7 @@ def _create_worker_framework(payload: Dict[str, Any]) -> ThickPanelDesignFramewo
         max_offset=payload["max_offset"],
         use_gui=payload["use_gui"],
         symm_mode=payload["symm_mode"],
+        horiz_bias=payload["horiz_bias"],
         algorithm_key=payload["algorithm_key"],
         result_prefix=payload["result_prefix"],
         n_processes=1,

@@ -606,6 +606,7 @@ class ThickPanelCMAMarginFramework(ThickPanelDesignFramework):
         self.extract_data["avg"].clear()
         self.extract_data["std"].clear()
         self.extract_data["min"].clear()
+        self.extract_data["min_without_var"].clear()
 
         # ------------------------------------------------------------------
         # Build the discrete space for each independent optimization variable.
@@ -628,14 +629,9 @@ class ThickPanelCMAMarginFramework(ThickPanelDesignFramework):
 
         # ------------------------------------------------------------------
         # Initial mean: valley(0) → +min_thickness, mountain(1) → -min_thickness
+        # Horizontal creases get an extra bias when framework.horiz_bias > 0.
         # ------------------------------------------------------------------
-        mean_full = np.zeros(self.num_creases)
-        for i, info in enumerate(self.crease_info):
-            if info["type"] == 0:
-                mean_full[i] = self.min_thickness
-            else:
-                mean_full[i] = -self.min_thickness
-        mean = self._reduce_offsets(mean_full)
+        mean = self._build_initial_mean()
 
         lam = population_size
         dim = self.num_independent

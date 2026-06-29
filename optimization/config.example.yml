@@ -58,7 +58,14 @@ framework:
   # Enable PCA symmetry detection and optimize in reduced independent dimensions
   # Trade-off: true = fewer DOFs and enforced symmetric offsets, faster search on symmetric patterns;
   #            false = optimize every crease independently, needed for asymmetric designs.
-  symm_mode: false
+  # symm_mode: false
+
+  # Additive border-proximity bias weight (0.0–1.0).  Scales the initial mean
+  # magnitude for the most border-adjacent crease by
+  # horiz_bias: horizontal creases get a flat uniform starting offset of
+  # horiz_bias * (max_offset - min_thickness) mm added on top of min_thickness.
+  # 0.0 disables the bias; 1.0 sets all horizontal creases to max_offset.
+  horiz_bias: 0.2
 
 # Shared optimization loop control (used by both cma-es and bo)
 optimization:
