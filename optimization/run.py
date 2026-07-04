@@ -4,6 +4,14 @@ import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+# Ensure stdout/stderr use UTF-8 on Windows when output is piped or when the
+# system locale does not support CJK characters (e.g. cp1252 terminals).
+# This is a no-op on platforms that already use UTF-8.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import numpy as np
 import yaml
 
@@ -130,6 +138,11 @@ def _framework_kwargs(config: Dict[str, Any], json_path: str) -> Dict[str, Any]:
 
     n_processes = resolve_n_processes(framework_cfg.get("n_processes"))
 
+    initial_offsets_cfg = framework_cfg.get("initial_offsets")
+    initial_offsets = (
+        [float(value) for value in initial_offsets_cfg] if initial_offsets_cfg else None
+    )
+
     kwargs = {
         "json_path": json_path,
         "batch_size": batch_size,
@@ -141,13 +154,13 @@ def _framework_kwargs(config: Dict[str, Any], json_path: str) -> Dict[str, Any]:
         "use_gui": framework_cfg.get("use_gui", False),
         "symm_mode": framework_cfg.get("symm_mode", True),
     }
-    if "horiz_bias" in framework_cfg:
-        kwargs["horiz_bias"] = framework_cfg["horiz_bias"]
+    if initial_offsets is not None:
+        kwargs["initial_offsets"] = initial_offsets
     return kwargs
 
 
 def _load_cma_framework_class():
-    cma_path = os.path.join(_optimization_dir(), "cma-es.py")
+    cma_path = os.path.join(_optimization_dir(), "algorithms", "cma-es.py")
     spec = importlib.util.spec_from_file_location("optimization_cma_es", cma_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -155,13 +168,13 @@ def _load_cma_framework_class():
 
 
 def _load_bo_framework_class():
-    from optimization.bo import ThickPanelBOFramework
+    from optimization.algorithms.bo import ThickPanelBOFramework
 
     return ThickPanelBOFramework
 
 
 def _load_cma_margin_framework_class():
-    cma_margin_path = os.path.join(_optimization_dir(), "cma-es-margin.py")
+    cma_margin_path = os.path.join(_optimization_dir(), "algorithms", "cma-es-margin.py")
     spec = importlib.util.spec_from_file_location("optimization_cma_es_margin", cma_margin_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -169,11 +182,23 @@ def _load_cma_margin_framework_class():
 
 
 def _load_cma_elitist_margin_framework_class():
-    path = os.path.join(_optimization_dir(), "cma-es-elitist-margin.py")
+    path = os.path.join(_optimization_dir(), "algorithms", "cma-es-elitist-margin.py")
     spec = importlib.util.spec_from_file_location("optimization_cma_es_elitist_margin", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.ThickPanelCMAElitistMarginFramework
+
+
+def _load_manual_framework_class():
+    from optimization.manual import ThickPanelManualFramework
+
+    return ThickPanelManualFramework
+
+
+def _load_de_framework_class():
+    from optimization.algorithms.de import ThickPanelDEFramework
+
+    return ThickPanelDEFramework
 
 
 def _common_optimize_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -227,6 +252,28 @@ def _bo_optimize_kwargs(config: Dict[str, Any], common: Dict[str, Any]) -> Dict[
     }
 
 
+def _de_optimize_kwargs(config: Dict[str, Any], common: Dict[str, Any]) -> Dict[str, Any]:
+    de_cfg = config.get("de", {})
+    return {
+        **common,
+        "mutation_factor": de_cfg.get("mutation_factor", 0.8),
+        "crossover_prob": de_cfg.get("crossover_prob", 0.9),
+        "strategy": de_cfg.get("strategy", "rand1bin"),
+        "random_state": de_cfg.get("random_state", config.get("random_seed", 42)),
+    }
+
+
+def _manual_optimize_kwargs(config: Dict[str, Any], _common: Dict[str, Any]) -> Dict[str, Any]:
+    manual_cfg = config.get("manual", {})
+    if "offsets" not in manual_cfg or not manual_cfg["offsets"]:
+        raise ValueError("manual.offsets is required when algorithm: manual")
+
+    return {
+        "offsets": manual_cfg["offsets"],
+        "verbose": config.get("optimization", {}).get("verbose", True),
+    }
+
+
 def _format_param_token(value: Any) -> str:
     if isinstance(value, (int, np.integer)):
         return str(int(value))
@@ -251,6 +298,14 @@ def _build_result_prefix(spec: AlgorithmSpec, optimize_kwargs: Dict[str, Any]) -
         )
     elif spec.key in ("cma_es", "cma_es_margin", "cma_es_elitist_margin"):
         parts.append(f"sigma{_format_param_token(optimize_kwargs['sigma_init'])}")
+    elif spec.key == "de":
+        parts.extend(
+            [
+                f"f{_format_param_token(optimize_kwargs['mutation_factor'])}",
+                f"cr{_format_param_token(optimize_kwargs['crossover_prob'])}",
+                _format_param_token(optimize_kwargs["strategy"]),
+            ]
+        )
 
     return "-".join(parts)
 
@@ -296,6 +351,26 @@ def register_builtin_algorithms() -> None:
             optimize_kwargs_builder=_cma_es_elitist_margin_optimize_kwargs,
         )
     )
+    register_algorithm(
+        AlgorithmSpec(
+            key="manual",
+            aliases=("manual",),
+            result_prefix="manual",
+            config_key="manual",
+            framework_loader=_load_manual_framework_class,
+            optimize_kwargs_builder=_manual_optimize_kwargs,
+        )
+    )
+    register_algorithm(
+        AlgorithmSpec(
+            key="de",
+            aliases=("de", "differential-evolution", "differential_evolution"),
+            result_prefix="de",
+            config_key="de",
+            framework_loader=_load_de_framework_class,
+            optimize_kwargs_builder=_de_optimize_kwargs,
+        )
+    )
 
 
 register_builtin_algorithms()
@@ -309,7 +384,7 @@ def create_framework(
     framework_cls = spec.framework_loader()
     kwargs = _framework_kwargs(config, json_path)
     kwargs["algorithm_key"] = spec.key
-    kwargs["result_prefix"] = _build_result_prefix(spec, optimize_kwargs)
+    kwargs["result_prefix"] = ""
     return framework_cls(**kwargs), spec, optimize_kwargs
 
 

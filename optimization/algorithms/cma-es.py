@@ -45,9 +45,7 @@ class ThickPanelCMAFramework(ThickPanelDesignFramework):
 
         mean = self._build_initial_mean()
 
-        bounds = np.array(
-            [[-self.max_offset, self.max_offset] for _ in range(self.num_independent)]
-        )
+        bounds = self._build_optimizer_bounds()
 
         optimizer = CMA(
             mean=mean,

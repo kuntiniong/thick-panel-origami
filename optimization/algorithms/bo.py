@@ -28,20 +28,22 @@ class ThickPanelBOFramework(ThickPanelDesignFramework):
             through ``_denormalize_offsets_by_crease_length`` before
             sending them to the simulator.
         """
+        lo = self._optimizer_bound_lo()
+        hi = self._optimizer_bound_hi()
         if normalize_by_length:
             lengths = self._compute_crease_lengths()
             return [
                 Real(
-                    -self.max_offset / max(lengths[self.independent_indices[group_idx]], 1.0),
-                    self.max_offset / max(lengths[self.independent_indices[group_idx]], 1.0),
+                    lo / max(lengths[self.independent_indices[group_idx]], 1.0),
+                    hi / max(lengths[self.independent_indices[group_idx]], 1.0),
                     name=f"group_{group_idx}_crease_{self.independent_indices[group_idx]}",
                 )
                 for group_idx in range(self.num_independent)
             ]
         return [
             Real(
-                -self.max_offset,
-                self.max_offset,
+                lo,
+                hi,
                 name=f"group_{group_idx}_crease_{self.independent_indices[group_idx]}",
             )
             for group_idx in range(self.num_independent)
@@ -85,17 +87,44 @@ class ThickPanelBOFramework(ThickPanelDesignFramework):
         self.extract_data["num"] = population_size
 
         dimensions = self._build_search_space()
+        initial_mean = self._build_initial_mean()
+        x0 = None
+        y0 = None
+        total_evaluations = 0
+        best_fitness = np.inf
+        best_solution = None
+
+        if self.has_initial_offsets():
+            fitness_list, constrained_list = self.evaluate_population([initial_mean], 0)
+            x0 = [initial_mean.tolist()]
+            y0 = [float(fitness_list[0])]
+            total_evaluations = 1
+            best_fitness = float(fitness_list[0])
+            best_solution = np.copy(constrained_list[0])
+
+            self.data.append([best_fitness])
+            self.extract_data["gen"].append(-1)
+            self.extract_data["avg"].append(best_fitness)
+            self.extract_data["std"].append(0.0)
+            self.extract_data["min"].append(best_fitness)
+            self._record_best_offset(best_solution)
+            self.save_extract_data()
+
         optimizer = Optimizer(
             dimensions=dimensions,
             base_estimator=base_estimator,
             acq_func=acq_func,
             n_initial_points=n_initial_points,
             random_state=random_state,
+            x0=x0,
+            y0=y0,
         )
 
         print("贝叶斯优化初始化完成 / Bayesian optimizer initialized")
         print(f"  每轮候选数/Points per iteration: {population_size}")
         print(f"  初始随机点数/Initial random points: {n_initial_points}")
+        if self.has_initial_offsets():
+            print("  初始种子点/Seeded initial point: framework.initial_offsets")
         print(f"  代理模型/Surrogate model: {base_estimator}")
         print(f"  采集函数/Acquisition function: {acq_func}")
         if self.symm_mode:
@@ -105,10 +134,6 @@ class ThickPanelBOFramework(ThickPanelDesignFramework):
             )
         else:
             print(f"  维度/Dimension: {self.num_creases} (symmetry off)")
-
-        best_fitness = np.inf
-        best_solution = None
-        total_evaluations = 0
 
         for generation in range(1, generations + 1):
             self.data.append([])

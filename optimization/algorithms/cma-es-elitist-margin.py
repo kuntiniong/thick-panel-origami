@@ -432,14 +432,11 @@ class ThickPanelCMAElitistMarginFramework(ThickPanelDesignFramework):
         self.extract_data["min"].clear()
         self.extract_data["min_without_var"].clear()
 
-        # Discrete space: valid quantised offsets, gap at zero enforced by min_thickness
-        eps = self.discrete_step * 0.5
-        neg_vals = np.arange(-self.max_offset, -self.min_thickness + eps, self.discrete_step)
-        pos_vals = np.arange(self.min_thickness, self.max_offset + eps, self.discrete_step)
-        all_vals = np.sort(np.concatenate([neg_vals, pos_vals]))
+        # Discrete magnitude grid; sign applied in _apply_constraints.
+        all_vals = self._build_discrete_magnitude_values()
         discrete_space = np.tile(all_vals, (self.num_independent, 1))
 
-        # Initial mean: built by the framework so horiz_bias is applied
+        # Initial mean: built by the framework
         # uniformly regardless of which algorithm is used.
         mean = self._build_initial_mean()
 

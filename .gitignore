@@ -8,6 +8,7 @@ physResult/
 
 # generated batch simulation JSON (e.g. mountain-thick_batch_25.json)
 **/*_batch*.json
+*/*/output/*
 
 # config file
 config.yml

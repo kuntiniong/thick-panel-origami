@@ -102,7 +102,7 @@ def load_config(base_dir: str, config_arg: str = None) -> Tuple[dict, str]:
 
 
 def resolve_json_path(name: str, base_dir: str) -> str:
-    project_root = os.path.dirname(base_dir)
+    project_root = os.path.dirname(os.path.dirname(base_dir))
     return os.path.join(project_root, "descriptionData", f"{name}.json")
 
 

@@ -1,0 +1,14 @@
+simulations:
+  - name: mountain-thick
+    # Optional output image path (relative to visualization/splitting when not absolute)
+    output: output/mountain-thick_splitting.png
+    # Draw numeric labels (crease index + folding-range width in rad)
+    show_values: true
+
+    # Values used when visualizing the initial-mean boost implied by splitting.
+    min_thickness: 2.0
+    max_offset: 25.0
+    splittable_height_boost: 1.5
+
+    # Same threshold used in optimization.
+    splittable_min_range: 0.2

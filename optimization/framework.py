@@ -97,7 +97,6 @@ class ThickPanelDesignFramework:
         max_offset: float = 50.0,
         use_gui: bool = False,
         symm_mode: bool = True,
-        horiz_bias: float = 0.0,
         algorithm_key: Optional[str] = None,
         result_prefix: Optional[str] = None,
         _batch_json_suffix: str = "",
@@ -105,6 +104,7 @@ class ThickPanelDesignFramework:
         _quiet: bool = False,
         _force_cpu: bool = False,
         _reuse_ti_runtime: bool = False,
+        initial_offsets: Optional[np.ndarray] = None,
     ):
         self.json_path = json_path
         self.batch_size = batch_size
@@ -120,14 +120,27 @@ class ThickPanelDesignFramework:
         self.max_offset = max_offset
         self.use_gui = use_gui
         self.symm_mode = symm_mode
-        self.horiz_bias = horiz_bias
+
         self.algorithm_key = algorithm_key or self.algorithm_key
-        self.result_prefix = result_prefix or self.result_prefix or self.algorithm_key
+        if result_prefix is None:
+            self.result_prefix = self.result_prefix or self.algorithm_key
+        else:
+            self.result_prefix = result_prefix
 
         self.original_data = self._load_json(json_path)
 
         self.crease_info = self._parse_crease_info()
         self.num_creases = len(self.crease_info)
+
+        self._initial_offsets_full: Optional[np.ndarray] = None
+        if initial_offsets is not None:
+            offsets = np.asarray(initial_offsets, dtype=float).reshape(-1)
+            if offsets.size != self.num_creases:
+                raise ValueError(
+                    "initial_offsets length must match the number of creases "
+                    f"({self.num_creases}); got {offsets.size}"
+                )
+            self._initial_offsets_full = offsets
 
         # --- symmetry state (disabled) ---
         # self._init_symmetry_state()
@@ -172,6 +185,11 @@ class ThickPanelDesignFramework:
             print(f"  - 离散步长/Discrete step: {discrete_step}mm")
             if self.result_prefix:
                 print(f"  - 结果前缀/Result prefix: {self.result_prefix}")
+            if self._initial_offsets_full is not None:
+                print("  - 初始偏移量/Initial offsets: from framework.initial_offsets")
+
+    def has_initial_offsets(self) -> bool:
+        return self._initial_offsets_full is not None
 
     def _batch_json_stem(self) -> str:
         return os.path.basename(self.batch_json_path).replace(".json", "")
@@ -509,26 +527,47 @@ class ThickPanelDesignFramework:
                     mask[i] = True
         return mask
 
+    def _optimizer_bound_lo(self) -> float:
+        """Lower bound for each optimizer variable (unsigned magnitude, mm)."""
+        return self.min_thickness
+
+    def _optimizer_bound_hi(self) -> float:
+        """Upper bound for each optimizer variable (unsigned magnitude, mm)."""
+        return self.max_offset
+
+    def _build_optimizer_bounds(self) -> np.ndarray:
+        """
+        Per-independent-variable bounds in magnitude space.
+
+        Optimizers search |offset| in [min_thickness, max_offset]; valley/mountain
+        sign is applied later in _apply_constraints.
+        """
+        lo = self._optimizer_bound_lo()
+        hi = self._optimizer_bound_hi()
+        return np.array([[lo, hi] for _ in range(self.num_independent)])
+
+    def _build_discrete_magnitude_values(self) -> np.ndarray:
+        """Quantised magnitude levels for margin CMA-ES variants."""
+        eps = self.discrete_step * 0.5
+        return np.arange(self.min_thickness, self.max_offset + eps, self.discrete_step)
+
     def _build_initial_mean(self) -> np.ndarray:
         """
         Build the initial mean vector for optimization algorithms.
 
-        All creases start at min_thickness.  When horiz_bias > 0, every
-        horizontal crease receives a flat uniform bonus of
-        horiz_bias * (max_offset - min_thickness) mm on top of min_thickness.
-        Diagonal creases are unaffected.
+        Values are unsigned magnitudes in [min_thickness, max_offset]. When manual
+        selection offsets were loaded, their constrained absolute values are used.
+        Otherwise every crease starts at min_thickness.
 
-        :return: Mean vector of shape (num_creases,).
+        :return: Mean vector of shape (num_independent,).
         """
-        max_bias_mm = self.horiz_bias * (self.max_offset - self.min_thickness)
-        horizontal = self._horizontal_crease_mask()
-        mean = np.zeros(self.num_creases, dtype=float)
-        for i, info in enumerate(self.crease_info):
-            base = self.min_thickness + (max_bias_mm if horizontal[i] else 0.0)
-            mean[i] = base if info["type"] == 0 else -base
-        return mean
-        # --- symmetry reduction (disabled) ---
-        # return self._reduce_offsets(mean)
+        if self._initial_offsets_full is not None:
+            constrained = self._apply_constraints(self._initial_offsets_full)
+            magnitudes = np.abs(constrained)
+            return self._reduce_offsets(magnitudes)
+
+        mean = np.full(self.num_creases, self.min_thickness, dtype=float)
+        return self._reduce_offsets(mean)
 
     def _discretize_offset(self, offset: float) -> float:
         """离散化高度偏移量 / Discretize height offset."""
@@ -567,12 +606,13 @@ class ThickPanelDesignFramework:
         """
         应用约束条件
 
-        1. 强制符号：valley(0)→正值，mountain(1)→负值
-        2. 离散化
-        3. 确保valley折痕的高度偏移量 - mountain折痕的高度偏移量 >= 4mm
+        Step 1 – Sign enforcement:  valley (type 0) → positive, mountain (type 1) → negative.
+        Step 2 – Discretisation:    snap to the grid  [min_thickness, min_thickness+step, …].
+        Step 3 – Global M/V gap:    ensure every valley height ≥ every mountain height + 4 mm.
         """
         constrained = np.copy(offsets)
 
+        # ── Step 1: sign enforcement ──────────────────────────────────────────
         for i, info in enumerate(self.crease_info):
             if info["type"] == 0:
                 constrained[i] = abs(constrained[i])
@@ -581,9 +621,11 @@ class ThickPanelDesignFramework:
 
         # constrained = self._enforce_symmetry(constrained)  # disabled
 
+        # ── Step 2: discretisation ────────────────────────────────────────────
         for i in range(len(constrained)):
             constrained[i] = self._discretize_offset(constrained[i])
 
+        # ── Step 3: global valley-mountain gap ≥ 4 mm ────────────────────────
         valley_indices = [i for i, info in enumerate(self.crease_info) if info["type"] == 0]
         mountain_indices = [i for i, info in enumerate(self.crease_info) if info["type"] == 1]
 
@@ -646,6 +688,10 @@ class ThickPanelDesignFramework:
         self._set_heights_in_batch_json(constrained_matrix)
 
         if os.environ.get("FRAMEWORK_MP_DRY_RUN") == "1":
+            print(
+                "[DRY RUN] FRAMEWORK_MP_DRY_RUN=1, skipping simulator and "
+                "returning synthetic fitness values"
+            )
             fitnesses = np.arange(self.batch_size, dtype=float) + float(algo_step)
             return fitnesses, constrained_matrix
 
@@ -753,7 +799,6 @@ class ThickPanelDesignFramework:
             "max_offset": self.max_offset,
             "use_gui": self.use_gui,
             "symm_mode": self.symm_mode,
-            "horiz_bias": self.horiz_bias,
             "algorithm_key": self.algorithm_key,
             "result_prefix": self.result_prefix,
             "simulator_name": self._shared_simulator_name(),
@@ -938,7 +983,6 @@ def _create_worker_framework(payload: Dict[str, Any]) -> ThickPanelDesignFramewo
         max_offset=payload["max_offset"],
         use_gui=payload["use_gui"],
         symm_mode=payload["symm_mode"],
-        horiz_bias=payload["horiz_bias"],
         algorithm_key=payload["algorithm_key"],
         result_prefix=payload["result_prefix"],
         n_processes=1,

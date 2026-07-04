@@ -609,27 +609,15 @@ class ThickPanelCMAMarginFramework(ThickPanelDesignFramework):
         self.extract_data["min_without_var"].clear()
 
         # ------------------------------------------------------------------
-        # Build the discrete space for each independent optimization variable.
-        # Valid height-offset values are quantised by discrete_step and must
-        # satisfy |offset| >= min_thickness.  We include the full symmetric
-        # range so that any independent variable (regardless of crease type)
-        # can explore both signs; the framework's _apply_constraints enforces
-        # the sign rules on every candidate before simulation.
+        # Discrete magnitude grid: [min_thickness, max_offset] stepped by
+        # discrete_step. Sign is applied in _apply_constraints before simulation.
         # ------------------------------------------------------------------
-        eps = self.discrete_step * 0.5
-        neg_vals = np.arange(
-            -self.max_offset, -self.min_thickness + eps, self.discrete_step
-        )
-        pos_vals = np.arange(
-            self.min_thickness, self.max_offset + eps, self.discrete_step
-        )
-        all_vals = np.sort(np.concatenate([neg_vals, pos_vals]))
+        all_vals = self._build_discrete_magnitude_values()
         # shape: (num_independent, num_discrete_values)
         discrete_space = np.tile(all_vals, (self.num_independent, 1))
 
         # ------------------------------------------------------------------
-        # Initial mean: valley(0) → +min_thickness, mountain(1) → -min_thickness
-        # Horizontal creases get an extra bias when framework.horiz_bias > 0.
+        # Initial mean: unsigned magnitudes (default min_thickness per crease)
         # ------------------------------------------------------------------
         mean = self._build_initial_mean()
 

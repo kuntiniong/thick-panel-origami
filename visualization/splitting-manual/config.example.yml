@@ -1,0 +1,17 @@
+simulations:
+  - name: mountain-thick
+    # Optional output folder (relative to visualization/splitting-manual when not absolute)
+    output_dir: output
+
+    # Baseline magnitude for all creases.
+    min_thickness: 2.0
+
+    # Initial magnitude for selected "thicker" creases.
+    thick_thickness: 12.0
+
+    # Limits and snapping used by the GUI slider.
+    max_offset: 25.0
+    discrete_step: 1.0
+
+    # Visual options
+    show_labels: true

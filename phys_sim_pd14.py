@@ -2,57 +2,38 @@ import taichi as ti
 import taichi.math as tm
 import json
 import time, os
-from ori_sim_sys import *
 import yaml
+from ori_sim_sys import *
 
-use_gpu = 1
+data_type = ti.f32
+numpy_data_type = np.float32
+use_gpu = 0
 
 if use_gpu:
-    data_type = ti.f32
-    numpy_data_type = np.float32
+    ti.init(arch=ti.gpu, default_fp=data_type, fast_math=False, advanced_optimization=False, kernel_profiler=True)
 else:
-    data_type = ti.f64
-    numpy_data_type = np.float64
-
-_taichi_initialized = False
+    ti.init(arch=ti.cpu, default_fp=data_type, fast_math=False, advanced_optimization=False, cpu_max_num_threads=1, kernel_profiler=False, verbose=False)
 
 
 def ensure_taichi_init(force_cpu: bool = False):
-    """Lazy Taichi init so multiprocessing workers do not JIT-compile concurrently at import."""
-    global _taichi_initialized
-    if _taichi_initialized:
-        return
-    if use_gpu and not force_cpu:
-        ti.init(
-            arch=ti.gpu,
-            default_fp=data_type,
-            fast_math=False,
-            advanced_optimization=False,
-            kernel_profiler=True,
-        )
-    else:
-        ti.init(
-            arch=ti.cpu,
-            default_fp=data_type,
-            fast_math=False,
-            advanced_optimization=False,
-            cpu_max_num_threads=1,
-            kernel_profiler=False,
-            verbose=False,
-        )
-    _taichi_initialized = True
+    """Compatibility shim for optimization framework.
+
+    Taichi is initialized eagerly at module import in this version, so this is a no-op.
+    """
+    return
 
 
 def mark_taichi_reset():
-    """Call after ti.reset() so the next simulation re-initializes Taichi."""
-    global _taichi_initialized
-    _taichi_initialized = False
+    """Compatibility shim for optimization framework.
 
+    The old API used this to track lazy initialization state. Keep as no-op so
+    existing callers can import and call it safely.
+    """
+    return
 
 @ti.data_oriented
 class PD_Origami_Simulator:
-    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.95, material_type=1, ref_target=False):
-        ensure_taichi_init()
+    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.95, material_type=1, ref_target=False, verbose=False):
         self.use_gui = use_gui
         self.ID = 0
 
@@ -62,6 +43,7 @@ class PD_Origami_Simulator:
 
         self.material_type = material_type
         self.ref_target = ref_target
+        self.verbose = verbose
 
         self.split_origami_num = 1
         self.split_start_index = []
@@ -106,7 +88,7 @@ class PD_Origami_Simulator:
                 pass
         
         self.origami_thickness = 1.32
-
+        
     def biasKp(self, kp, bias):
         new_kp = deepcopy(kp)
         for i in range(min(len(new_kp), len(bias))):
@@ -222,14 +204,14 @@ class PD_Origami_Simulator:
         self.unit_edge_max = self.ori_sim.unit_edge_max
         self.ori_sim.fillBlankIndices() # fill all blank indice with -1
 
-    def commonStart_2(self):
+    def commonStart_2(self, occupy_memory=True):
         ori_sim = self.ori_sim
         self.connection_matrix = ori_sim.connection_matrix
         self.mass_list = ori_sim.mass_list
-        self.crease_pairs = ori_sim.crease_pairs
-        self.bending_pairs = ori_sim.bending_pairs
-        self.facet_crease_pairs = ori_sim.facet_bending_pairs
-        self.facet_bending_pairs = ori_sim.facet_bending_pairs
+        self.crease_pairs_list = ori_sim.crease_pairs
+        self.bending_pairs_list = ori_sim.bending_pairs
+        self.facet_crease_pairs_list = ori_sim.facet_crease_pairs
+        self.facet_bending_pairs_list = ori_sim.facet_bending_pairs
         self.spring_k = ori_sim.spring_k
         self.bending_k = ori_sim.bending_k
         self.facet_bending_k = ori_sim.face_k
@@ -266,149 +248,152 @@ class PD_Origami_Simulator:
             self.split_kp_sets_min.append(min(kp_set))
             self.split_kp_sets_max.append(max(kp_set))
 
-        self.x = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的位置
-        self.x0 = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的位置
-        self.s = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的位置
-        self.v = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的速度
-        self.dv = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的加速度
+        # self.spring_cons_num = int(np.count_nonzero(np.array(self.connection_matrix)) // 2 + 3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))]))
+        self.spring_cons_num = int(np.count_nonzero(np.array(self.connection_matrix)) // 2 + self.maximum_number_of_thick_panel_spring)
+        self.bending_cons_num = len(self.crease_pairs_list)
+        self.facet_bending_cons_num = len(self.facet_crease_pairs_list)
+        facet_space = max(self.facet_bending_cons_num, self.maximum_facet_crease_number)
 
-        self.unit_indices = ti.Vector.field(self.unit_edge_max, dtype=int, shape=self.unit_indices_num) # 每个单元的索引信息
-
-        self.vertices = ti.Vector.field(3, dtype=ti.f32, shape=self.kp_num) #点的位置
-        self.original_vertices = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) # 原始点坐标
-
-        self.masses = ti.field(dtype=data_type, shape=self.kp_num) # 质量信息
-
-        self.energy = ti.field(dtype=data_type, shape=())
-        self.split_energy = ti.field(dtype=data_type, shape=self.split_origami_num)
-
-        self.spring_k_param = ti.field(dtype=data_type, shape=())
-        self.bending_k_param = ti.field(dtype=data_type, shape=())
-        self.facet_bending_k_param = ti.field(dtype=data_type, shape=())
-
-        self.kp_num_param = ti.field(dtype=int, shape=())
-        self.split_origami_num_param = ti.field(dtype=int, shape=())
-
-        self.spring_num_param = ti.field(dtype=int, shape=())
-        self.bending_num_param = ti.field(dtype=int, shape=())
-        self.facet_bending_num_param = ti.field(dtype=int, shape=())
-
-        self.spring_cons_num = int(np.count_nonzero(np.array(self.connection_matrix)) // 2 + 3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))]))
-        self.bending_cons_num = len(self.crease_pairs)
-        self.facet_bending_cons_num = len(self.facet_crease_pairs)
-
-        print(f"# of Spring constraints: {np.count_nonzero(np.array(self.connection_matrix)) // 2} + {3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))])}\n" + \
-              f"# of Bending constraints: {self.bending_cons_num}\n" + \
-              f"# of Facet bending constraints: {self.facet_bending_cons_num}")
-
-        # === 约束拓扑索引（拆分为 3 种约束各自独立的 field，避免 base 偏移计算） ===
-
-        # spring: 每个约束 2 个索引 → shape = 2 * spring_cons_num
-        self.spring_selection = ti.field(dtype=int, shape=2 * self.spring_cons_num)
-        self.spring_x_proj = ti.Vector.field(3, dtype=data_type, shape=2 * self.spring_cons_num)
-        self.spring_selection_corresponding_origami_id = ti.field(dtype=int, shape=self.spring_cons_num)
-        # bending: 每个约束 4 个索引 → shape = 4 * bending_cons_num
-        self.bending_selection = ti.field(dtype=int, shape=4 * self.bending_cons_num)
-        self.bending_x_proj = ti.Vector.field(3, dtype=data_type, shape=4 * self.bending_cons_num)
-        self.bending_selection_corresponding_origami_id = ti.field(dtype=int, shape=self.bending_cons_num)
-        # facet_bending: 每个约束 4 个索引 → shape = 4 * facet_bending_cons_num
-        self.facet_bending_selection = ti.field(dtype=int, shape=4 * max(self.facet_bending_cons_num, 1))
-        self.facet_bending_x_proj = ti.Vector.field(3, dtype=data_type, shape=4 * max(self.facet_bending_cons_num, 1))
-        self.facet_bending_selection_corresponding_origami_id = ti.field(dtype=int, shape=self.facet_bending_cons_num)
-
-        # === 余切权重（cotangent Laplacian 构型相关常数，initializeRunning 时计算一次） ===
-        self.cotangent_vector = ti.Vector.field(4, dtype=data_type, shape=self.bending_cons_num)
-        self.facet_cotangent_vector = ti.Vector.field(4, dtype=data_type, shape=max(self.facet_bending_cons_num, 1))
-        self.cotangent_matrix = ti.Matrix.field(4, 4, dtype=data_type, shape=self.bending_cons_num)
-        self.facet_cotangent_matrix = ti.Matrix.field(4, 4, dtype=data_type, shape=max(self.facet_bending_cons_num, 1))
-
-        self.line_pairs = ti.field(dtype=int, shape=(self.line_total_indice_num, 2)) #线段索引信息，用于初始化渲染
-        self.line_color = ti.Vector.field(3, dtype=data_type, shape=self.line_total_indice_num*2) #线段颜色，用于渲染
-        self.line_vertex = ti.Vector.field(3, dtype=ti.f32, shape=self.line_total_indice_num*2) #线段顶点位置，用于渲染
-
-        self.indices = ti.field(int, shape=self.indices_num) #三角面索引信息
-
-        self.bending_pairs = ti.field(dtype=int, shape=(self.bending_pairs_num, 2)) #弯曲对索引信息
-        self.crease_pairs = ti.field(dtype=int, shape=(self.crease_pairs_num, 2)) #折痕对索引信息
-
-        self.crease_folding_angle = ti.field(dtype=data_type, shape=self.crease_pairs_num) #折痕折角
-        self.bending_pairs_area = ti.field(dtype=data_type, shape=(self.bending_pairs_num, 2)) #弯曲对面积信息
-        self.crease_initial_length = ti.field(dtype=data_type, shape=self.crease_pairs_num) #折痕长度
-
-        self.spring_original_length = ti.field(dtype=data_type, shape=self.spring_cons_num)
-
-        self.crease_type = ti.field(dtype=int, shape=self.crease_pairs_num) #折痕类型信息，与折痕对一一对应
-        self.crease_level = ti.field(dtype=int, shape=self.crease_pairs_num)
-        self.crease_coeff = ti.field(dtype=data_type, shape=self.crease_pairs_num)
-
-        self.maximum_level_number = 1
-        self.recover_level_need = ti.field(dtype=bool, shape=(self.crease_pairs_num, self.maximum_level_number))
-        self.recover_level = ti.field(dtype=int, shape=(self.crease_pairs_num, self.maximum_level_number))
-        self.recover_angle = ti.field(dtype=float, shape=(self.crease_pairs_num, self.maximum_level_number))
-
-        self.crease_angle = ti.field(dtype=data_type, shape=self.bending_pairs_num)
-        self.backup_crease_angle = ti.field(dtype=data_type, shape=self.bending_pairs_num)
-        self.target_crease_angle = ti.field(dtype=data_type, shape=self.bending_pairs_num)
-        self.previous_dir = ti.field(dtype=data_type, shape=self.bending_pairs_num)
-        self.folding_angle_upper_bound = ti.field(dtype=data_type, shape=self.bending_pairs_num) #折痕折角上限，正值或0
-        self.folding_angle_lower_bound = ti.field(dtype=data_type, shape=self.bending_pairs_num) #折痕折角下限，负值或0
-
-        self.folding_angle_reach_pi = ti.field(dtype=bool, shape=())
-
-        # 有可能所有单元都是三角形，故没有面折痕，根据特定条件初始化面折痕信息
-        if self.facet_bending_pairs_num > 0:
-            self.facet_bending_pairs = ti.field(dtype=int, shape=(self.facet_bending_pairs_num, 2))
-            self.facet_crease_pairs = ti.field(dtype=int, shape=(self.facet_crease_pairs_num, 2))
-            self.facet_bending_pairs_area = ti.field(dtype=data_type, shape=(self.facet_bending_pairs_num, 2)) #弯曲对面积信息
-            self.facet_crease_initial_length = ti.field(dtype=data_type, shape=self.facet_bending_pairs_num) #折痕长度
-            self.facet_bending_pairs_distance = ti.field(dtype=data_type, shape=self.facet_bending_pairs_num) #折痕有效弯曲长度
-
-        else:
-            self.facet_bending_pairs = ti.field(dtype=int, shape=(1, 2))
-            self.facet_crease_pairs = ti.field(dtype=int, shape=(1, 2))
-            self.facet_bending_pairs_area = ti.field(dtype=data_type, shape=(1, 2)) #弯曲对面积信息
-            self.facet_crease_initial_length = ti.field(dtype=data_type, shape=1) #折痕长度
-            self.facet_bending_pairs_distance = ti.field(dtype=data_type, shape=1) #折痕有效弯曲长度
+        if self.verbose:
+            print(f"# of Spring constraints: {np.count_nonzero(np.array(self.connection_matrix)) // 2} in-panel + {3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))])} out-of-panel in practice, using maximum value {self.maximum_number_of_thick_panel_spring} to maximize the space\n" + \
+                f"# of Bending constraints: {self.bending_cons_num}\n" + \
+                f"# of Facet bending constraints: {self.facet_bending_cons_num} in practice")
         
-        self.fix_id_list = ti.field(dtype=int, shape=self.MAXIMUM_FIX_PANEL)
-
-        self.unit_kp_num_list = ti.field(dtype=int, shape=self.unit_indices_num)
-        self.unit_contributions = ti.Vector.field(self.unit_edge_max, dtype=data_type, shape=self.unit_indices_num) # 每个单元的贡献度
-
-        self.thick_panel_additional_connection_id = ti.Vector.field(2, dtype=int, shape=self.unit_indices_num * self.unit_edge_max)
-
-        self.sequence_level = ti.field(int, shape=2) # max, min
-        self.folding_micro_step = ti.field(data_type, shape=()) # step calculated by sequence_level max and min
-
-        self.folding_angle_param = ti.field(data_type, shape=())
-        self.enable_add_folding_angle_param = ti.field(data_type, shape=())
-        self.angle_protection_param = ti.field(data_type, shape=())
-        self.damping_param = ti.field(data_type, shape=())
-
-        self.collision_indice_param = ti.field(data_type, shape=())
-        self.collision_d_param = ti.field(data_type, shape=())
-
-        self.AK_field = ti.field(dtype=data_type, shape=(3 * self.kp_num, 3 * self.kp_num))
-
-        self.AK = ti.linalg.SparseMatrixBuilder(3 * self.kp_num, 3 * self.kp_num, max_num_triplets=9 * self.kp_num ** 2, dtype=data_type)
-
-        self.AM = ti.linalg.SparseMatrix(3 * self.kp_num, 3 * self.kp_num, dtype=data_type)
-
-        self.b = ti.field(data_type, shape=3 * self.kp_num)
-        self.b_array = ti.ndarray(data_type, 3 * self.kp_num)
-        self.u0 = ti.field(data_type, shape=3 * self.kp_num) # solution
-
+        self.maximum_level_number = 1
         for i in range(len(self.ori_sim.line_indices)):
             self.ori_sim.line_indices[i] = [self.ori_sim.line_indices[i][0][START], self.ori_sim.line_indices[i][0][END], self.ori_sim.line_indices[i][1], self.ori_sim.line_indices[i][2], self.ori_sim.line_indices[i][3]]
 
-        # print(f"Spring: {self.spring_cons_num}, Bending: {self.bending_cons_num}, Facet bending: {self.facet_bending_cons_num}")
+        # ---memory--- #
+        if occupy_memory:
+            self.x = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的位置
+            self.x0 = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的位置
+            self.s = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的位置
+            self.v = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的速度
+            self.dv = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的加速度
 
-    def start(self, filepath, unit_edge_max, thick_mode=False):
+            self.unit_indices = ti.Vector.field(self.unit_edge_max, dtype=int, shape=self.unit_indices_num) # 每个单元的索引信息
+
+            self.vertices = ti.Vector.field(3, dtype=ti.f32, shape=self.kp_num) #点的位置
+            self.original_vertices = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) # 原始点坐标
+
+            self.masses = ti.field(dtype=data_type, shape=self.kp_num) # 质量信息
+
+            self.energy = ti.field(dtype=data_type, shape=())
+            self.split_energy = ti.field(dtype=data_type, shape=self.split_origami_num)
+
+            self.spring_k_param = ti.field(dtype=data_type, shape=())
+            self.bending_k_param = ti.field(dtype=data_type, shape=())
+            self.facet_bending_k_param = ti.field(dtype=data_type, shape=())
+
+            self.kp_num_param = ti.field(dtype=int, shape=())
+            self.split_origami_num_param = ti.field(dtype=int, shape=())
+
+            self.spring_num_param = ti.field(dtype=int, shape=())
+            self.bending_num_param = ti.field(dtype=int, shape=())
+            self.facet_bending_num_param = ti.field(dtype=int, shape=())
+
+            # === 约束拓扑索引（拆分为 3 种约束各自独立的 field，避免 base 偏移计算） ===
+
+            # spring: 每个约束 2 个索引 → shape = 2 * spring_cons_num
+            self.spring_selection = ti.field(dtype=int, shape=2 * self.spring_cons_num)
+            self.spring_x_proj = ti.Vector.field(3, dtype=data_type, shape=2 * self.spring_cons_num)
+            self.spring_selection_corresponding_origami_id = ti.field(dtype=int, shape=self.spring_cons_num)
+            # bending: 每个约束 4 个索引 → shape = 4 * bending_cons_num
+            self.bending_selection = ti.field(dtype=int, shape=4 * self.bending_cons_num)
+            self.bending_x_proj = ti.Vector.field(3, dtype=data_type, shape=4 * self.bending_cons_num)
+            self.bending_selection_corresponding_origami_id = ti.field(dtype=int, shape=self.bending_cons_num)
+            # facet_bending: 每个约束 4 个索引 → shape = 4 * facet_bending_cons_num
+            self.facet_bending_selection = ti.field(dtype=int, shape=4 * max(facet_space, 1))
+            self.facet_bending_x_proj = ti.Vector.field(3, dtype=data_type, shape=4 * max(facet_space, 1))
+            self.facet_bending_selection_corresponding_origami_id = ti.field(dtype=int, shape=facet_space)
+
+            # === 余切权重（cotangent Laplacian 构型相关常数，initializeRunning 时计算一次） ===
+            self.cotangent_vector = ti.Vector.field(4, dtype=data_type, shape=self.bending_cons_num)
+            self.facet_cotangent_vector = ti.Vector.field(4, dtype=data_type, shape=max(facet_space, 1))
+            self.cotangent_matrix = ti.Matrix.field(4, 4, dtype=data_type, shape=self.bending_cons_num)
+            self.facet_cotangent_matrix = ti.Matrix.field(4, 4, dtype=data_type, shape=max(facet_space, 1))
+
+            self.line_pairs = ti.field(dtype=int, shape=(self.line_total_indice_num, 2)) #线段索引信息，用于初始化渲染
+            self.line_color = ti.Vector.field(3, dtype=data_type, shape=self.line_total_indice_num*2) #线段颜色，用于渲染
+            self.line_vertex = ti.Vector.field(3, dtype=ti.f32, shape=self.line_total_indice_num*2) #线段顶点位置，用于渲染
+
+            self.indices = ti.field(int, shape=self.indices_num) #三角面索引信息
+
+            self.bending_pairs = ti.field(dtype=int, shape=(self.bending_pairs_num, 2)) #弯曲对索引信息
+            self.crease_pairs = ti.field(dtype=int, shape=(self.crease_pairs_num, 2)) #折痕对索引信息
+
+            self.crease_folding_angle = ti.field(dtype=data_type, shape=self.crease_pairs_num) #折痕折角
+            self.bending_pairs_area = ti.field(dtype=data_type, shape=(self.bending_pairs_num, 2)) #弯曲对面积信息
+            self.crease_initial_length = ti.field(dtype=data_type, shape=self.crease_pairs_num) #折痕长度
+
+            self.spring_original_length = ti.field(dtype=data_type, shape=self.spring_cons_num)
+
+            self.crease_type = ti.field(dtype=int, shape=self.crease_pairs_num) #折痕类型信息，与折痕对一一对应
+            self.crease_level = ti.field(dtype=int, shape=self.crease_pairs_num)
+            self.crease_coeff = ti.field(dtype=data_type, shape=self.crease_pairs_num)
+
+            self.recover_level_need = ti.field(dtype=bool, shape=(self.crease_pairs_num, self.maximum_level_number))
+            self.recover_level = ti.field(dtype=int, shape=(self.crease_pairs_num, self.maximum_level_number))
+            self.recover_angle = ti.field(dtype=float, shape=(self.crease_pairs_num, self.maximum_level_number))
+
+            self.crease_angle = ti.field(dtype=data_type, shape=self.bending_pairs_num)
+            self.backup_crease_angle = ti.field(dtype=data_type, shape=self.bending_pairs_num)
+            self.target_crease_angle = ti.field(dtype=data_type, shape=self.bending_pairs_num)
+            self.previous_dir = ti.field(dtype=data_type, shape=self.bending_pairs_num)
+            self.folding_angle_upper_bound = ti.field(dtype=data_type, shape=self.bending_pairs_num) #折痕折角上限，正值或0
+            self.folding_angle_lower_bound = ti.field(dtype=data_type, shape=self.bending_pairs_num) #折痕折角下限，负值或0
+
+            self.folding_angle_reach_pi = ti.field(dtype=bool, shape=())
+
+            # 有可能所有单元都是三角形，故没有面折痕，根据特定条件初始化面折痕信息
+            if self.facet_bending_pairs_num > 0:
+                self.facet_bending_pairs = ti.field(dtype=int, shape=(facet_space, 2))
+                self.facet_crease_pairs = ti.field(dtype=int, shape=(facet_space, 2))
+                self.facet_bending_pairs_area = ti.field(dtype=data_type, shape=(facet_space, 2)) #弯曲对面积信息
+                self.facet_crease_initial_length = ti.field(dtype=data_type, shape=facet_space) #折痕长度
+                self.facet_bending_pairs_distance = ti.field(dtype=data_type, shape=facet_space) #折痕有效弯曲长度
+
+            else:
+                self.facet_bending_pairs = ti.field(dtype=int, shape=(1, 2))
+                self.facet_crease_pairs = ti.field(dtype=int, shape=(1, 2))
+                self.facet_bending_pairs_area = ti.field(dtype=data_type, shape=(1, 2)) #弯曲对面积信息
+                self.facet_crease_initial_length = ti.field(dtype=data_type, shape=1) #折痕长度
+                self.facet_bending_pairs_distance = ti.field(dtype=data_type, shape=1) #折痕有效弯曲长度
+            
+            self.fix_id_list = ti.field(dtype=int, shape=self.MAXIMUM_FIX_PANEL)
+
+            self.unit_kp_num_list = ti.field(dtype=int, shape=self.unit_indices_num)
+            self.unit_contributions = ti.Vector.field(self.unit_edge_max, dtype=data_type, shape=self.unit_indices_num) # 每个单元的贡献度
+
+            self.thick_panel_additional_connection_id = ti.Vector.field(2, dtype=int, shape=self.unit_indices_num * self.unit_edge_max)
+
+            self.sequence_level = ti.field(int, shape=2) # max, min
+            self.folding_micro_step = ti.field(data_type, shape=()) # step calculated by sequence_level max and min
+
+            self.folding_angle_param = ti.field(data_type, shape=())
+            self.enable_add_folding_angle_param = ti.field(data_type, shape=())
+            self.angle_protection_param = ti.field(data_type, shape=())
+            self.damping_param = ti.field(data_type, shape=())
+
+            self.collision_indice_param = ti.field(data_type, shape=())
+            self.collision_d_param = ti.field(data_type, shape=())
+
+            self.AK_field = ti.field(dtype=data_type, shape=(3 * self.kp_num, 3 * self.kp_num))
+
+            self.AK = ti.linalg.SparseMatrixBuilder(3 * self.kp_num, 3 * self.kp_num, max_num_triplets=9 * self.kp_num ** 2, dtype=data_type)
+
+            self.AM = ti.linalg.SparseMatrix(3 * self.kp_num, 3 * self.kp_num, dtype=data_type)
+
+            self.b = ti.field(data_type, shape=3 * self.kp_num)
+            self.b_array = ti.ndarray(data_type, 3 * self.kp_num)
+            self.u0 = ti.field(data_type, shape=3 * self.kp_num) # solution
+
+    def start(self, filepath, unit_edge_max, thick_mode=False, occupy_memory=True):
         # 存储厚板模式标志 / Store thick mode flag
         self.thick_mode_flag = thick_mode
         self.json_stem = filepath
 
-        with open("./descriptionData/" + self.json_stem + ".json", 'r', encoding='utf-8') as fw:
+        with open("./descriptionData/" + filepath + ".json", 'r', encoding='utf-8') as fw:
             input_json = json.load(fw)
         self.input_json = input_json
         self.kps = []
@@ -417,7 +402,12 @@ class PD_Origami_Simulator:
         
         self.contributions = []
         self.connected_unit_pairs = []
-                
+
+        self.maximum_number_of_thick_panel = 0
+        self.maximum_number_of_thick_panel_spring = 0
+        self.maximum_facet_crease_number = 0
+        unit_mapping = []
+
         try:
             self.split_origami_num = input_json["split_num"]
         except:
@@ -454,10 +444,10 @@ class PD_Origami_Simulator:
                     self.lines[i].recover_angle = input_json["line_features"][i]["recover_angle"]
                 except:
                     self.lines[i].recover_angle = []
-                try:
-                    self.lines[i].thick_panel_height = input_json["line_features"][i]["thick_panel_height"]
-                except:
-                    self.lines[i].thick_panel_height = 0.0
+                # try:
+                #     self.lines[i].thick_panel_height = input_json["line_features"][i]["thick_panel_height"]
+                # except:
+                self.lines[i].thick_panel_height = 0.0
                 self.lines[i].hard = input_json["line_features"][i]["hard"]
                 self.lines[i].folding_angle_upper_bound = input_json["line_features"][i]["hard_angle"]
                 self.lines[i].folding_angle_lower_bound = input_json["line_features"][i]["hard_angle_down"]
@@ -491,9 +481,8 @@ class PD_Origami_Simulator:
                     pass
             
         else:
-            unit_mapping = []
             for i in range(len(input_json["lines"])):
-                line_start = input_json["lines"][i][START]
+                line_start = deepcopy(input_json["lines"][i][START])
 
                 add_height = 10.0 if input_json["line_features"][i]["type"] == 0 else -10.0
                 try:
@@ -507,7 +496,7 @@ class PD_Origami_Simulator:
                     line_start.append(add_height)
                 else:
                     line_start[Z] = add_height
-                line_end = input_json["lines"][i][END]
+                line_end = deepcopy(input_json["lines"][i][END])
                 if len(line_end) == 2:
                     line_end.append(add_height)
                 else:
@@ -543,6 +532,7 @@ class PD_Origami_Simulator:
                 kps = deepcopy(input_json["units"][i])
                 # check different height
                 height_parameters = []
+                current_possible_thick_panel_number = 0
                 for j in range(0, -len(kps), -1):
                     crease_type = BORDER
                     hard = False
@@ -551,10 +541,16 @@ class PD_Origami_Simulator:
                     for line in self.lines:
                         if (distance(line[START], current_kp) < 1e-3 and distance(line[END], next_kp) < 1e-3) or \
                             (distance(line[END], current_kp) < 1e-3 and distance(line[START], next_kp) < 1e-3):
+                                self.maximum_number_of_thick_panel += 1
+                                current_possible_thick_panel_number += 1
+                                self.maximum_facet_crease_number += len(kps) - 3
                                 if (line.getType() == VALLEY or line.getType() == MOUNTAIN) and line.thick_panel_height not in height_parameters:
                                     height_parameters.append(line.thick_panel_height)
                                 break
-                
+
+                self.maximum_number_of_thick_panel_spring += 3 * len(kps) * (current_possible_thick_panel_number - 1)    
+                height_parameters.sort()
+
                 unit_mapping.append([len(self.units) + k for k in range(len(height_parameters))])
                 if i == 0 and len(height_parameters) >= 2:
                     self.connected_unit_pairs += [[0, x] for x in range(1, len(height_parameters))]
@@ -616,6 +612,9 @@ class PD_Origami_Simulator:
                         self.contributions.append(new_contribution)
                     except:
                         pass
+            
+            if self.verbose:
+                print(f"Maximum thick panels in theory: {self.maximum_number_of_thick_panel}\nMaximum thick panel spring in theory: {self.maximum_number_of_thick_panel_spring}\nMaximum facet crease in theory: {self.maximum_facet_crease_number}")
                         
         if len(self.contributions) == 0:
             self.contributions.append([])
@@ -639,11 +638,15 @@ class PD_Origami_Simulator:
         # calculate max length of view
         self.max_size, max_x, max_y = getMaxDistance(self.kps)
         self.total_bias = getTotalBias(self.units)
+        self.unit_mapping = unit_mapping
         
         self.commonStart_1(unit_edge_max, thick_mode)
     
-        self.commonStart_2()
+        self.commonStart_2(occupy_memory=occupy_memory)
 
+    def getUnitMapping(self):
+        return self.unit_mapping
+    
     @ti.kernel
     def fill_line_vertex(self):
         for i in ti.ndrange(self.line_total_indice_num):
@@ -707,6 +710,7 @@ class PD_Origami_Simulator:
                         numpy_split_connection      : ti.types.ndarray(),
                         numpy_additional_kp_ori_id  : ti.types.ndarray(),
                         numpy_target_angle          : ti.types.ndarray(),
+                        verbose                     : bool,
         ):
         self.fix_id_list.fill(-1)
         self.AK_field.fill(0.)
@@ -994,7 +998,8 @@ class PD_Origami_Simulator:
                 current_connection_pos += 1
             
         if (spring_count + thick_count) < self.spring_num_param[None]:
-            print(f"Warning: real spring count is {spring_count} + {thick_count} = {(spring_count + thick_count)}, less than {self.spring_num_param[None]}")
+            if verbose:
+                print(f"Warning: real spring count is {spring_count} + {thick_count} = {(spring_count + thick_count)}, less than {self.spring_num_param[None]}")
             self.spring_num_param[None] = spring_count + thick_count
 
         # 2. bending
@@ -1306,7 +1311,7 @@ class PD_Origami_Simulator:
         if len(self.target):
             numpy_target_angle = np.array(self.target, dtype=numpy_data_type)
         else:
-            numpy_target_angle = np.array([0.], dtype=numpy_data_type)
+            numpy_target_angle = np.array([0.])
                     
         # initialize!
         self.initialize(
@@ -1347,7 +1352,8 @@ class PD_Origami_Simulator:
             numpy_split_facet_id,
             numpy_split_connection,
             numpy_additional_kp_origami_id,
-            numpy_target_angle
+            numpy_target_angle,
+            self.verbose,
         )
 
         # print(self.spring_selection_corresponding_origami_id, self.bending_selection_corresponding_origami_id, self.facet_bending_selection_corresponding_origami_id)
@@ -2341,10 +2347,10 @@ class PD_Origami_Simulator:
 
         self.canvas.scene(self.scene)
         try:
-            folder = os.path.join('./physResult', self.origami_name)
+            folder = f'./physResult/' + self.origami_name
             if not os.path.exists(folder):
                 os.makedirs(folder)
-            self.window.save_image(os.path.join(folder, str(self.ID).zfill(8) + '.png'))
+            self.window.save_image(f'./physResult/' + self.origami_name + "/" + str(self.ID).zfill(8) + '.png')
             print(f"Picture ID {str(self.ID).zfill(8)} is saved.")
         except:
             pass
@@ -2376,25 +2382,11 @@ class PD_Origami_Simulator:
                 self.step_once = False
             self.current_t += self.dt
 
-    def reward(self, mode: int = 2):
-        """
-        Compute per-origami reward.
-
-        mode 0 — energy divided by average folding percent (original):
-                    reward_i = E_i / avg(theta_i / pi)
-        mode 1 — pure folding penalty:
-                    reward_i = 1 - avg(theta_i / pi)
-        mode 2 — normalized version of mode 0 (max-normalized):
-                raw_i    = E_i / avg(theta_i / pi)
-                reward_i = raw_i / max(raw)
-
-        :param mode: selects the reward formulation (0, 1, or 2)
-        """
-
+    def reward(self):
         reward_list = np.zeros(self.split_origami_num)
         individual_crease_num = self.crease_pairs_num // self.split_origami_num
 
-        if mode == 0:
+        if 1:
             for i in range(self.split_origami_num):
                 reward_list[i] = self.split_energy[i]
                 start_index = individual_crease_num * i
@@ -2405,7 +2397,7 @@ class PD_Origami_Simulator:
                 avg_folding_percent /= individual_crease_num
                 avg_folding_percent = max(1e-6, avg_folding_percent)
                 reward_list[i] /= avg_folding_percent
-        elif mode == 1:
+        else:
             for i in range(self.split_origami_num):
                 start_index = individual_crease_num * i
                 end_index = individual_crease_num * (i + 1)
@@ -2414,26 +2406,6 @@ class PD_Origami_Simulator:
                     avg_folding_percent += self.crease_angle[j]
                 avg_folding_percent /= individual_crease_num
                 reward_list[i] = 1. - avg_folding_percent
-        elif mode == 2:
-            # Normalized mode 0:
-            # raw_i = E_i / avg(theta_i/pi), then normalize by max(raw).
-            for i in range(self.split_origami_num):
-                start_index = individual_crease_num * i
-                end_index = individual_crease_num * (i + 1)
-                avg_folding_percent = 0.
-                for j in range(start_index, end_index):
-                    avg_folding_percent += self.crease_angle[j]
-                avg_folding_percent /= individual_crease_num
-                avg_folding_percent = max(1e-6, avg_folding_percent)
-                reward_list[i] = self.split_energy[i] / avg_folding_percent
-
-            raw_max = np.max(reward_list)
-            if raw_max > 1e-12:
-                reward_list = reward_list / raw_max
-            else:
-                reward_list.fill(0.)
-        else:
-            raise ValueError(f"Unknown reward mode {mode}. Choose 0, 1, or 2.")
 
         return reward_list
     
@@ -2466,7 +2438,7 @@ class PD_Origami_Simulator:
 
         self.folding_angle = self.gui.slider_float('Folding angle', self.folding_angle, 0, 3.135)
 
-        self.spring_k = self.gui.slider_float('Spring k', self.spring_k, 10., 5000.)
+        self.spring_k = self.gui.slider_float('Spring k', self.spring_k, 40., 5000.)
         self.bending_k = self.gui.slider_float('Crease k', self.bending_k, 0.01, 1.)
         self.facet_bending_k = self.gui.slider_float('Facet k', self.facet_bending_k, 1., 100.)
 
@@ -2506,7 +2478,6 @@ class PD_Origami_Simulator:
             self.appendCreaseInfo()
 
 if __name__ == '__main__':
-
     base_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(base_dir, "config.yml")
     example_path = os.path.join(base_dir, "config.example.yml")
@@ -2517,6 +2488,9 @@ if __name__ == '__main__':
     elif os.path.exists(example_path):
         config_file_used = example_path
         print("config.yml not found. Falling back to config.example.yml")
+    else:
+        print("Neither config.yml nor config.example.yml was found.")
+        exit(1)
 
     with open(config_file_used, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
@@ -2535,21 +2509,21 @@ if __name__ == '__main__':
 
         ori = PD_Origami_Simulator(
             origami_name=name,
-            use_gui=sim.get("use_gui", True),          # headless mode if False
-            fast=sim.get("fast", True),                # save images only when not in fast simulation mode
+            use_gui=sim.get("use_gui", True),
+            fast=sim.get("fast", True),
             material_type=sim.get("material_type", 1),
-
             ref_target=sim.get("ref_target", False),
             damping=sim.get("damping", 0.95),
             pd_local_time=sim.get("pd_local_time", 1),
             pd_global_time=sim.get("pd_global_time", 1),
             pd_iter_time=sim.get("pd_iter_time", 5),
+            verbose=sim.get("verbose", False),
         )
 
         ori.start(
             filepath=name,
             unit_edge_max=sim.get("unit_edge_max", 4),
-            thick_mode=sim.get("thick_mode", False),   # thick origami if True
+            thick_mode=sim.get("thick_mode", False),
         )
 
         ori.run()
