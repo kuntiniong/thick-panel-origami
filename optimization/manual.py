@@ -42,9 +42,10 @@ class ThickPanelManualFramework(ThickPanelDesignFramework):
             raise ValueError("manual.offsets must be a 1D list of numbers")
 
         if manual_offsets.size == self.num_creases:
-            candidate = self._reduce_offsets(manual_offsets)
+            multiplicands = self._magnitudes_to_optimizer_vars(np.abs(manual_offsets))
+            candidate = self._reduce_offsets(multiplicands)
         elif manual_offsets.size == self.num_independent:
-            candidate = manual_offsets
+            candidate = self._magnitudes_to_optimizer_vars(np.abs(manual_offsets))
         else:
             raise ValueError(
                 "manual.offsets length must match the number of creases "

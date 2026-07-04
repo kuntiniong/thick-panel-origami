@@ -609,15 +609,15 @@ class ThickPanelCMAMarginFramework(ThickPanelDesignFramework):
         self.extract_data["min_without_var"].clear()
 
         # ------------------------------------------------------------------
-        # Discrete magnitude grid: [min_thickness, max_offset] stepped by
-        # discrete_step. Sign is applied in _apply_constraints before simulation.
+        # Discrete multiplicand grid: [1, max_offset/min_thickness] stepped by
+        # discrete_step/min_thickness. Sign is applied in _apply_constraints.
         # ------------------------------------------------------------------
         all_vals = self._build_discrete_magnitude_values()
         # shape: (num_independent, num_discrete_values)
         discrete_space = np.tile(all_vals, (self.num_independent, 1))
 
         # ------------------------------------------------------------------
-        # Initial mean: unsigned magnitudes (default min_thickness per crease)
+        # Initial mean: unsigned multiplicands (default 1 per crease)
         # ------------------------------------------------------------------
         mean = self._build_initial_mean()
 

@@ -52,7 +52,8 @@ framework:
   #            larger = faster optimization and easier manufacturing alignment, but may miss the true optimum between steps.
   discrete_step: 1.0
 
-  # Upper magnitude bound in mm; optimizers search [min_thickness, max_offset]; sign comes from crease type
+  # Upper magnitude bound in mm; optimizers search multiplicands in [1, max_offset/min_thickness]
+  # (e.g. min_thickness=2, max_offset=30 → multiplicands 1..15 → heights 2..30 mm); sign from crease type
   # Trade-off: larger = broader exploration and less risk of boundary clipping, but harder search and more wasted evals;
   #            smaller = faster focus near likely values, but can miss solutions that need larger offsets.
   max_offset: 30.0
@@ -102,7 +103,7 @@ optimization:
 
 # CMA-ES settings (only used when algorithm: cma-es)
 cma_es:
-  # Initial mutation spread in mm; controls how far offspring are sampled around the mean at the start
+  # Initial mutation spread in multiplicand units (× min_thickness → mm); controls early offspring spread
   # Trade-off: higher = wider early exploration and less premature convergence, but more random early evals;
   #            lower = faster local refinement, but higher risk of getting trapped near the initial guess.
   sigma_init: 10.0
@@ -111,7 +112,7 @@ cma_es:
 # Reference: Hamano et al., "CMA-ES with Margin: Lower-Bounding Marginal
 #            Probability for Mixed-Integer Black-Box Optimization" (2022)
 cma_es_margin:
-  # Initial mutation spread in mm (same role as cma_es.sigma_init)
+  # Initial mutation spread in multiplicand units (same role as cma_es.sigma_init)
   sigma_init: 10.0
 
  # Margin parameter α: minimum probability mass preserved on each side of a
@@ -132,7 +133,7 @@ cma_es_margin:
 # offspring is used to update the covariance and mean (elitist selection).
 # Step-size is adapted every generation via a success probability tracker (SSA).
 cma_es_elitist_margin:
-  # Initial mutation spread in mm; controls how far offspring are sampled around the mean at the start
+  # Initial mutation spread in multiplicand units; controls early offspring spread around the mean
   # Trade-off: higher = wider early exploration and less premature convergence, but more random early evals;
   #            lower = faster local refinement, but higher risk of getting trapped near the initial guess.
   #            SSA adapts sigma every generation, so the starting value matters less than in vanilla CMA-ES.
