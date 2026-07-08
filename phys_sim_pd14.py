@@ -444,10 +444,21 @@ class PD_Origami_Simulator:
     def start(self, filepath, unit_edge_max, thick_mode=False, occupy_memory=True):
         # 存储厚板模式标志 / Store thick mode flag
         self.thick_mode_flag = thick_mode
-        self.origami_name = filepath
-        self.json_stem = filepath
+        # origami_name is the export folder key (set in __init__); filepath may be a
+        # per-worker batch JSON copy during multiprocess optimization.
 
-        with open("./descriptionData/" + filepath + ".json", 'r', encoding='utf-8') as fw:
+        if os.path.isabs(filepath):
+            json_path = filepath
+        elif os.path.isfile(filepath):
+            json_path = filepath
+        elif os.path.isfile(filepath + ".json"):
+            json_path = filepath + ".json"
+        else:
+            json_path = os.path.join("./descriptionData", filepath + ".json")
+
+        self.json_stem = os.path.splitext(os.path.basename(json_path))[0]
+
+        with open(json_path, 'r', encoding='utf-8') as fw:
             input_json = json.load(fw)
         self.input_json = input_json
         self.kps = []

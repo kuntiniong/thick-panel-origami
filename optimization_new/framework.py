@@ -4,7 +4,6 @@ import json
 import multiprocessing as mp
 import os
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
@@ -67,7 +66,7 @@ class ThickPanelDesignFramework:
     该框架通过优化算法来设计折痕的高度偏移量，使得厚板折纸能够尽可能完全地折叠。
 
     约束条件/Constraints:
-    1. 优化器在倍率空间搜索 [1, max_offset/min_thickness]，物理高度 = 倍率 × min_thickness
+    1. 优化器在归一化空间搜索 [-1, 1]，由 _apply_constraints 映射到物理高度
     2. 高度偏移量绝对值至少为min_thickness（默认2mm），保证板具有厚度
     3. 高度偏移量绝对值按discrete_step（默认0.4mm）离散化
     4. 对于同时包含山折痕和谷折痕的板，谷折痕的有符号高度偏移量必须大于山折痕的有符号高度偏移量，且至少相差4mm
@@ -101,7 +100,7 @@ class ThickPanelDesignFramework:
         symm_mode: bool = True,
         algorithm_key: Optional[str] = None,
         result_prefix: Optional[str] = None,
-        _batch_json_dir: Optional[str] = None,
+        _batch_json_suffix: str = "",
         _simulator_name_override: Optional[str] = None,
         _quiet: bool = False,
         _force_cpu: bool = False,
@@ -112,7 +111,7 @@ class ThickPanelDesignFramework:
         self.batch_size = batch_size
         self.population_size = population_size
         self.n_processes = max(1, int(n_processes))
-        self._batch_json_dir = _batch_json_dir
+        self._batch_json_suffix = _batch_json_suffix
         self._simulator_name_override = _simulator_name_override
         self._quiet = _quiet
         self._force_cpu = _force_cpu
@@ -186,9 +185,7 @@ class ThickPanelDesignFramework:
             print(f"  - 最小厚度/Min thickness: {min_thickness}mm")
             print(f"  - 离散步长/Discrete step: {discrete_step}mm")
             print(
-                f"  - 优化器倍率范围/Optimizer multiplicand range: "
-                f"[{self._optimizer_bound_lo():.4g}, {self._optimizer_bound_hi():.4g}] "
-                f"(× {min_thickness}mm)"
+                "  - 优化器搜索范围/Optimizer search range: [-1, 1] (CDF remap)\n"
             )
             if self.result_prefix:
                 print(f"  - 结果前缀/Result prefix: {self.result_prefix}")
@@ -202,16 +199,13 @@ class ThickPanelDesignFramework:
         return os.path.basename(self.batch_json_path).replace(".json", "")
 
     def simulator_origami_name(self) -> str:
-        """Export folder key: optional algo/config prefix + batch stem (never _mp)."""
+        """Name passed to OrigamiSimulator (batch JSON stem, no algo/param suffix)."""
         if self._simulator_name_override:
             return self._simulator_name_override
-        stem = self._batch_json_stem()
-        if self.result_prefix:
-            return f"{self.result_prefix}-{stem}"
-        return stem
+        return self._batch_json_stem()
 
     def result_dir(self) -> str:
-        """Same folder as PD_Origami_Simulator.outputFigure (cdf-{export name})."""
+        """Same folder used by PD_Origami_Simulator.outputFigure (cdf-{stem})."""
         return os.path.join("./physResult", "cdf-" + self.simulator_origami_name())
 
     def _record_best_offset(self, best_solution: Optional[np.ndarray]) -> None:
@@ -381,12 +375,8 @@ class ThickPanelDesignFramework:
         batch_data = self._construct_batch_data(self.original_data, self.batch_size)
 
         base_name = os.path.basename(self.json_path).replace(".json", "")
-        batch_json_name = f"{base_name}_batch_{self.batch_size}.json"
-        if self._batch_json_dir:
-            os.makedirs(self._batch_json_dir, exist_ok=True)
-            batch_json_path = os.path.join(self._batch_json_dir, batch_json_name)
-        else:
-            batch_json_path = os.path.join(os.path.dirname(self.json_path), batch_json_name)
+        batch_json_name = f"{base_name}_batch_{self.batch_size}{self._batch_json_suffix}.json"
+        batch_json_path = os.path.join(os.path.dirname(self.json_path), batch_json_name)
 
         with open(batch_json_path, "w", encoding="utf-8") as f:
             json.dump(batch_data, f, indent=2)
@@ -539,62 +529,68 @@ class ThickPanelDesignFramework:
                     mask[i] = True
         return mask
 
+    def _optimizer_range(self) -> float:
+        return self.max_offset - self.min_thickness
+
     def _optimizer_bound_lo(self) -> float:
-        """Lower bound for each optimizer multiplicand (dimensionless, ≥ 1)."""
-        return 1.0
+        return -1.0
 
     def _optimizer_bound_hi(self) -> float:
-        """Upper bound for each optimizer multiplicand: max_offset / min_thickness."""
-        return self.max_offset / self.min_thickness
+        return 1.0
 
     def _build_optimizer_bounds(self) -> np.ndarray:
-        """
-        Per-independent-variable bounds in multiplicand space.
-
-        Optimizers search unsigned multiplicands in [1, max_offset/min_thickness];
-        physical magnitude is multiplicand × min_thickness. Valley/mountain sign is
-        applied later in _apply_constraints.
-        """
         lo = self._optimizer_bound_lo()
         hi = self._optimizer_bound_hi()
         return np.array([[lo, hi] for _ in range(self.num_independent)])
 
-    def _build_discrete_magnitude_values(self) -> np.ndarray:
-        """Quantised multiplicand levels for margin CMA-ES variants."""
+    def _height_to_optimizer_var(self, height: float, crease_type: int) -> float:
+        span = self._optimizer_range()
+        if span <= 0:
+            return 0.0
+        if crease_type == 0:
+            return 2.0 * (height - self.min_thickness) / span - 1.0
+        return 2.0 * (height + self.min_thickness) / span + 1.0
+
+    def _build_discrete_values_for_crease(self, crease_idx: int) -> np.ndarray:
         eps = self.discrete_step * 0.5
         heights = np.arange(self.min_thickness, self.max_offset + eps, self.discrete_step)
-        return heights / self.min_thickness
+        crease_type = self.crease_info[crease_idx]["type"]
+        return np.array(
+            [self._height_to_optimizer_var(float(h), crease_type) for h in heights],
+            dtype=float,
+        )
 
-    def _optimizer_vars_to_magnitudes(self, optimizer_vars: np.ndarray) -> np.ndarray:
-        """
-        Convert optimizer multiplicands to unsigned height magnitudes (mm).
+    def _build_discrete_magnitude_values(self) -> np.ndarray:
+        if self.num_creases == 0:
+            return np.array([-1.0, 1.0], dtype=float)
+        return self._build_discrete_values_for_crease(0)
 
-        :param optimizer_vars: Independent multiplicands (× min_thickness → mm).
-        :return: Unsigned magnitudes in mm, same shape as optimizer_vars.
-        """
-        return np.asarray(optimizer_vars, dtype=float) * self.min_thickness
+    def _build_discrete_optimizer_space(self) -> np.ndarray:
+        rows = []
+        for group_idx in range(self.num_independent):
+            rep = self.independent_indices[group_idx]
+            rows.append(self._build_discrete_values_for_crease(int(rep)))
+        max_len = max(len(row) for row in rows)
+        padded = np.zeros((self.num_independent, max_len), dtype=float)
+        for i, row in enumerate(rows):
+            padded[i, : len(row)] = row
+            if len(row) < max_len:
+                padded[i, len(row) :] = row[-1]
+        return padded
 
-    def _magnitudes_to_optimizer_vars(self, magnitudes: np.ndarray) -> np.ndarray:
-        """Convert unsigned height magnitudes (mm) to optimizer multiplicands."""
-        return np.asarray(magnitudes, dtype=float) / self.min_thickness
+    def _physical_offsets_to_optimizer_vars(self, offsets: np.ndarray) -> np.ndarray:
+        constrained = self._apply_constraints(offsets)
+        full = np.zeros(self.num_creases, dtype=float)
+        for i, info in enumerate(self.crease_info):
+            full[i] = self._height_to_optimizer_var(float(constrained[i]), info["type"])
+        return self._reduce_offsets(full)
 
     def _build_initial_mean(self) -> np.ndarray:
-        """
-        Build the initial mean vector for optimization algorithms.
-
-        Values are unsigned multiplicands in [1, max_offset/min_thickness]. When
-        initial_offsets were loaded, their constrained absolute values are converted
-        to multiplicands. Otherwise every crease starts at multiplicand 1
-        (height = min_thickness).
-
-        :return: Mean vector of shape (num_independent,).
-        """
+        mean = np.zeros(self.num_creases, dtype=float)
         if self._initial_offsets_full is not None:
             constrained = self._apply_constraints(self._initial_offsets_full)
-            multiplicands = self._magnitudes_to_optimizer_vars(np.abs(constrained))
-            return self._reduce_offsets(multiplicands)
-
-        mean = np.ones(self.num_creases, dtype=float)
+            for i, info in enumerate(self.crease_info):
+                mean[i] = self._height_to_optimizer_var(float(constrained[i]), info["type"])
         return self._reduce_offsets(mean)
 
     def _discretize_offset(self, offset: float) -> float:
@@ -631,48 +627,18 @@ class ThickPanelDesignFramework:
         return np.copy(offsets)
 
     def _apply_constraints(self, offsets: np.ndarray) -> np.ndarray:
-        """
-        应用约束条件
-
-        Step 1 – Sign enforcement:  valley (type 0) → positive, mountain (type 1) → negative.
-        Step 2 – Discretisation:    snap to the grid  [min_thickness, min_thickness+step, …].
-        Step 3 – Global M/V gap:    ensure every valley height ≥ every mountain height + 4 mm.
-        """
+        """CDF constraints: remap [-1, 1] -> signed heights, then discretize."""
         constrained = np.copy(offsets)
+        span = self._optimizer_range()
 
-        # ── Step 1: sign enforcement ──────────────────────────────────────────
         for i, info in enumerate(self.crease_info):
             if info["type"] == 0:
-                constrained[i] = abs(constrained[i])
+                constrained[i] = (constrained[i] + 1.0) * 0.5 * span + self.min_thickness
             else:
-                constrained[i] = -abs(constrained[i])
+                constrained[i] = (constrained[i] - 1.0) * 0.5 * span - self.min_thickness
 
-        # constrained = self._enforce_symmetry(constrained)  # disabled
-
-        # ── Step 2: discretisation ────────────────────────────────────────────
         for i in range(len(constrained)):
             constrained[i] = self._discretize_offset(constrained[i])
-
-        # ── Step 3: global valley-mountain gap ≥ 4 mm ────────────────────────
-        valley_indices = [i for i, info in enumerate(self.crease_info) if info["type"] == 0]
-        mountain_indices = [i for i, info in enumerate(self.crease_info) if info["type"] == 1]
-
-        if len(valley_indices) > 0 and len(mountain_indices) > 0:
-            min_valley = min(constrained[i] for i in valley_indices)
-            max_mountain = max(constrained[j] for j in mountain_indices)
-
-            if min_valley < max_mountain + 4.0:
-                gap = (max_mountain + 4.0) - min_valley
-
-                for i in valley_indices:
-                    constrained[i] += gap / 2 + 0.2
-                for j in mountain_indices:
-                    constrained[j] -= gap / 2 - 0.2
-
-                for i in range(len(constrained)):
-                    constrained[i] = self._discretize_offset(constrained[i])
-
-        # constrained = self._enforce_symmetry(constrained)  # disabled
 
         return constrained
 
@@ -703,12 +669,6 @@ class ThickPanelDesignFramework:
             json.dump(batch_data, f, indent=2)
 
     def evaluate_batch(self, height_matrix: np.ndarray, algo_step: int) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        批量评估候选解 / Batch-evaluate candidate height offset configurations.
-
-        :param height_matrix: 形状为(batch_size, num_creases)的矩阵
-        :return: (每个候选解的折叠百分比, 约束后的高度偏移量矩阵)
-        """
         constrained_matrix = np.zeros_like(height_matrix)
         for i in range(self.batch_size):
             constrained_matrix[i] = self._apply_constraints(height_matrix[i])
@@ -716,64 +676,76 @@ class ThickPanelDesignFramework:
         self._set_heights_in_batch_json(constrained_matrix)
 
         if os.environ.get("FRAMEWORK_MP_DRY_RUN") == "1":
-            print(
-                "[DRY RUN] FRAMEWORK_MP_DRY_RUN=1, skipping simulator and "
-                "returning synthetic fitness values"
-            )
             fitnesses = np.arange(self.batch_size, dtype=float) + float(algo_step)
             return fitnesses, constrained_matrix
 
+        batch_json_name = self._batch_json_stem()
         simulator_name = self.simulator_origami_name()
-        batch_json_path = os.path.abspath(self.batch_json_path)
+
+        def _restore_export_name() -> None:
+            # start() sets origami_name = batch JSON stem; MP workers use a
+            # per-process JSON suffix but must export images to the shared folder.
+            if self.simulator is not None:
+                self.simulator.origami_name = simulator_name
 
         if self.simulator is None:
             self._init_ti()
-
             self.simulator = OrigamiSimulator(
                 origami_name=simulator_name,
                 use_gui=self.use_gui,
                 fast=True,
+                ref_target=1,
+                verbose=0,
             )
-
             self.simulator.ID = algo_step
+            ok = self.simulator.start(batch_json_name, 4, thick_mode=1)
+            _restore_export_name()
+        else:
+            self.simulator.ID = algo_step
+            ok = self.simulator.start(batch_json_name, 4, thick_mode=1)
+            _restore_export_name()
+            if not ok:
+                if self.use_gui:
+                    self.simulator.window.destroy()
+                self.simulator = None
+                gc.collect()
+                ti.reset()
+                self._init_ti()
+                self.simulator = OrigamiSimulator(
+                    origami_name=simulator_name,
+                    use_gui=self.use_gui,
+                    fast=True,
+                    ref_target=1,
+                    verbose=0,
+                )
+                self.simulator.ID = algo_step
+                ok = self.simulator.start(batch_json_name, 4, thick_mode=1)
+                _restore_export_name()
 
-        self.simulator.start(batch_json_path, 4, thick_mode=1)
-
-        max_steps = 300
+        max_steps = 60
         step_count = 0
-
         self.simulator.initializeRunning()
-        self.simulator.enable_add_folding_angle = 0.03141
+        self.simulator.enable_add_folding_angle = 0.105
 
         while step_count < max_steps and self.simulator.window.running:
             self.simulator.step()
             if self.use_gui:
                 self.simulator.render()
             if self.simulator.stop():
-                self.simulator.outputFigure()
+                if algo_step % max(1, int(self.population_size / self.batch_size * self.num_creases)) == 0:
+                    self.simulator.outputFigure()
+                self.simulator.backupSimulationSetting()
                 break
-
             step_count += 1
 
         if step_count == max_steps:
-            self.simulator.outputFigure()
+            if algo_step % max(1, int(self.population_size / self.batch_size * self.num_creases)) == 0:
+                self.simulator.outputFigure()
+            self.simulator.backupSimulationSetting()
 
         folding_percentages = self._extract_folding_percentages()
-
-        self.simulator.window.destroy()
-
-        gc.collect()
-
-        if self._reuse_ti_runtime:
-            # Preserve the Taichi runtime (compiled kernels stay alive) but
-            # drop the simulator object — its window is destroyed and cannot
-            # be reused.  The next evaluate_batch call will create a fresh
-            # OrigamiSimulator that reuses the already-compiled kernels.
-            self.simulator = None
-        else:
-            ti.reset()
-            mark_taichi_reset()
-            self.simulator = None
+        if not self._quiet:
+            print(f"Batch {algo_step} evaluation completed: {folding_percentages}")
 
         return folding_percentages, constrained_matrix
 
@@ -796,9 +768,9 @@ class ThickPanelDesignFramework:
             fast=True,
         )
         self.simulator.ID = algo_step
-        self.simulator.start(os.path.abspath(self.batch_json_path), 4, thick_mode=1)
+        self.simulator.start(self._batch_json_stem(), 4, thick_mode=1)
         self.simulator.initializeRunning()
-        self.simulator.enable_add_folding_angle = 0.03141
+        self.simulator.enable_add_folding_angle = 0.105
         self.simulator.step()
 
     def _extract_folding_percentages(self) -> np.ndarray:
@@ -809,12 +781,8 @@ class ThickPanelDesignFramework:
         return self.n_processes
 
     def _shared_simulator_name(self) -> str:
-        """Export name shared by all MP workers (prefix + batch stem, no _mp)."""
-        base = os.path.basename(self.json_path).replace(".json", "")
-        stem = f"{base}_batch_{self.batch_size}"
-        if self.result_prefix:
-            return f"{self.result_prefix}-{stem}"
-        return stem
+        """Batch stem shared by all MP workers for images + data.json."""
+        return self._batch_json_stem()
 
     def _build_worker_payload(self, task: Dict[str, Any]) -> Dict[str, Any]:
         worker_tag = f"b{task['batch_idx']}_{task['algo_step']}"
@@ -897,10 +865,7 @@ class ThickPanelDesignFramework:
 
             height_matrix = np.zeros((self.batch_size, self.num_creases))
             for i in range(batch_size_actual):
-                magnitudes = self._optimizer_vars_to_magnitudes(
-                    candidate_heights[start_idx + i]
-                )
-                height_matrix[i] = self._expand_offsets(magnitudes)
+                height_matrix[i] = self._expand_offsets(candidate_heights[start_idx + i])
 
             tasks.append(
                 {
@@ -965,13 +930,9 @@ class ThickPanelDesignFramework:
                     constrained_list.append(constrained[i])
 
         raw_rewards = list(fitness_list)
-        _dw = type(self)._composite_fitness.__defaults__[0]
-        variances = [_dw * float(np.var(c)) for c in constrained_list]
-        fitness_list = self._composite_fitness(fitness_list, constrained_list)
-
         self.extract_data["pop_rewards"].append(raw_rewards)
-        self.extract_data["pop_variances"].append(variances)
-        self.extract_data["pop_fitness"].append(list(fitness_list))
+        self.extract_data["pop_variances"].append([float(np.var(c)) for c in constrained_list])
+        self.extract_data["pop_fitness"].append(raw_rewards)
         self.extract_data["min_without_var"].append(float(min(raw_rewards)))
 
         return fitness_list, constrained_list
@@ -1017,7 +978,7 @@ def _create_worker_framework(payload: Dict[str, Any]) -> ThickPanelDesignFramewo
         algorithm_key=payload["algorithm_key"],
         result_prefix=payload["result_prefix"],
         n_processes=1,
-        _batch_json_dir=os.path.join(tempfile.gettempdir(), "thick_panel_opt", str(os.getpid())),
+        _batch_json_suffix=f"_mp{os.getpid()}",
         _simulator_name_override=payload["simulator_name"],
         _quiet=True,
         _force_cpu=True,
