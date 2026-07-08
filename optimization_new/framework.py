@@ -205,8 +205,8 @@ class ThickPanelDesignFramework:
         return self._batch_json_stem()
 
     def result_dir(self) -> str:
-        """Same folder used by PD_Origami_Simulator.outputFigure (cdf-{stem})."""
-        return os.path.join("./physResult", "cdf-" + self.simulator_origami_name())
+        """Same folder used by PD_Origami_Simulator.outputFigure (physResult/{stem})."""
+        return os.path.join("./physResult", self.simulator_origami_name())
 
     def _record_best_offset(self, best_solution: Optional[np.ndarray]) -> None:
         """

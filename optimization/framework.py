@@ -106,6 +106,10 @@ class ThickPanelDesignFramework:
         _quiet: bool = False,
         _force_cpu: bool = False,
         _reuse_ti_runtime: bool = False,
+        max_steps: int = 60,
+        fold_angle_step: float = 0.105,
+        ref_target: bool = True,
+        reuse_simulator: bool = True,
         initial_offsets: Optional[np.ndarray] = None,
     ):
         self.json_path = json_path
@@ -117,6 +121,10 @@ class ThickPanelDesignFramework:
         self._quiet = _quiet
         self._force_cpu = _force_cpu
         self._reuse_ti_runtime = _reuse_ti_runtime
+        self.max_steps = max(1, int(max_steps))
+        self.fold_angle_step = float(fold_angle_step)
+        self.ref_target = bool(ref_target)
+        self.reuse_simulator = bool(reuse_simulator)
         self.min_thickness = min_thickness
         self.discrete_step = discrete_step
         self.max_offset = max_offset
@@ -155,6 +163,8 @@ class ThickPanelDesignFramework:
         self.batch_json_path = self._create_batch_json()
 
         self.simulator = None
+        self._mp_pool: Optional[Any] = None
+        self._mp_pool_worker_count = 0
 
         self.data = []
         self.extract_data = {
@@ -192,6 +202,9 @@ class ThickPanelDesignFramework:
             )
             if self.result_prefix:
                 print(f"  - 结果前缀/Result prefix: {self.result_prefix}")
+            print(f"  - 仿真步数/Simulation max steps: {self.max_steps}")
+            print(f"  - 折角步长/Fold angle step: {self.fold_angle_step}")
+            print(f"  - 复用仿真器/Reuse simulator: {self.reuse_simulator}")
             if self._initial_offsets_full is not None:
                 print("  - 初始偏移量/Initial offsets: from framework.initial_offsets")
 
@@ -211,8 +224,47 @@ class ThickPanelDesignFramework:
         return stem
 
     def result_dir(self) -> str:
-        """Same folder as PD_Origami_Simulator.outputFigure (cdf-{export name})."""
-        return os.path.join("./physResult", "cdf-" + self.simulator_origami_name())
+        """Same folder as PD_Origami_Simulator.outputFigure (physResult/{export name})."""
+        return os.path.join("./physResult", self.simulator_origami_name())
+
+    def _export_figure_stride(self) -> int:
+        """Export PNGs every N evaluations (CDF-style throttling)."""
+        return max(1, int(self.population_size / self.batch_size * self.num_creases))
+
+    def _should_export_figure(self, algo_step: int) -> bool:
+        return algo_step % self._export_figure_stride() == 0
+
+    def _create_simulator(self, simulator_name: str, algo_step: int) -> OrigamiSimulator:
+        simulator = OrigamiSimulator(
+            origami_name=simulator_name,
+            use_gui=self.use_gui,
+            fast=True,
+            ref_target=self.ref_target,
+            verbose=0,
+        )
+        simulator.ID = algo_step
+        return simulator
+
+    def _teardown_simulator(self) -> None:
+        if self.simulator is None:
+            return
+        self.simulator.window.destroy()
+        self.simulator = None
+        gc.collect()
+        if not self._reuse_ti_runtime:
+            ti.reset()
+            mark_taichi_reset()
+
+    def _recover_simulator_after_failed_start(
+        self,
+        simulator_name: str,
+        batch_json_path: str,
+        algo_step: int,
+    ) -> bool:
+        self._teardown_simulator()
+        self._init_ti()
+        self.simulator = self._create_simulator(simulator_name, algo_step)
+        return self.simulator.start(batch_json_path, 4, thick_mode=1)
 
     def _record_best_offset(self, best_solution: Optional[np.ndarray]) -> None:
         """
@@ -728,52 +780,48 @@ class ThickPanelDesignFramework:
 
         if self.simulator is None:
             self._init_ti()
-
-            self.simulator = OrigamiSimulator(
-                origami_name=simulator_name,
-                use_gui=self.use_gui,
-                fast=True,
-            )
-
+            self.simulator = self._create_simulator(simulator_name, algo_step)
+            ok = self.simulator.start(batch_json_path, 4, thick_mode=1)
+            if not ok:
+                ok = self._recover_simulator_after_failed_start(
+                    simulator_name,
+                    batch_json_path,
+                    algo_step,
+                )
+        else:
             self.simulator.ID = algo_step
+            ok = self.simulator.start(batch_json_path, 4, thick_mode=1)
+            if not ok:
+                ok = self._recover_simulator_after_failed_start(
+                    simulator_name,
+                    batch_json_path,
+                    algo_step,
+                )
 
-        self.simulator.start(batch_json_path, 4, thick_mode=1)
-
-        max_steps = 300
         step_count = 0
-
         self.simulator.initializeRunning()
-        self.simulator.enable_add_folding_angle = 0.03141
+        self.simulator.enable_add_folding_angle = self.fold_angle_step
 
-        while step_count < max_steps and self.simulator.window.running:
+        while step_count < self.max_steps and self.simulator.window.running:
             self.simulator.step()
             if self.use_gui:
                 self.simulator.render()
             if self.simulator.stop():
-                self.simulator.outputFigure()
+                if self._should_export_figure(algo_step):
+                    self.simulator.outputFigure()
+                self.simulator.backupSimulationSetting()
                 break
-
             step_count += 1
 
-        if step_count == max_steps:
-            self.simulator.outputFigure()
+        if step_count == self.max_steps:
+            if self._should_export_figure(algo_step):
+                self.simulator.outputFigure()
+            self.simulator.backupSimulationSetting()
 
         folding_percentages = self._extract_folding_percentages()
 
-        self.simulator.window.destroy()
-
-        gc.collect()
-
-        if self._reuse_ti_runtime:
-            # Preserve the Taichi runtime (compiled kernels stay alive) but
-            # drop the simulator object — its window is destroyed and cannot
-            # be reused.  The next evaluate_batch call will create a fresh
-            # OrigamiSimulator that reuses the already-compiled kernels.
-            self.simulator = None
-        else:
-            ti.reset()
-            mark_taichi_reset()
-            self.simulator = None
+        if not self.reuse_simulator:
+            self._teardown_simulator()
 
         return folding_percentages, constrained_matrix
 
@@ -790,15 +838,13 @@ class ThickPanelDesignFramework:
         self._set_heights_in_batch_json(constrained_matrix)
 
         self._init_ti()
-        self.simulator = OrigamiSimulator(
-            origami_name=self.simulator_origami_name(),
-            use_gui=self.use_gui,
-            fast=True,
+        self.simulator = self._create_simulator(
+            self.simulator_origami_name(),
+            algo_step,
         )
-        self.simulator.ID = algo_step
         self.simulator.start(os.path.abspath(self.batch_json_path), 4, thick_mode=1)
         self.simulator.initializeRunning()
-        self.simulator.enable_add_folding_angle = 0.03141
+        self.simulator.enable_add_folding_angle = self.fold_angle_step
         self.simulator.step()
 
     def _extract_folding_percentages(self) -> np.ndarray:
@@ -807,6 +853,36 @@ class ThickPanelDesignFramework:
 
     def _effective_n_processes(self) -> int:
         return self.n_processes
+
+    def shutdown_workers(self) -> None:
+        """Close the persistent multiprocessing pool (no-op if not started)."""
+        if self._mp_pool is None:
+            return
+        self._mp_pool.close()
+        self._mp_pool.join()
+        self._mp_pool = None
+        self._mp_pool_worker_count = 0
+
+    def _acquire_mp_pool(self, worker_count: int) -> Any:
+        """Return a process pool reused across generations (spawn + Taichi-safe init)."""
+        if self._mp_pool is not None and self._mp_pool_worker_count == worker_count:
+            return self._mp_pool
+
+        self.shutdown_workers()
+        ctx = mp.get_context("spawn")
+        ti_lock = ctx.Lock()
+        self._mp_pool = ctx.Pool(
+            processes=worker_count,
+            initializer=_init_mp_worker,
+            initargs=(ti_lock,),
+        )
+        self._mp_pool_worker_count = worker_count
+        if not self._quiet:
+            print(
+                f"[多进程/Multiprocessing] Persistent worker pool started "
+                f"(n_processes={worker_count})"
+            )
+        return self._mp_pool
 
     def _shared_simulator_name(self) -> str:
         """Export name shared by all MP workers (prefix + batch stem, no _mp)."""
@@ -829,6 +905,10 @@ class ThickPanelDesignFramework:
             "symm_mode": self.symm_mode,
             "algorithm_key": self.algorithm_key,
             "result_prefix": self.result_prefix,
+            "max_steps": self.max_steps,
+            "fold_angle_step": self.fold_angle_step,
+            "ref_target": self.ref_target,
+            "reuse_simulator": self.reuse_simulator,
             "simulator_name": self._shared_simulator_name(),
             "worker_tag": worker_tag,
             "height_matrix": task["height_matrix"],
@@ -932,14 +1012,8 @@ class ThickPanelDesignFramework:
             )
             payloads = [self._build_worker_payload(task) for task in tasks]
 
-            ctx = mp.get_context("spawn")
-            ti_lock = ctx.Lock()
-            with ctx.Pool(
-                processes=min(effective_n_processes, num_batches),
-                initializer=_init_mp_worker,
-                initargs=(ti_lock,),
-            ) as pool:
-                raw_results = pool.map(_run_mp_worker, payloads)
+            pool = self._acquire_mp_pool(min(effective_n_processes, num_batches))
+            raw_results = pool.map(_run_mp_worker, payloads)
             raw_results.sort(key=lambda item: item[2])
             print(
                 f"[多进程/Multiprocessing] All {num_batches} batches finished; "
@@ -1016,6 +1090,10 @@ def _create_worker_framework(payload: Dict[str, Any]) -> ThickPanelDesignFramewo
         symm_mode=payload["symm_mode"],
         algorithm_key=payload["algorithm_key"],
         result_prefix=payload["result_prefix"],
+        max_steps=payload["max_steps"],
+        fold_angle_step=payload["fold_angle_step"],
+        ref_target=payload["ref_target"],
+        reuse_simulator=payload["reuse_simulator"],
         n_processes=1,
         _batch_json_dir=os.path.join(tempfile.gettempdir(), "thick_panel_opt", str(os.getpid())),
         _simulator_name_override=payload["simulator_name"],

@@ -153,6 +153,10 @@ def _framework_kwargs(config: Dict[str, Any], json_path: str) -> Dict[str, Any]:
         "max_offset": framework_cfg.get("max_offset", 50.0),
         "use_gui": framework_cfg.get("use_gui", False),
         "symm_mode": framework_cfg.get("symm_mode", True),
+        "max_steps": framework_cfg.get("max_steps", 60),
+        "fold_angle_step": framework_cfg.get("fold_angle_step", 0.105),
+        "ref_target": framework_cfg.get("ref_target", True),
+        "reuse_simulator": framework_cfg.get("reuse_simulator", True),
     }
     if initial_offsets is not None:
         kwargs["initial_offsets"] = initial_offsets
@@ -426,7 +430,10 @@ def run_from_config(
 
     json_path = resolve_input_path(config["input"])
     framework, _spec, optimize_kwargs = create_framework(config, json_path)
-    return framework.optimize(**optimize_kwargs)
+    try:
+        return framework.optimize(**optimize_kwargs)
+    finally:
+        framework.shutdown_workers()
 
 
 def main(default_algorithm: Optional[str] = None) -> None:

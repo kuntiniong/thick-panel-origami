@@ -2511,10 +2511,10 @@ class PD_Origami_Simulator:
 
         self.canvas.scene(self.scene)
         try:
-            folder = f'./physResult/cdf-' + self.origami_name
+            folder = f'./physResult/{self.origami_name}'
             if not os.path.exists(folder):
                 os.makedirs(folder)
-            self.window.save_image(f'./physResult/cdf-' + self.origami_name + "/" + str(self.ID).zfill(8) + '.png')
+            self.window.save_image(f'{folder}/{str(self.ID).zfill(8)}.png')
             print(f"Picture ID {str(self.ID).zfill(8)} is saved.")
         except:
             pass

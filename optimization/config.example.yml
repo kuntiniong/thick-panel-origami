@@ -60,6 +60,12 @@ framework:
 
   use_gui: false
 
+  # Fast simulation settings (CDF-style; restore max_steps: 300, fold_angle_step: 0.03141 for full fidelity)
+  max_steps: 60
+  fold_angle_step: 0.105
+  ref_target: true
+  reuse_simulator: true
+
   # Enable PCA symmetry detection and optimize in reduced independent dimensions
   # Trade-off: true = fewer DOFs and enforced symmetric offsets, faster search on symmetric patterns;
   #            false = optimize every crease independently, needed for asymmetric designs.

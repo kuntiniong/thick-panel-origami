@@ -650,7 +650,7 @@ class ThickPanelDesignFramework:
 
             origami_name = os.path.basename(self.batch_json_path).replace('.json', '')
             try:
-                with open('./physResult/cdf-' + origami_name + '/data.json', 'w', encoding="utf-8") as f:
+                with open('./physResult/' + origami_name + '/data.json', 'w', encoding="utf-8") as f:
                     json.dump(self.extract_data, f, indent=4)
             except Exception as e:
                 print(f"保存数据失败/Failed to save data: {e}")
