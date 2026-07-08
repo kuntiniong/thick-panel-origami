@@ -18,12 +18,13 @@ from typing import List, Dict, Tuple, Optional, Callable
 import warnings
 from cmaes import CMA
 import gc
+from scipy.optimize import differential_evolution
 
 # 添加PyGamiX-V7到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from phys_sim_pd14 import PD_Origami_Simulator as OrigamiSimulator
-from phys_sim_pd14 import ti, data_type, use_gpu
+from phys_sim_pd14 import ti, data_type, numpy_data_type
 
 class ThickPanelDesignFramework:
     """
@@ -50,8 +51,8 @@ class ThickPanelDesignFramework:
                  batch_size: int = 64,
                  population_size: int = 256,
                  min_thickness: float = 2.0,
-                 discrete_step: float = 0.4,
-                 max_offset: float = 50.0,
+                 discrete_step: float = 0.1,
+                 max_offset: float = 20.0,
                  use_gui: bool = False):
         self.json_path = json_path
         self.batch_size = batch_size
@@ -74,6 +75,13 @@ class ThickPanelDesignFramework:
         # 初始化仿真器（只初始化一次）
         self.simulator = None
 
+        self.target_heights = [2, -2, -2, -14, -6, 2, 2, 10, 10, -2, -2, -6, -14, 2, 2, -2, -2, -6, 2, 2, 10, -2, -2, -14] # 临时占位，实际目标高度由设计者定义
+
+        self.initial_mean = [2.2, -3.0, -4.9, -18.2, -5.0, 4.3, 3.8, 12.5, 9.7, -4.2, -4.1, -6.6, -15.6, 3.6, 3.1, -2.7, -8.6, -2.2, 4.4, 5.0, 11.0, -3.2, -7.1, -17.4]
+        self.initial_mean = []
+
+        self.episode = 0
+
         self.data = []
         self.extract_data = {
             "gen": [],
@@ -89,7 +97,7 @@ class ThickPanelDesignFramework:
         print(f"  - 批量大小/Batch size: {batch_size}")
         print(f"  - 最小厚度/Min thickness: {min_thickness}mm")
         print(f"  - 离散步长/Discrete step: {discrete_step}mm")
-        
+        print(f"  - 最大偏移量/Max offset: {max_offset}mm")
     def _load_json(self, path: str) -> Dict:
         """加载JSON文件 / Load JSON file"""
         with open(path, 'r', encoding='utf-8') as f:
@@ -282,49 +290,43 @@ class ThickPanelDesignFramework:
         # 离散化只保留绝对值，然后加回正确符号。
         for i, info in enumerate(self.crease_info):
             if info["type"] == 0:   # valley → 必须为正
-                constrained[i] = abs(constrained[i])
+                constrained[i] = (constrained[i] + 1.) * 0.5 * (self.max_offset - self.min_thickness) + self.min_thickness
             else:                   # mountain → 必须为负
-                constrained[i] = -abs(constrained[i])
+                constrained[i] = (constrained[i] - 1.) * 0.5 * (self.max_offset - self.min_thickness) - self.min_thickness
         
         # 离散化所有偏移量
         for i in range(len(constrained)):
             constrained[i] = self._discretize_offset(constrained[i])
         
         # 处理山/谷折痕间距约束
-        valley_indices = [i for i, info in enumerate(self.crease_info) if info["type"] == 0]
-        mountain_indices = [i for i, info in enumerate(self.crease_info) if info["type"] == 1]
+        # valley_indices = [i for i, info in enumerate(self.crease_info) if info["type"] == 0]
+        # mountain_indices = [i for i, info in enumerate(self.crease_info) if info["type"] == 1]
         
-        if len(valley_indices) > 0 and len(mountain_indices) > 0:
-            min_valley = min(constrained[i] for i in valley_indices)
-            max_mountain = max(constrained[j] for j in mountain_indices)
+        # if len(valley_indices) > 0 and len(mountain_indices) > 0:
+        #     min_valley = min(constrained[i] for i in valley_indices)
+        #     max_mountain = max(constrained[j] for j in mountain_indices)
             
-            if min_valley < max_mountain + 4.0:
-                gap = (max_mountain + 4.0) - min_valley
+        #     if min_valley < max_mountain + 4.0:
+        #         gap = (max_mountain + 4.0) - min_valley
                 
-                # 将valley折痕上移一半，mountain折痕下移一半
-                for i in valley_indices:
-                    constrained[i] += gap / 2 + 0.2
-                for j in mountain_indices:
-                    constrained[j] -= gap / 2 - 0.2
+        #         # 将valley折痕上移一半，mountain折痕下移一半
+        #         for i in valley_indices:
+        #             constrained[i] += max(gap / 2, 0.1)
+        #         for j in mountain_indices:
+        #             constrained[j] -= max(gap / 2, 0.1)
                 
-                # 重新离散化（符号已固定，此处直接离散化即可）
-                for i in range(len(constrained)):
-                    constrained[i] = self._discretize_offset(constrained[i])
+        #         # 重新离散化（符号已固定，此处直接离散化即可）
+        #         for i in range(len(constrained)):
+        #             constrained[i] = self._discretize_offset(constrained[i])
         
         return constrained
-
+    
     def _init_ti(self):
         """安全初始化 Taichi，避免重复初始化。
         Safely initialize Taichi to avoid re-init errors."""
         try:
-            if use_gpu:
-                ti.init(arch=ti.gpu, default_fp=data_type,
-                        fast_math=False, advanced_optimization=False, kernel_profiler=True)
-            else:
-                ti.init(arch=ti.cpu, default_fp=data_type,
-                        fast_math=False, advanced_optimization=False,
-                        cpu_max_num_threads=1, kernel_profiler=False, verbose=False)
-            # ti.init(arch=ti.cpu, default_fp=data_type, fast_math=False, advanced_optimization=False, cpu_max_num_threads=1, kernel_profiler=False, verbose=False)
+            ti.init(arch=ti.cpu, default_fp=data_type,
+                    fast_math=False, advanced_optimization=False, cpu_max_num_threads=1, kernel_profiler=False)#, verbose=True, debug=True, gdb_trigger=True)
         except Exception:
             pass
 
@@ -356,6 +358,27 @@ class ThickPanelDesignFramework:
         with open(self.batch_json_path, 'w', encoding='utf-8') as f:
             json.dump(batch_data, f, indent=2)
     
+    def objective_function(self, X):
+        ret = np.zeros(X.shape[1])
+        batch_size = self.batch_size
+
+        pointer = 0
+        pointer_max = X.shape[1] // self.batch_size
+
+        while pointer < pointer_max:
+            batch_X = X[:, pointer * batch_size:(pointer + 1) * batch_size]
+            folding_percentages, _ = self.evaluate_batch(batch_X.T, pointer + self.episode)
+            print(f"Episode: {pointer + self.episode} done.")
+            ret[pointer * batch_size:(pointer + 1) * batch_size] = folding_percentages
+            pointer += 1
+
+        self.episode += pointer_max
+        # for i in range(X.shape[0]):
+        #     x_array = X[i]
+        #     constrained_x_array = self._apply_constraints(x_array)
+        #     ret[i] = np.linalg.norm(constrained_x_array - self.target_heights)  # 临时占位，实际折叠百分比由仿真器计算
+        return ret
+
     def evaluate_batch(self, height_matrix: np.ndarray, algo_step: int) -> np.ndarray:
         """
         批量评估候选解
@@ -367,8 +390,13 @@ class ThickPanelDesignFramework:
         """
         # 应用约束
         constrained_matrix = np.zeros_like(height_matrix)
+        folding_percentages = [0. for _ in range(self.batch_size)]
+        
         for i in range(self.batch_size):
             constrained_matrix[i] = self._apply_constraints(height_matrix[i])
+        
+        # for i in range(self.batch_size):
+        #     folding_percentages[i] = np.linalg.norm(constrained_matrix[i] - self.target_heights)  # 临时占位，实际折叠百分比由仿真器计算
         
         # 设置高度偏移量到JSON
         self._set_heights_in_batch_json(constrained_matrix)
@@ -383,20 +411,42 @@ class ThickPanelDesignFramework:
             self.simulator = OrigamiSimulator(
                 origami_name=batch_json_name,
                 use_gui=self.use_gui,
-                fast=True,           # 使用快速仿真模式 / Use fast simulation mode
+                fast=True, ref_target=1, verbose=0,
             )
 
             self.simulator.ID = algo_step
+            
+            # 启动仿真
+            ok = self.simulator.start(batch_json_name, 4, thick_mode=1)
         
-        # 启动仿真
-        self.simulator.start(batch_json_name, 4, thick_mode=1)
+        else:
+            self.simulator.ID = algo_step
+            ok = self.simulator.start(batch_json_name, 4, thick_mode=1)
+            if not ok:
+                if self.use_gui:
+                    self.simulator.window.destroy()
+
+                self.simulator = None
+            
+                gc.collect() #清除内存残留
+                ti.reset()
+
+                self._init_ti()
+                self.simulator = OrigamiSimulator(
+                    origami_name=batch_json_name,
+                    use_gui=self.use_gui, 
+                    fast=True, ref_target=1, verbose=0,
+                )
+                self.simulator.ID = algo_step
+                # 启动仿真
+                ok = self.simulator.start(batch_json_name, 4, thick_mode=1)
         
         # 运行直到稳定
-        max_steps = 300  # 最大步数限制（减少以加速测试）(300 / 60 seconds)
+        max_steps = 60  # 最大步数限制（减少以加速测试）(60 / 60 seconds)
         step_count = 0
 
         self.simulator.initializeRunning()
-        self.simulator.enable_add_folding_angle = 0.03141 #单步目标折角增量
+        self.simulator.enable_add_folding_angle = 0.105 #单步目标折角增量
         
         while step_count < max_steps and self.simulator.window.running:
             self.simulator.step()
@@ -404,25 +454,31 @@ class ThickPanelDesignFramework:
                 self.simulator.render()
             # 检查是否稳定
             if self.simulator.stop():
-                self.simulator.outputFigure()
+                if algo_step % (self.population_size / self.batch_size * self.num_creases) == 0:
+                    self.simulator.outputFigure()
+                self.simulator.backupSimulationSetting()
                 break
             
             step_count += 1
         
         if step_count == max_steps:
-            self.simulator.outputFigure()
+            if algo_step % (self.population_size / self.batch_size * self.num_creases) == 0:
+                self.simulator.outputFigure()
+            self.simulator.backupSimulationSetting()
         
         # 获取每个折纸的折叠程度
         folding_percentages = self._extract_folding_percentages()
+
+        print(f"Batch {algo_step} evaluation completed: {folding_percentages}")
         
         # if self.use_gui:
-        self.simulator.window.destroy()
+        # self.simulator.window.destroy()
         
-        gc.collect() #清除内存残留
+        # gc.collect() #清除内存残留
 
-        ti.reset()
+        # ti.reset()
 
-        self.simulator = None
+        # self.simulator = None
         
         return folding_percentages, constrained_matrix
     
@@ -438,10 +494,19 @@ class ThickPanelDesignFramework:
         
         return folding_percentages
     
+    def optimize_using_DE(self, population_size: int = 16,
+                 generations: int = 50,):
+        bounds = np.array([
+            [-1., 1.] for _ in range(self.num_creases)
+        ])
+        result = differential_evolution(self.objective_function, bounds, popsize=population_size, maxiter=generations, disp=True, vectorized=True)
+        print(f"DE优化完成 / DE optimization completed")
+        print(f"  最优高度偏移量/Optimal height offsets: {self._apply_constraints(np.array(result.x))} with fitness {result.fun:.4f}")
+
     def optimize(self, 
                  population_size: int = 16,
                  generations: int = 50,
-                 sigma_init: float = 5.0,
+                 sigma_init: float = 1.0,
                  verbose: bool = True) -> Tuple[np.ndarray, float]:
         """
         使用CMA-ES算法优化高度偏移量
@@ -468,15 +533,28 @@ class ThickPanelDesignFramework:
         # 初始化均值向量（根据折痕类型设置初始值）
         # valley折痕(0)应该在上方（正值），mountain折痕(1)应该在下方（负值）
         mean = np.zeros(self.num_creases)
+
         for i, info in enumerate(self.crease_info):
             if info["type"] == 0:  # valley
-                mean[i] = self.min_thickness
+                mean[i] = 0.
             else:  # mountain
-                mean[i] = -self.min_thickness
+                mean[i] = 0.
         
+        if len(self.initial_mean):
+            new_mean = []
+            for i, info in enumerate(self.crease_info):
+                if info["type"] == 0:  # valley
+                    new_mean.append((self.initial_mean[i] - self.min_thickness) / (self.max_offset - self.min_thickness) * 2 - 1.)
+                else:  # mountain
+                    new_mean.append((self.initial_mean[i] + self.min_thickness) / (self.max_offset - self.min_thickness) * 2 + 1.)
+            mean = np.array(new_mean)
+
         # 设置边界约束
+        # bounds = np.array([
+        #     [-self.max_offset, self.max_offset] for _ in range(self.num_creases)
+        # ])
         bounds = np.array([
-            [-self.max_offset, self.max_offset] for _ in range(self.num_creases)
+            [-1., 1.] for _ in range(self.num_creases)
         ])
         
         # 初始化CMA-ES优化器
@@ -485,6 +563,8 @@ class ThickPanelDesignFramework:
             sigma=sigma_init,
             bounds=bounds,
             population_size=population_size,
+            seed=42,
+            lr_adapt=True
         )
         
         print(f"CMA-ES初始化完成 / CMA-ES initialized")
@@ -569,8 +649,11 @@ class ThickPanelDesignFramework:
                 print(f"  当前sigma/Current sigma: {optimizer._sigma:.4f}")
 
             origami_name = os.path.basename(self.batch_json_path).replace('.json', '')
-            with open('./physResult/cdf-' + origami_name + '/data.json', 'w', encoding="utf-8") as f:
-                json.dump(self.extract_data, f, indent=4)
+            try:
+                with open('./physResult/cdf-' + origami_name + '/data.json', 'w', encoding="utf-8") as f:
+                    json.dump(self.extract_data, f, indent=4)
+            except Exception as e:
+                print(f"保存数据失败/Failed to save data: {e}")
         
         print("\n" + "="*60)
         print("CMA-ES优化完成 / CMA-ES optimization completed")
@@ -598,7 +681,7 @@ def main():
     
     np.random.seed(42)
     # 设置路径
-    json_path = os.path.join(os.path.dirname(__file__), "descriptionData", "mountain-big-new.json")
+    json_path = os.path.join(os.path.dirname(__file__), "descriptionData", "mountain-thick.json")
     
     if not os.path.exists(json_path):
         print(f"错误：找不到文件 {json_path}")
@@ -606,8 +689,8 @@ def main():
         return
     
     # 参数设置
-    BATCH_SIZE = 40  # 每次仿真评估的候选解数量（CMA-ES种群大小）
-    POPULATION_SIZE = BATCH_SIZE * 10
+    BATCH_SIZE = 16  # 每次仿真评估的候选解数量（CMA-ES种群大小）
+    POPULATION_SIZE = 10 * BATCH_SIZE
     
     # 创建设计框架
     framework = ThickPanelDesignFramework(
@@ -615,19 +698,24 @@ def main():
         batch_size=BATCH_SIZE,
         population_size=POPULATION_SIZE,
         min_thickness=2.0, 
-        discrete_step=1.0,
-        max_offset=30.0,
+        discrete_step=0.1,
+        max_offset=20.0,
         use_gui=0
     )
     
     # 运行CMA-ES优化
     best_solution, best_fitness = framework.optimize(
         population_size=POPULATION_SIZE,  # CMA-ES种群大小等于batch_size
-        generations=100,       # 最大迭代代数
-        sigma_init=10.0,       # 初始变异强度
+        generations=200,       # 最大迭代代数
+        sigma_init=1.0,       # 初始变异强度
         verbose=True
     )
-    
+
+    # framework.optimize_using_DE(
+    #     population_size=16,
+    #     generations=500
+    # )
+
     # 验证已知答案
     # print("\n" + "="*60)
     # print("验证已知正确答案 / Verifying known correct answer")

@@ -1,4 +1,6 @@
 from utils import *
+from spatialhash import SpatialHash
+import time
 # import dxfgrabber
 
 # 定义折纸系统，包含各刚度和单元信息
@@ -35,6 +37,8 @@ class OrigamiSimulationSystem:
 
         self.new_kp_origami_id = []
 
+        self.spatialhash = SpatialHash(cell_size=1.0)
+
     def getNewLines(self):
         new_lines = []
         for ele in self.line_indices:
@@ -68,16 +72,17 @@ class OrigamiSimulationSystem:
     def distance(self, kp1, kp2):
         return ((kp1[0] - kp2[0]) ** 2 + (kp1[1] - kp2[1]) ** 2 + (kp1[2] - kp2[2]) ** 2) ** 0.5
         
-    def pointInList(self, kp, tolerance=2): # strict or loose
-        candidate_points_id = []
-        for i in range(len(self.kps)):
-            if self.distance(kp, self.kps[i]) < tolerance:
-                candidate_points_id.append(i)
-        if len(candidate_points_id) == 1:
-            return candidate_points_id[0]
-        elif len(candidate_points_id) > 1:
-            return candidate_points_id[0]   
-        return -1
+    def pointInList(self, kp, tolerance=1): # strict or loose
+        # candidate_points_id = []
+        # for i in range(len(self.kps)):
+        #     if self.distance(kp, self.kps[i]) < tolerance:
+        #         candidate_points_id.append(i)
+        # if len(candidate_points_id) == 1:
+        #     return candidate_points_id[0]
+        # elif len(candidate_points_id) > 1:
+        #     return candidate_points_id[0]   
+        # return -1
+        return self.spatialhash.find(kp, tolerance)
     
     def optimizeIndices(self):
         self.unit_edge_max = max([len(self.indices[i]) for i in range(len(self.indices))])
@@ -353,6 +358,385 @@ class OrigamiSimulationSystem:
                     created_mass[ele] = final_mass
         self.mass_list += created_mass
 
+    def optimizeIndices_v2(self):
+        """Optimized version of optimizeIndices using inverted index.
+
+        Complexity: O(F*E + V*D^2) where F=panels, E=edges/panel, V=vertices, D=avg degree
+        vs original O(F^3 * E).
+
+        Key optimizations:
+        1. vertex->panels inverted index replaces O(F^2) scan for shared border discovery
+        2. Chain tracing uses inverted index instead of scanning all panels each iteration
+        3. replacement_buffer uses set for O(1) deduplication
+        4. line_indices uses set for O(1) edge deduplication
+        5. Mass redistribution uses Counter for O(V+D) instead of O(V*D)
+        """
+        from collections import Counter, defaultdict
+
+        self.unit_edge_max = max(len(self.indices[i]) for i in range(len(self.indices)))
+        F = len(self.indices)
+
+        # ---- Phase 1: Build vertex -> panels inverted index ----
+        # vertex_to_panels[v] = [(panel_id, position), ...] sorted by panel_id
+        vertex_to_panels = defaultdict(list)
+        for pid in range(F):
+            n = len(self.indices[pid])
+            for pos in range(n):
+                v = self.indices[pid][pos]
+                vertex_to_panels[v].append((pid, pos))
+
+        def find_first_panel_with_both(v, w, min_pid=-1):
+            """Find first panel with id > min_pid containing both v and w.
+            Uses two-pointer merge on sorted lists. O(deg(v) + deg(w))."""
+            vp = vertex_to_panels.get(v, [])
+            wp = vertex_to_panels.get(w, [])
+            i, j = 0, 0
+            while i < len(vp) and j < len(wp):
+                pa, pb = vp[i][0], wp[j][0]
+                if pa < pb:
+                    i += 1
+                elif pa > pb:
+                    j += 1
+                else:
+                    if pa > min_pid:
+                        return pa
+                    i += 1
+                    j += 1
+            return -1
+
+        def find_first_panel_with_both_excluded(v, w, excluded):
+            """Find first panel containing both v and w, not in excluded set.
+            O(deg(v) + deg(w))."""
+            vp = vertex_to_panels.get(v, [])
+            wp = vertex_to_panels.get(w, [])
+            i, j = 0, 0
+            while i < len(vp) and j < len(wp):
+                pa, pb = vp[i][0], wp[j][0]
+                if pa < pb:
+                    i += 1
+                elif pa > pb:
+                    j += 1
+                else:
+                    if pa not in excluded:
+                        return pa
+                    i += 1
+                    j += 1
+            return -1
+
+        def check_full_in(vertex, accompany_pres, accompany_crt):
+            """Check if vertex + accompany_pres + accompany_crt are in the same
+            panel with non-BORDER crease types. Matches original: finds FIRST
+            panel (by id) containing all 3 points, checks its crease types.
+            O(deg(vertex) + deg(accompany_pres) + deg(accompany_crt))."""
+            vp_set = {p for p, _ in vertex_to_panels.get(vertex, [])}
+            if not vp_set:
+                return False
+            pp_set = {p for p, _ in vertex_to_panels.get(accompany_pres, [])}
+            if not pp_set:
+                return False
+            cp_set = {p for p, _ in vertex_to_panels.get(accompany_crt, [])}
+            if not cp_set:
+                return False
+            common = vp_set & pp_set & cp_set
+            if not common:
+                return False
+            first_panel = min(common)
+            idx = self.indices[first_panel]
+            ct = self.indices_crease_type[first_panel]
+            pos = idx.index(vertex)
+            n = len(idx)
+            return ct[pos] != BORDER and ct[(pos - 1 + n) % n] != BORDER
+
+        # ---- Phase 2: Process shared BORDER edges ----
+        replacement_buffer = []  # [panel_id, position, new_kp_id]
+        replacement_set = set()  # (panel_id, position) for O(1) lookup
+        created_kps = []
+        created_mass_ref = []
+
+        for i in range(F):
+            current_indice = self.indices[i]
+            current_crease_type_list = self.indices_crease_type[i]
+            kp_num = len(current_indice)
+
+            for j in range(kp_num):
+                current_crease_type = current_crease_type_list[j]
+                if current_crease_type != BORDER:
+                    continue
+
+                current_kp_id = current_indice[j]
+                next_kp_id = current_indice[(j + 1) % kp_num]
+
+                # Find first panel i2 > i containing both endpoints (inverted index)
+                i2 = find_first_panel_with_both(current_kp_id, next_kp_id, i)
+                if i2 < 0:
+                    continue
+
+                other_indice = self.indices[i2]
+                kp_num2 = len(other_indice)
+                other_crease_type_list = self.indices_crease_type[i2]
+                indice_position = other_indice.index(next_kp_id)
+
+                # Set up chain tracing variables (same as original)
+                preserved_id = [current_kp_id, next_kp_id]
+                preserved_id_accompany = [
+                    current_indice[(j - 1 + kp_num) % kp_num],
+                    current_indice[(j + 2 + kp_num) % kp_num]
+                ]
+                preserved_crease_type = [
+                    current_crease_type_list[(j - 1 + kp_num) % kp_num],
+                    current_crease_type_list[(j + 1 + kp_num) % kp_num]
+                ]
+
+                created_id_accompany = [
+                    other_indice[(indice_position + 2 + kp_num2) % kp_num2],
+                    other_indice[(indice_position - 1 + kp_num2) % kp_num2]
+                ]
+                created_crease_type = [
+                    other_crease_type_list[(indice_position + 1 + kp_num2) % kp_num2],
+                    other_crease_type_list[(indice_position - 1 + kp_num2) % kp_num2]
+                ]
+
+                backup_end_flag = [0, 0, 0, 0]
+                end_flag = [0, 0, 0, 0]
+
+                # Use sets for O(1) membership check during tracing
+                preserved_ids_1 = {i}
+                preserved_ids_2 = {i}
+                replace_ids_1_set = {i2}
+                replace_ids_2_set = {i2}
+                # Keep ordered lists for replacement recording
+                replace_ids_1_list = [i2]
+                replace_ids_2_list = [i2]
+
+                max_iterations = 1000
+                iteration_count = 0
+                steps = [0, 0, 0, 0]
+
+                while 0 in end_flag:
+                    # con-stop condition
+                    if preserved_id_accompany[0] == created_id_accompany[0] and \
+                       created_crease_type[0] != BORDER and preserved_crease_type[0] != BORDER:
+                        replace_ids_1_set.clear()
+                        replace_ids_1_list.clear()
+                        end_flag[0] = end_flag[2] = 1
+                    if preserved_id_accompany[1] == created_id_accompany[1] and \
+                       created_crease_type[1] != BORDER and preserved_crease_type[1] != BORDER:
+                        replace_ids_2_set.clear()
+                        replace_ids_2_list.clear()
+                        end_flag[1] = end_flag[3] = 1
+
+                    # full-in condition (using inverted index)
+                    if check_full_in(preserved_id[0], preserved_id_accompany[0], created_id_accompany[0]):
+                        replace_ids_1_set.clear()
+                        replace_ids_1_list.clear()
+                        end_flag[0] = end_flag[2] = 1
+                    if check_full_in(preserved_id[1], preserved_id_accompany[1], created_id_accompany[1]):
+                        replace_ids_2_set.clear()
+                        replace_ids_2_list.clear()
+                        end_flag[1] = end_flag[3] = 1
+
+                    # single stop
+                    if preserved_crease_type[0] == BORDER:
+                        end_flag[0] = 1
+                    if preserved_crease_type[1] == BORDER:
+                        end_flag[1] = 1
+                    if created_crease_type[0] == BORDER:
+                        end_flag[2] = 1
+                    if created_crease_type[1] == BORDER:
+                        end_flag[3] = 1
+
+                    # roll (only if end_flag hasn't changed since last iteration)
+                    if end_flag == backup_end_flag:
+                        steps = [0, 0, 0, 0]
+
+                        # Chain 0: preserved_ids_1 (vertex preserved_id[0], prev direction)
+                        if not end_flag[0] and not steps[0]:
+                            i3 = find_first_panel_with_both_excluded(
+                                preserved_id[0], preserved_id_accompany[0], preserved_ids_1)
+                            if i3 >= 0:
+                                kp_num3 = len(self.indices[i3])
+                                preserved_ids_1.add(i3)
+                                position = self.indices[i3].index(preserved_id[0])
+                                previous_id = self.indices[i3][((position - 1) + kp_num3) % kp_num3]
+                                next_id = self.indices[i3][((position + 1) + kp_num3) % kp_num3]
+                                if previous_id == preserved_id_accompany[0]:
+                                    preserved_id_accompany[0] = next_id
+                                    preserved_crease_type[0] = self.indices_crease_type[i3][((position) + kp_num3) % kp_num3]
+                                else:
+                                    preserved_id_accompany[0] = previous_id
+                                    preserved_crease_type[0] = self.indices_crease_type[i3][((position - 1) + kp_num3) % kp_num3]
+                                if preserved_crease_type[0] == BORDER:
+                                    end_flag[0] = 1
+                                steps[0] = 1
+
+                        # Chain 1: preserved_ids_2 (vertex preserved_id[1], next direction)
+                        if not end_flag[1] and not steps[1]:
+                            i3 = find_first_panel_with_both_excluded(
+                                preserved_id[1], preserved_id_accompany[1], preserved_ids_2)
+                            if i3 >= 0:
+                                kp_num3 = len(self.indices[i3])
+                                preserved_ids_2.add(i3)
+                                position = self.indices[i3].index(preserved_id[1])
+                                previous_id = self.indices[i3][((position - 1) + kp_num3) % kp_num3]
+                                next_id = self.indices[i3][((position + 1) + kp_num3) % kp_num3]
+                                if previous_id == preserved_id_accompany[1]:
+                                    preserved_id_accompany[1] = next_id
+                                    preserved_crease_type[1] = self.indices_crease_type[i3][((position) + kp_num3) % kp_num3]
+                                else:
+                                    preserved_id_accompany[1] = previous_id
+                                    preserved_crease_type[1] = self.indices_crease_type[i3][((position - 1) + kp_num3) % kp_num3]
+                                if preserved_crease_type[1] == BORDER:
+                                    end_flag[1] = 1
+                                steps[1] = 1
+
+                        # Chain 2: replace_ids_1 (vertex preserved_id[0], created side)
+                        if not end_flag[2] and not steps[2]:
+                            i3 = find_first_panel_with_both_excluded(
+                                preserved_id[0], created_id_accompany[0], replace_ids_1_set)
+                            if i3 >= 0:
+                                kp_num3 = len(self.indices[i3])
+                                replace_ids_1_set.add(i3)
+                                replace_ids_1_list.append(i3)
+                                position = self.indices[i3].index(preserved_id[0])
+                                previous_id = self.indices[i3][((position - 1) + kp_num3) % kp_num3]
+                                next_id = self.indices[i3][((position + 1) + kp_num3) % kp_num3]
+                                if previous_id == created_id_accompany[0]:
+                                    created_id_accompany[0] = next_id
+                                    created_crease_type[0] = self.indices_crease_type[i3][((position) + kp_num3) % kp_num3]
+                                else:
+                                    created_id_accompany[0] = previous_id
+                                    created_crease_type[0] = self.indices_crease_type[i3][((position - 1) + kp_num3) % kp_num3]
+                                if created_crease_type[0] == BORDER:
+                                    end_flag[2] = 1
+                                steps[2] = 1
+
+                        # Chain 3: replace_ids_2 (vertex preserved_id[1], created side)
+                        if not end_flag[3] and not steps[3]:
+                            i3 = find_first_panel_with_both_excluded(
+                                preserved_id[1], created_id_accompany[1], replace_ids_2_set)
+                            if i3 >= 0:
+                                kp_num3 = len(self.indices[i3])
+                                replace_ids_2_set.add(i3)
+                                replace_ids_2_list.append(i3)
+                                position = self.indices[i3].index(preserved_id[1])
+                                previous_id = self.indices[i3][((position - 1) + kp_num3) % kp_num3]
+                                next_id = self.indices[i3][((position + 1) + kp_num3) % kp_num3]
+                                if previous_id == created_id_accompany[1]:
+                                    created_id_accompany[1] = next_id
+                                    created_crease_type[1] = self.indices_crease_type[i3][((position) + kp_num3) % kp_num3]
+                                else:
+                                    created_id_accompany[1] = previous_id
+                                    created_crease_type[1] = self.indices_crease_type[i3][((position - 1) + kp_num3) % kp_num3]
+                                if created_crease_type[1] == BORDER:
+                                    end_flag[3] = 1
+                                steps[3] = 1
+
+                        # no progress -> stop (only when roll actually executed)
+                        if steps[0] == 0 and end_flag[0] == 0:
+                            end_flag[0] = 1
+                        if steps[1] == 0 and end_flag[1] == 0:
+                            end_flag[1] = 1
+                        if steps[2] == 0 and end_flag[2] == 0:
+                            end_flag[2] = 1
+                        if steps[3] == 0 and end_flag[3] == 0:
+                            end_flag[3] = 1
+
+                    backup_end_flag = end_flag[:]
+
+                    iteration_count += 1
+                    if iteration_count >= max_iterations:
+                        print(f"[Warning] optimizeIndices_v2: 达到最大迭代次数 {max_iterations}，强制退出循环")
+                        print(f"  当前单元: {i}, 配对单元: {i2}")
+                        print(f"  end_flag: {end_flag}, steps: {steps}")
+                        break
+
+                # Deduplicate replace_ids_1_list against replacement_set
+                filtered_1 = []
+                for pid in replace_ids_1_list:
+                    pos = self.indices[pid].index(preserved_id[0])
+                    if (pid, pos) not in replacement_set:
+                        filtered_1.append(pid)
+
+                # Deduplicate replace_ids_2_list against replacement_set
+                filtered_2 = []
+                for pid in replace_ids_2_list:
+                    pos = self.indices[pid].index(preserved_id[1])
+                    if (pid, pos) not in replacement_set:
+                        filtered_2.append(pid)
+
+                if len(filtered_1) and all(pid > i for pid in filtered_1):
+                    created_kps.append(deepcopy(self.kps[preserved_id[0]]))
+                    created_mass_ref.append(preserved_id[0])
+                    new_kp_id = len(self.kps) + len(created_kps) - 1
+                    for pid in filtered_1:
+                        pos = self.indices[pid].index(preserved_id[0])
+                        replacement_buffer.append([pid, pos, new_kp_id])
+                        replacement_set.add((pid, pos))
+
+                if len(filtered_2) and all(pid > i for pid in filtered_2):
+                    created_kps.append(deepcopy(self.kps[preserved_id[1]]))
+                    created_mass_ref.append(preserved_id[1])
+                    new_kp_id = len(self.kps) + len(created_kps) - 1
+                    for pid in filtered_2:
+                        pos = self.indices[pid].index(preserved_id[1])
+                        replacement_buffer.append([pid, pos, new_kp_id])
+                        replacement_set.add((pid, pos))
+
+        # ---- Phase 3: Apply replacements ----
+        for ele in replacement_buffer:
+            self.indices[ele[0]][ele[1]] = ele[2]
+
+        # ---- Phase 4: Compute new_kp_origami_id ----
+        self.new_kp_origami_id = []
+        seen_kp_section = set()
+        for ele in replacement_buffer:
+            unit_id = ele[0]
+            kp_id = ele[2]
+            for k in range(len(self.split_unit_list)):
+                if self.split_unit_list[k] <= unit_id and (k == len(self.split_unit_list) - 1 or self.split_unit_list[k + 1] > unit_id):
+                    break
+            key = (kp_id, k)
+            if key not in seen_kp_section:
+                seen_kp_section.add(key)
+                self.new_kp_origami_id.append([kp_id, k])
+
+        # ---- Phase 5: Redistribute mass ----
+        mass_ref_count = Counter(created_mass_ref)
+        mass_ref_indices = defaultdict(list)
+        for j, v in enumerate(created_mass_ref):
+            mass_ref_indices[v].append(j)
+
+        created_mass = [0.0] * len(created_mass_ref)
+        original_kp_len = len(self.kps)
+        self.kps += created_kps
+        for orig_v, count in mass_ref_count.items():
+            portion = count + 1
+            final_mass = self.mass_list[orig_v] / portion
+            self.mass_list[orig_v] = final_mass
+            for j in mass_ref_indices[orig_v]:
+                created_mass[j] = final_mass
+        self.mass_list += created_mass
+
+        # ---- Phase 6: Rebuild line_indices (with set-based deduplication) ----
+        self.line_indices.clear()
+        seen_edges = set()
+        for i1 in range(len(self.unit_list)):
+            unit = self.unit_list[i1]
+            n = len(self.indices[i1])
+            for i in range(n):
+                next_i = (i + 1) % n
+                linetype = unit.crease[i].getType()
+                if unit.crease[i].hard:
+                    linetype = 3
+                indice1 = self.indices[i1][i]
+                indice2 = self.indices[i1][next_i]
+                edge_key = (min(indice1, indice2), max(indice1, indice2))
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    self.line_indices.append([[indice1, indice2], linetype,
+                        unit.crease[i].folding_angle_upper_bound,
+                        unit.crease[i].folding_angle_lower_bound])
+                    
     def addUnit(self, unit: Unit, special=False, scale=1.0, tol=1.0):    
         temp_indice = []
         temp_indice_crease_type = []
@@ -390,6 +774,7 @@ class OrigamiSimulationSystem:
             if exist_indice < 0:
                 temp_indice.append(len(self.kps))
                 self.kps.append(kp)
+                self.spatialhash.insert(kp, len(self.kps) - 1)
                 self.mass_list.append(unit.mass[i])
                 self.dup_time_list.append(1.)
             else:
@@ -449,17 +834,18 @@ class OrigamiSimulationSystem:
         return max([abs(alpha0 - alpha1), abs(alpha0 - alpha2), abs(alpha1 - alpha2)])
     
     def mesh(self):
-        self.optimizeIndices()
+        # self.optimizeIndices()
+        self.optimizeIndices_v2()
         self.tri_indices.clear()
         self.tri_indices_ref.clear()
         kp_len = len(self.kps)
         self.connection_matrix = [[0] * kp_len for _ in range(kp_len)]
-        self.origin_distance_matrix = [[0] * kp_len for _ in range(kp_len)]
+        # self.origin_distance_matrix = [[0] * kp_len for _ in range(kp_len)]
 
-        #origin distance
-        for i in range(kp_len):
-            for j in range(kp_len):
-                self.origin_distance_matrix[i][j] = self.distance(self.kps[i], self.kps[j])
+        # #origin distance
+        # for i in range(kp_len):
+        #     for j in range(kp_len):
+        #         self.origin_distance_matrix[i][j] = self.distance(self.kps[i], self.kps[j])
         
         # for i in range(kp_len):
         #     self.mass_list[i] = 5e-7
@@ -467,6 +853,7 @@ class OrigamiSimulationSystem:
         self.facet_cons_id = []
         facet_pair = []
         current_tri_indice_ref = 0
+
         #spring force
         for i in range(len(self.unit_list)):
             indices = self.indices[i]
@@ -531,36 +918,37 @@ class OrigamiSimulationSystem:
             
             self.tri_indices_ref.append(current_tri_indice_ref)
             current_tri_indice_ref += len(tri_indices)
-            # for k in range(unit_kp_len):
-            #     indice_k = indices[k]
-            #     for l in range(unit_kp_len):
-            #         indice_l = indices[l]
-            #         self.connection_matrix[indice_k][indice_l] = k_element[k][l]
-        
+
+        # Build adjacency sets and edge-to-triangle index for O(1) lookup
+        # Replaces O(N) connection_matrix row scan with O(min(deg)) set intersection
+        adjacency = [set() for _ in range(kp_len)]
+        edge_to_tris = {}
+        for j in range(len(self.tri_indices) // 3):
+            a = self.tri_indices[3 * j]
+            b = self.tri_indices[3 * j + 1]
+            c = self.tri_indices[3 * j + 2]
+            adjacency[a].add(b); adjacency[b].add(a)
+            adjacency[b].add(c); adjacency[c].add(b)
+            adjacency[a].add(c); adjacency[c].add(a)
+            for e in (frozenset((a, b)), frozenset((b, c)), frozenset((a, c))):
+                if e not in edge_to_tris:
+                    edge_to_tris[e] = []
+                edge_to_tris[e].append(j)
+
         #bending force
         for i in range(len(self.line_indices)):
-            # indices = self.indices[i]
-            # unit_kp_len = len(indices)
-            # for j in range(unit_kp_len):
-            # line_start_indice = indices[j]
-            # line_end_indice = indices[(j + 1) % unit_kp_len]
             line_start_indice = self.line_indices[i][0][0]
             line_end_indice = self.line_indices[i][0][1]
             line_type = self.line_indices[i][1]
-            start_row = self.connection_matrix[line_start_indice]
-            end_row = self.connection_matrix[line_end_indice]
 
-            relevant_kp = []
-            for k in range(kp_len):
-                if abs(start_row[k] - end_row[k]) < 1e-5 and start_row[k] > 0:
-                    relevant_kp.append(k)
-            
+            relevant_kp = sorted(adjacency[line_start_indice] & adjacency[line_end_indice])
+
             if len(relevant_kp) == 2 and [line_end_indice, line_start_indice] not in self.crease_pairs:
                 crease_pair = [line_start_indice, line_end_indice]
                 result = 0
-                for j in range(len(self.tri_indices) // 3):
+                for j in edge_to_tris.get(frozenset((line_start_indice, line_end_indice)), []):
                     tri_index = [self.tri_indices[3 * j], self.tri_indices[3 * j + 1], self.tri_indices[3 * j + 2]]
-                    if line_start_indice in tri_index and line_end_indice in tri_index and relevant_kp[0] in tri_index:
+                    if relevant_kp[0] in tri_index:
                         index_start = tri_index.index(line_start_indice)
                         index_end = tri_index.index(line_end_indice)
                         if index_end == index_start + 1 or (index_end == 0 and index_start == 2):
@@ -593,13 +981,8 @@ class OrigamiSimulationSystem:
         for i in range(len(facet_pair)):
             line_start_indice = facet_pair[i][0]
             line_end_indice = facet_pair[i][1]
-            start_row = self.connection_matrix[line_start_indice]
-            end_row = self.connection_matrix[line_end_indice]
 
-            relevant_kp = []
-            for k in range(kp_len):
-                if abs(start_row[k] - end_row[k]) < 1e-5 and start_row[k] > 0:
-                    relevant_kp.append(k)
+            relevant_kp = sorted(adjacency[line_start_indice] & adjacency[line_end_indice])
             
             if len(relevant_kp) == 2 and [line_end_indice, line_start_indice] not in self.facet_crease_pairs:
                 facet_crease_pair = [line_start_indice, line_end_indice]
@@ -611,8 +994,8 @@ class OrigamiSimulationSystem:
                 else:
                     self.facet_bending_pairs.append([relevant_kp[1], relevant_kp[0]])
                 self.facet_crease_pairs.append(facet_crease_pair)
-                
-        
+
+
         while len(self.mass_list) < len(self.kps):
             self.mass_list.insert(0, 0.0)
 

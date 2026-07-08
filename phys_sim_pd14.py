@@ -3,16 +3,19 @@ import taichi.math as tm
 import json
 import time, os
 import yaml
+import gc
+from spatialhash import SpatialHash
 from ori_sim_sys import *
 
-data_type = ti.f32
-numpy_data_type = np.float32
+data_type = ti.f64
+numpy_data_type = np.float64
 use_gpu = 0
 
 if use_gpu:
     ti.init(arch=ti.gpu, default_fp=data_type, fast_math=False, advanced_optimization=False, kernel_profiler=True)
 else:
-    ti.init(arch=ti.cpu, default_fp=data_type, fast_math=False, advanced_optimization=False, cpu_max_num_threads=1, kernel_profiler=False, verbose=False)
+    ti.init(arch=ti.cpu, default_fp=data_type, fast_math=False, advanced_optimization=False, cpu_max_num_threads=1) #, kernel_profiler=False, verbose=True, debug=True, gdb_trigger=True)
+
 
 
 def ensure_taichi_init(force_cpu: bool = False):
@@ -88,7 +91,20 @@ class PD_Origami_Simulator:
                 pass
         
         self.origami_thickness = 1.32
-        
+
+        self.backup_spring_cons_num = 0
+        self.backup_facet_space = 0
+        self.backup_maximum_kp_number = 0
+        self.backup_maximum_line_indice_num = 0
+
+    def _init_ti(self):
+        """安全初始化 Taichi，避免重复初始化。
+        Safely initialize Taichi to avoid re-init errors."""
+        try:
+            ti.init(arch=ti.cpu, default_fp=data_type, fast_math=False, advanced_optimization=False, cpu_max_num_threads=1, kernel_profiler=False, verbose=False)
+        except Exception:
+            pass
+         
     def biasKp(self, kp, bias):
         new_kp = deepcopy(kp)
         for i in range(min(len(new_kp), len(bias))):
@@ -195,16 +211,24 @@ class PD_Origami_Simulator:
         density = 1.24e-9
         if self.material_type == 2:
             density = 0.08e-9
-        tolerance = 0.1 if thick_mode else 1.0
+        tolerance = 0.05 if thick_mode else 1.0
         self.ori_sim = OrigamiSimulationSystem(unit_edge_max, material_density=density, split_unit_list=self.split_start_index)
+        
         for ele in self.units:
             self.ori_sim.addUnit(ele, ele.special, self.origami_thickness, tol=tolerance)
+
         self.ori_sim.mesh() #构造三角剖分
 
         self.unit_edge_max = self.ori_sim.unit_edge_max
         self.ori_sim.fillBlankIndices() # fill all blank indice with -1
 
-    def commonStart_2(self, occupy_memory=True):
+    def backupSimulationSetting(self):
+        self.backup_spring_cons_num = self.spring_cons_num
+        self.backup_facet_space =self.facet_space
+        self.backup_maximum_kp_number = self.maximum_kp_number
+        self.backup_maximum_line_indice_num = self.maximum_line_indice_num
+
+    def commonStart_2(self, occupy_memory=True, multiple=1.1):
         ori_sim = self.ori_sim
         self.connection_matrix = ori_sim.connection_matrix
         self.mass_list = ori_sim.mass_list
@@ -248,35 +272,59 @@ class PD_Origami_Simulator:
             self.split_kp_sets_min.append(min(kp_set))
             self.split_kp_sets_max.append(max(kp_set))
 
-        # self.spring_cons_num = int(np.count_nonzero(np.array(self.connection_matrix)) // 2 + 3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))]))
-        self.spring_cons_num = int(np.count_nonzero(np.array(self.connection_matrix)) // 2 + self.maximum_number_of_thick_panel_spring)
+        self.spring_cons_num = int(np.count_nonzero(np.array(self.connection_matrix)) // 2 + 3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))]))
+        # self.spring_cons_num = int(np.count_nonzero(np.array(self.connection_matrix)) // 2 + self.maximum_number_of_thick_panel_spring)
         self.bending_cons_num = len(self.crease_pairs_list)
         self.facet_bending_cons_num = len(self.facet_crease_pairs_list)
-        facet_space = max(self.facet_bending_cons_num, self.maximum_facet_crease_number)
+        
+        self.facet_space = self.facet_bending_cons_num
+        self.maximum_kp_number = int(self.kp_num)
+        self.maximum_line_indice_num = int(self.line_total_indice_num)
 
         if self.verbose:
-            print(f"# of Spring constraints: {np.count_nonzero(np.array(self.connection_matrix)) // 2} in-panel + {3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))])} out-of-panel in practice, using maximum value {self.maximum_number_of_thick_panel_spring} to maximize the space\n" + \
+            print(f"# of Spring constraints: {np.count_nonzero(np.array(self.connection_matrix)) // 2} in-panel + {3 * sum([len(ori_sim.indices[self.connected_unit_pairs[i][0]]) for i in range(len(self.connected_unit_pairs))])} out-of-panel in practice\n" + \
                 f"# of Bending constraints: {self.bending_cons_num}\n" + \
-                f"# of Facet bending constraints: {self.facet_bending_cons_num} in practice")
+                f"# of Facet bending constraints: {self.facet_bending_cons_num} in practice\n" + \
+                f"# of keypoints: {self.kp_num} in practice\n" + \
+                f"# of line indices: {self.line_total_indice_num} in practice")
         
         self.maximum_level_number = 1
         for i in range(len(self.ori_sim.line_indices)):
             self.ori_sim.line_indices[i] = [self.ori_sim.line_indices[i][0][START], self.ori_sim.line_indices[i][0][END], self.ori_sim.line_indices[i][1], self.ori_sim.line_indices[i][2], self.ori_sim.line_indices[i][3]]
 
+        if self.spring_cons_num > self.backup_spring_cons_num or \
+              self.facet_space > self.backup_facet_space or \
+                self.maximum_kp_number > self.backup_maximum_kp_number or \
+                    self.maximum_line_indice_num > self.backup_maximum_line_indice_num:
+            occupy_memory = True
+            self.maximum_kp_number = int(self.maximum_kp_number * multiple) // 2 * 2
+            self.spring_cons_num = int(self.spring_cons_num * multiple) // 2 * 2
+            self.facet_space = int(self.facet_space * multiple) // 2 * 2
+            self.maximum_line_indice_num = int(self.maximum_line_indice_num * multiple) // 2 * 2
+            self.unit_indices_num = int(self.unit_indices_num * multiple) // 2 * 2
+            if self.backup_maximum_kp_number != 0:
+                return 0
+        else:
+            self.spring_cons_num = self.backup_spring_cons_num
+            self.facet_space = self.backup_facet_space
+            self.maximum_kp_number = self.backup_maximum_kp_number
+            self.maximum_line_indice_num = self.backup_maximum_line_indice_num
+            occupy_memory = False
+        
         # ---memory--- #
         if occupy_memory:
-            self.x = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的位置
-            self.x0 = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的位置
-            self.s = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的位置
-            self.v = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的速度
-            self.dv = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) #点的加速度
+            self.x = ti.Vector.field(3, dtype=data_type, shape=self.maximum_kp_number) #点的位置
+            self.x0 = ti.Vector.field(3, dtype=data_type, shape=self.maximum_kp_number) #点的位置
+            self.s = ti.Vector.field(3, dtype=data_type, shape=self.maximum_kp_number) #点的位置
+            self.v = ti.Vector.field(3, dtype=data_type, shape=self.maximum_kp_number) #点的速度
+            self.dv = ti.Vector.field(3, dtype=data_type, shape=self.maximum_kp_number) #点的加速度
 
             self.unit_indices = ti.Vector.field(self.unit_edge_max, dtype=int, shape=self.unit_indices_num) # 每个单元的索引信息
 
-            self.vertices = ti.Vector.field(3, dtype=ti.f32, shape=self.kp_num) #点的位置
-            self.original_vertices = ti.Vector.field(3, dtype=data_type, shape=self.kp_num) # 原始点坐标
+            self.vertices = ti.Vector.field(3, dtype=ti.f32, shape=self.maximum_kp_number) #点的位置
+            self.original_vertices = ti.Vector.field(3, dtype=data_type, shape=self.maximum_kp_number) # 原始点坐标
 
-            self.masses = ti.field(dtype=data_type, shape=self.kp_num) # 质量信息
+            self.masses = ti.field(dtype=data_type, shape=self.maximum_kp_number) # 质量信息
 
             self.energy = ti.field(dtype=data_type, shape=())
             self.split_energy = ti.field(dtype=data_type, shape=self.split_origami_num)
@@ -286,6 +334,9 @@ class PD_Origami_Simulator:
             self.facet_bending_k_param = ti.field(dtype=data_type, shape=())
 
             self.kp_num_param = ti.field(dtype=int, shape=())
+            self.kp_max_num_param = ti.field(dtype=int, shape=())
+            self.line_total_indice_num_param = ti.field(dtype=int, shape=())
+            self.indices_num_param = ti.field(dtype=int, shape=())
             self.split_origami_num_param = ti.field(dtype=int, shape=())
 
             self.spring_num_param = ti.field(dtype=int, shape=())
@@ -303,21 +354,21 @@ class PD_Origami_Simulator:
             self.bending_x_proj = ti.Vector.field(3, dtype=data_type, shape=4 * self.bending_cons_num)
             self.bending_selection_corresponding_origami_id = ti.field(dtype=int, shape=self.bending_cons_num)
             # facet_bending: 每个约束 4 个索引 → shape = 4 * facet_bending_cons_num
-            self.facet_bending_selection = ti.field(dtype=int, shape=4 * max(facet_space, 1))
-            self.facet_bending_x_proj = ti.Vector.field(3, dtype=data_type, shape=4 * max(facet_space, 1))
-            self.facet_bending_selection_corresponding_origami_id = ti.field(dtype=int, shape=facet_space)
+            self.facet_bending_selection = ti.field(dtype=int, shape=4 * max(self.facet_space, 1))
+            self.facet_bending_x_proj = ti.Vector.field(3, dtype=data_type, shape=4 * max(self.facet_space, 1))
+            self.facet_bending_selection_corresponding_origami_id = ti.field(dtype=int, shape=self.facet_space)
 
             # === 余切权重（cotangent Laplacian 构型相关常数，initializeRunning 时计算一次） ===
             self.cotangent_vector = ti.Vector.field(4, dtype=data_type, shape=self.bending_cons_num)
-            self.facet_cotangent_vector = ti.Vector.field(4, dtype=data_type, shape=max(facet_space, 1))
+            self.facet_cotangent_vector = ti.Vector.field(4, dtype=data_type, shape=max(self.facet_space, 1))
             self.cotangent_matrix = ti.Matrix.field(4, 4, dtype=data_type, shape=self.bending_cons_num)
-            self.facet_cotangent_matrix = ti.Matrix.field(4, 4, dtype=data_type, shape=max(facet_space, 1))
+            self.facet_cotangent_matrix = ti.Matrix.field(4, 4, dtype=data_type, shape=max(self.facet_space, 1))
 
-            self.line_pairs = ti.field(dtype=int, shape=(self.line_total_indice_num, 2)) #线段索引信息，用于初始化渲染
-            self.line_color = ti.Vector.field(3, dtype=data_type, shape=self.line_total_indice_num*2) #线段颜色，用于渲染
-            self.line_vertex = ti.Vector.field(3, dtype=ti.f32, shape=self.line_total_indice_num*2) #线段顶点位置，用于渲染
+            self.line_pairs = ti.field(dtype=int, shape=(self.maximum_line_indice_num, 2)) #线段索引信息，用于初始化渲染
+            self.line_color = ti.Vector.field(3, dtype=data_type, shape=self.maximum_line_indice_num*2) #线段颜色，用于渲染
+            self.line_vertex = ti.Vector.field(3, dtype=ti.f32, shape=self.maximum_line_indice_num*2) #线段顶点位置，用于渲染
 
-            self.indices = ti.field(int, shape=self.indices_num) #三角面索引信息
+            self.indices = ti.field(int, shape=self.maximum_indice_num) #三角面索引信息
 
             self.bending_pairs = ti.field(dtype=int, shape=(self.bending_pairs_num, 2)) #弯曲对索引信息
             self.crease_pairs = ti.field(dtype=int, shape=(self.crease_pairs_num, 2)) #折痕对索引信息
@@ -347,11 +398,11 @@ class PD_Origami_Simulator:
 
             # 有可能所有单元都是三角形，故没有面折痕，根据特定条件初始化面折痕信息
             if self.facet_bending_pairs_num > 0:
-                self.facet_bending_pairs = ti.field(dtype=int, shape=(facet_space, 2))
-                self.facet_crease_pairs = ti.field(dtype=int, shape=(facet_space, 2))
-                self.facet_bending_pairs_area = ti.field(dtype=data_type, shape=(facet_space, 2)) #弯曲对面积信息
-                self.facet_crease_initial_length = ti.field(dtype=data_type, shape=facet_space) #折痕长度
-                self.facet_bending_pairs_distance = ti.field(dtype=data_type, shape=facet_space) #折痕有效弯曲长度
+                self.facet_bending_pairs = ti.field(dtype=int, shape=(self.facet_space, 2))
+                self.facet_crease_pairs = ti.field(dtype=int, shape=(self.facet_space, 2))
+                self.facet_bending_pairs_area = ti.field(dtype=data_type, shape=(self.facet_space, 2)) #弯曲对面积信息
+                self.facet_crease_initial_length = ti.field(dtype=data_type, shape=self.facet_space) #折痕长度
+                self.facet_bending_pairs_distance = ti.field(dtype=data_type, shape=self.facet_space) #折痕有效弯曲长度
 
             else:
                 self.facet_bending_pairs = ti.field(dtype=int, shape=(1, 2))
@@ -378,19 +429,22 @@ class PD_Origami_Simulator:
             self.collision_indice_param = ti.field(data_type, shape=())
             self.collision_d_param = ti.field(data_type, shape=())
 
-            self.AK_field = ti.field(dtype=data_type, shape=(3 * self.kp_num, 3 * self.kp_num))
+            self.AK_field = ti.field(dtype=data_type, shape=(3 * self.maximum_kp_number, 3 * self.maximum_kp_number))
 
-            self.AK = ti.linalg.SparseMatrixBuilder(3 * self.kp_num, 3 * self.kp_num, max_num_triplets=9 * self.kp_num ** 2, dtype=data_type)
+            self.AK = ti.linalg.SparseMatrixBuilder(3 * self.maximum_kp_number, 3 * self.maximum_kp_number, max_num_triplets=9 * self.maximum_kp_number ** 2, dtype=data_type)
 
-            self.AM = ti.linalg.SparseMatrix(3 * self.kp_num, 3 * self.kp_num, dtype=data_type)
+            self.AM = ti.linalg.SparseMatrix(3 * self.maximum_kp_number, 3 * self.maximum_kp_number, dtype=data_type)
 
-            self.b = ti.field(data_type, shape=3 * self.kp_num)
-            self.b_array = ti.ndarray(data_type, 3 * self.kp_num)
-            self.u0 = ti.field(data_type, shape=3 * self.kp_num) # solution
+            self.b = ti.field(data_type, shape=3 * self.maximum_kp_number)
+            self.b_array = ti.ndarray(data_type, 3 * self.maximum_kp_number)
+            self.u0 = ti.field(data_type, shape=3 * self.maximum_kp_number) # solution
+
+        return 1
 
     def start(self, filepath, unit_edge_max, thick_mode=False, occupy_memory=True):
         # 存储厚板模式标志 / Store thick mode flag
         self.thick_mode_flag = thick_mode
+        self.origami_name = filepath
         self.json_stem = filepath
 
         with open("./descriptionData/" + filepath + ".json", 'r', encoding='utf-8') as fw:
@@ -399,13 +453,20 @@ class PD_Origami_Simulator:
         self.kps = []
         self.lines = []
         self.units = []
-        
+
+        spatialhash = SpatialHash(cell_size=1.0)
+
         self.contributions = []
         self.connected_unit_pairs = []
 
-        self.maximum_number_of_thick_panel = 0
-        self.maximum_number_of_thick_panel_spring = 0
-        self.maximum_facet_crease_number = 0
+        if occupy_memory:
+            self.maximum_number_of_thick_panel = 0
+            self.maximum_number_of_thick_panel_spring = 0
+            self.maximum_facet_crease_number = 0
+            self.maximum_kp_number = 0
+            self.maximum_indice_num = 0
+            self.maximum_line_indice_num = 0
+
         unit_mapping = []
 
         try:
@@ -426,6 +487,7 @@ class PD_Origami_Simulator:
             self.split_start_index = [split_interval * _ for _ in range(self.split_origami_num)]
             for i in range(len(input_json["kps"])):
                 self.kps.append(input_json["kps"][i])
+                spatialhash.insert(input_json["kps"][i], i)
                 
             for i in range(len(input_json["lines"])):
                 self.lines.append(Crease(
@@ -467,9 +529,18 @@ class PD_Origami_Simulator:
                             folding_angle_upper_bound = line.folding_angle_upper_bound
                             folding_angle_lower_bound = line.folding_angle_lower_bound
                             break
+                    if occupy_memory:
+                        if crease_type == BORDER:
+                            self.maximum_kp_number += 1.
+                            self.maximum_line_indice_num += 1.
+                        else:
+                            self.maximum_kp_number += .5
+                            self.maximum_line_indice_num += .5
                     self.units[i].addCrease(Crease(
                         current_kp, next_kp, crease_type, hard=hard, upper=folding_angle_upper_bound, lower=folding_angle_lower_bound
                     ))
+                if occupy_memory:
+                    self.maximum_indice_num += 3 * (len(kps) - 2)
             
                 try:
                     contribution_for_unit = deepcopy(input_json["contributions"][i])
@@ -526,6 +597,19 @@ class PD_Origami_Simulator:
                 self.lines[i].folding_angle_upper_bound = input_json["line_features"][i]["hard_angle"]
                 self.lines[i].folding_angle_lower_bound = input_json["line_features"][i]["hard_angle_down"]
 
+            line_dict_2D = {}
+            line_dict_3D = {}
+
+            for line in self.lines:
+                key_s_2d = (round(line[START][X], 3), round(line[START][Y], 3))
+                key_e_2d = (round(line[END][X], 3), round(line[END][Y], 3))
+                line_dict_2D[(key_s_2d, key_e_2d)] = line
+                line_dict_2D[(key_e_2d, key_s_2d)] = line  # 双向
+                key_s = (round(line[START][X], 3), round(line[START][Y], 3), round(line[START][Z], 3))
+                key_e = (round(line[END][X], 3), round(line[END][Y], 3), round(line[END][Z], 3))
+                line_dict_3D[(key_s, key_e)] = line
+                line_dict_3D[(key_e, key_s)] = line  # 双向
+
             for i in range(len(input_json["units"])):
                 if i % split_interval == 0:
                     self.split_start_index.append(len(self.units))
@@ -538,17 +622,27 @@ class PD_Origami_Simulator:
                     hard = False
                     current_kp = deepcopy(kps[j])
                     next_kp = deepcopy(kps[j - 1])
-                    for line in self.lines:
-                        if (distance(line[START], current_kp) < 1e-3 and distance(line[END], next_kp) < 1e-3) or \
-                            (distance(line[END], current_kp) < 1e-3 and distance(line[START], next_kp) < 1e-3):
-                                self.maximum_number_of_thick_panel += 1
-                                current_possible_thick_panel_number += 1
-                                self.maximum_facet_crease_number += len(kps) - 3
-                                if (line.getType() == VALLEY or line.getType() == MOUNTAIN) and line.thick_panel_height not in height_parameters:
-                                    height_parameters.append(line.thick_panel_height)
-                                break
 
-                self.maximum_number_of_thick_panel_spring += 3 * len(kps) * (current_possible_thick_panel_number - 1)    
+                    key_s = (round(current_kp[X], 3), round(current_kp[Y], 3))
+                    key_e = (round(next_kp[X], 3), round(next_kp[Y], 3))
+
+                    line = line_dict_2D.get((key_s, key_e))
+                    # for line in self.lines:
+                    #     if (distance(line[START], current_kp) < 1e-3 and distance(line[END], next_kp) < 1e-3) or \
+                    #         (distance(line[END], current_kp) < 1e-3 and distance(line[START], next_kp) < 1e-3):
+                    if line is not None:
+                        if occupy_memory:
+                            self.maximum_number_of_thick_panel += 1
+                            self.maximum_facet_crease_number += len(kps) - 3
+                            current_possible_thick_panel_number += 1
+                        crease_type = line.getType()
+                        if (crease_type != BORDER) and line.thick_panel_height not in height_parameters:
+                            height_parameters.append(line.thick_panel_height)
+
+                if occupy_memory:
+                    self.maximum_number_of_thick_panel_spring += 3 * len(kps) * (current_possible_thick_panel_number - 1)    
+                    self.maximum_indice_num += 3 * (len(kps) - 2) * (current_possible_thick_panel_number)  
+
                 height_parameters.sort()
 
                 unit_mapping.append([len(self.units) + k for k in range(len(height_parameters))])
@@ -575,25 +669,40 @@ class PD_Origami_Simulator:
                         rec_level = []
                         rec_angle = []
                         
-                        for line in self.lines:
-                            if (distance3D(line[START], current_kp) < 1e-3 and distance3D(line[END], next_kp) < 1e-3) or \
-                                (distance3D(line[END], current_kp) < 1e-3 and distance3D(line[START], next_kp) < 1e-3):
-                                    current_kp[Z] = line.thick_panel_height
-                                    next_kp[Z] = line.thick_panel_height
-                                    crease_type = line.getType()
-                                    hard = line.hard
-                                    folding_angle_upper_bound = line.folding_angle_upper_bound
-                                    folding_angle_lower_bound = line.folding_angle_lower_bound
-                                    level = line.level
-                                    coeff = line.coeff
-                                    rec_level = line.recover_level
-                                    rec_angle = line.recover_angle
-                                    break
+                        key_s = (round(current_kp[X], 3), round(current_kp[Y], 3), round(current_kp[Z], 3))
+                        key_e = (round(next_kp[X], 3), round(next_kp[Y], 3), round(next_kp[Z], 3))
+
+                        line = line_dict_3D.get((key_s, key_e))
+                        # for line in self.lines:
+                        #     if (distance3D(line[START], current_kp) < 1e-3 and distance3D(line[END], next_kp) < 1e-3) or \
+                        #         (distance3D(line[END], current_kp) < 1e-3 and distance3D(line[START], next_kp) < 1e-3):
+                        if line is not None:
+                            current_kp[Z] = line.thick_panel_height
+                            next_kp[Z] = line.thick_panel_height
+                            crease_type = line.getType()
+                            hard = line.hard
+                            folding_angle_upper_bound = line.folding_angle_upper_bound
+                            folding_angle_lower_bound = line.folding_angle_lower_bound
+                            level = line.level
+                            coeff = line.coeff
+                            rec_level = line.recover_level
+                            rec_angle = line.recover_angle
+                            # break
+                        
+                        if occupy_memory:
+                            if crease_type == BORDER:
+                                self.maximum_kp_number += 1.
+                                self.maximum_line_indice_num += 1.
+                            else:
+                                self.maximum_kp_number += .5
+                                self.maximum_line_indice_num += .5
                                 
-                        if self.pointInList(current_kp, 1e-3) == -1:
+                        if spatialhash.find(current_kp, 1e-3) == -1:
                             self.kps.append(current_kp)
-                        if self.pointInList(next_kp, 1e-3) == -1:
-                            self.kps.append(next_kp) 
+                            spatialhash.insert(current_kp, len(self.kps) - 1)
+                        if spatialhash.find(next_kp, 1e-3) == -1:
+                            self.kps.append(next_kp)
+                            spatialhash.insert(next_kp, len(self.kps) - 1)
                              
                         new_crease = Crease(
                             current_kp, next_kp, crease_type, hard=hard, upper=folding_angle_upper_bound, lower=folding_angle_lower_bound
@@ -612,13 +721,24 @@ class PD_Origami_Simulator:
                         self.contributions.append(new_contribution)
                     except:
                         pass
+                
+                for ele in range(current_possible_thick_panel_number - len(height_parameters)):
+                    self.maximum_kp_number += 1. * len(kps)
+                    self.maximum_line_indice_num += 1. * len(kps)
             
+            self.maximum_kp_number = int(self.maximum_kp_number)
             if self.verbose:
-                print(f"Maximum thick panels in theory: {self.maximum_number_of_thick_panel}\nMaximum thick panel spring in theory: {self.maximum_number_of_thick_panel_spring}\nMaximum facet crease in theory: {self.maximum_facet_crease_number}")
+                print(f"Maximum thick panels in theory: {self.maximum_number_of_thick_panel}\n" + \
+                      f"Maximum thick panel spring in theory: {self.maximum_number_of_thick_panel_spring}\n" + \
+                        f"Maximum facet crease in theory: {self.maximum_facet_crease_number}\n" + \
+                            f"Maximum keypoints in theory: {self.maximum_kp_number}\n" + \
+                                f"Maximum indices in theory: {self.maximum_indice_num}")
                         
         if len(self.contributions) == 0:
             self.contributions.append([])
 
+        self.maximum_line_indice_num = int(self.maximum_line_indice_num)
+        
         try:
             self.fix_id = deepcopy(input_json["fix"])
             if len(self.connected_unit_pairs):
@@ -639,17 +759,19 @@ class PD_Origami_Simulator:
         self.max_size, max_x, max_y = getMaxDistance(self.kps)
         self.total_bias = getTotalBias(self.units)
         self.unit_mapping = unit_mapping
-        
+
         self.commonStart_1(unit_edge_max, thick_mode)
     
-        self.commonStart_2(occupy_memory=occupy_memory)
+        ok = self.commonStart_2(occupy_memory=occupy_memory)
+
+        return ok
 
     def getUnitMapping(self):
         return self.unit_mapping
     
     @ti.kernel
     def fill_line_vertex(self):
-        for i in ti.ndrange(self.line_total_indice_num):
+        for i in ti.ndrange(self.line_total_indice_num_param[None]):
             indice1 = self.line_pairs[i, 0]
             indice2 = self.line_pairs[i, 1]
             self.line_vertex[2 * i] = self.vertices[indice1]
@@ -692,6 +814,10 @@ class PD_Origami_Simulator:
                         numpy_connected_unit_id     : ti.types.ndarray(), 
                         dt                          : data_type,
                         kp_num                      : ti.i32,
+                        maximum_kp_num              : ti.i32,
+                        unit_indices_num            : ti.i32,
+                        line_total_indice_num       : ti.i32,
+                        indices_num                 : ti.i32,
                         spring_k                    : data_type, 
                         bending_k                   : data_type, 
                         facet_bending_k             : data_type,
@@ -716,13 +842,33 @@ class PD_Origami_Simulator:
         self.AK_field.fill(0.)
         self.cotangent_matrix.fill(0.)
         self.facet_cotangent_matrix.fill(0.)
+        self.x.fill(0.)
+        self.x0.fill(0.)
+        self.s.fill(0.)
+        self.v.fill(0.)
+        self.dv.fill(0.)
+        self.b.fill(0.)
+
+        self.indices.fill(maximum_kp_num - 1)
+        self.vertices.fill(0.)
+        self.original_vertices.fill(0.)
+        self.masses.fill(0.)
+        self.line_pairs.fill(0)
+        self.line_color.fill(0.)
+        self.line_vertex.fill(0.)
 
         self.energy[None] = 0.
         self.folding_angle_reach_pi[None] = False
         self.split_energy.fill(0.)
 
+        self.thick_panel_additional_connection_id.fill(-1)
+        self.unit_indices.fill(0)
+        self.unit_kp_num_list.fill(0)
+        self.unit_contributions.fill(0.)
+
         self.split_origami_num_param[None] = split_origami_num
         self.kp_num_param[None] = kp_num
+        self.kp_max_num_param[None] = maximum_kp_num
         self.spring_k_param[None] = spring_k
         self.bending_k_param[None] = bending_k
         self.facet_bending_k_param[None] = facet_bending_k
@@ -730,7 +876,7 @@ class PD_Origami_Simulator:
         self.spring_num_param[None] = spring_cons_num
         self.bending_num_param[None] = bending_cons_num
         self.facet_bending_num_param[None] = facet_bending_cons_num
-
+        self.line_total_indice_num_param[None] = line_total_indice_num
         self.folding_angle_param[None] = folding_angle
         self.enable_add_folding_angle_param[None] = enable_add_folding_angle
         self.angle_protection_param[None] = angle_protection
@@ -738,8 +884,7 @@ class PD_Origami_Simulator:
 
         self.collision_indice_param[None] = collision_indice
         self.collision_d_param[None] = collision_d
-
-        self.thick_panel_additional_connection_id.fill(-1)
+        self.indices_num_param[None] = indices_num
 
         for i in ti.ndrange(min(self.MAXIMUM_FIX_PANEL, numpy_fix_id.shape[0])):
             self.fix_id_list[i] = numpy_fix_id[i]
@@ -748,15 +893,15 @@ class PD_Origami_Simulator:
             self.thick_panel_additional_connection_id[i][j] = numpy_connected_unit_id[i, j]
         
         # 初始化单元索引
-        for i, j in ti.ndrange(self.unit_indices_num, self.unit_edge_max):
+        for i, j in ti.ndrange(numpy_indices.shape[0], self.unit_edge_max):
             self.unit_indices[i][j] = numpy_indices[i, j]
         
-        for i in ti.ndrange(self.unit_indices_num):
+        for i in ti.ndrange(numpy_indices.shape[0]):
             self.unit_kp_num_list[i] = self.calculateKpNumWithUnitId(self.unit_indices[i])
 
-        for i, j in ti.ndrange(self.unit_indices_num, self.unit_edge_max):
+        for i, j in ti.ndrange(numpy_indices.shape[0], self.unit_edge_max):
             self.unit_contributions[i][j] = 1. / self.unit_kp_num_list[i]
-        
+
         if numpy_contributions.shape[0] > 0:
             for i, j in ti.ndrange(numpy_contributions.shape[0], numpy_contributions.shape[1]):   
                 self.unit_contributions[i][j] = numpy_contributions[i, j]
@@ -766,10 +911,14 @@ class PD_Origami_Simulator:
             self.original_vertices[i] = [numpy_kps[i, X], numpy_kps[i, Y], numpy_kps[i, Z]]
             self.masses[i] = numpy_mass_list[i]
 
+        for i in ti.ndrange((self.kp_num_param[None], self.kp_max_num_param[None])):
+            self.original_vertices[i] = [0., 0., 0.]
+            self.masses[i] = numpy_mass_list[0]
+
         # 初始化三角面索引
-        for i in ti.ndrange(self.indices_num):
+        for i in ti.ndrange(self.indices_num_param[None]):
             self.indices[i] = numpy_tri_indices[i]
-            
+
         # # 初始化连接矩阵
         # for i, j in ti.ndrange(self.kp_num_param[None], self.kp_num_param[None]):
         #     self.connection_matrix[i, j] = numpy_connection_matrix[i, j]
@@ -792,7 +941,7 @@ class PD_Origami_Simulator:
             self.crease_initial_length[i] = (ce - cs).norm()
 
         # 初始化线段对
-        for i, j in ti.ndrange(self.line_total_indice_num, 2):
+        for i, j in ti.ndrange(self.line_total_indice_num_param[None], 2):
             self.line_pairs[i, j] = int(numpy_line_indices[i, j])
 
         # 初始化面折痕对
@@ -816,7 +965,7 @@ class PD_Origami_Simulator:
             self.facet_crease_initial_length[i] = (ce - cs).norm()
 
         #初始化折痕折角
-        for i in ti.ndrange(self.crease_pairs_num):
+        for i in ti.ndrange(self.bending_num_param[None]):
             self.crease_angle[i] = 0.0
             self.crease_folding_angle[i] = 0.0
             self.previous_dir[i] = 0.0
@@ -826,8 +975,8 @@ class PD_Origami_Simulator:
                 self.target_crease_angle[i] = 1.
 
         # 初始化折痕类型
-        for i in ti.ndrange(self.crease_pairs_num):
-            for j in ti.ndrange(self.line_total_indice_num):
+        for i in ti.ndrange(self.bending_num_param[None]):
+            for j in ti.ndrange(self.line_total_indice_num_param[None]):
                 if numpy_crease_pairs[i, 0] == int(numpy_line_indices[j, 0]) and numpy_crease_pairs[i, 1] == int(numpy_line_indices[j, 1]):
                     self.crease_type[i] = int(numpy_line_indices[j, 2])
 
@@ -848,7 +997,7 @@ class PD_Origami_Simulator:
         self.sequence_level[1] = 0
 
         # 初始化折叠等级和系数
-        for i, j in ti.ndrange(self.crease_pairs_num, numpy_tb_line.shape[0]):
+        for i, j in ti.ndrange(self.bending_num_param[None], numpy_tb_line.shape[0]):
             kp1 = [numpy_original_kps[numpy_crease_pairs[i, 0], X], numpy_original_kps[numpy_crease_pairs[i, 0], Y]]
             kp2 = [numpy_original_kps[numpy_crease_pairs[i, 1], X], numpy_original_kps[numpy_crease_pairs[i, 1], Y]]
             kp11 = [numpy_tb_line[j, 0], numpy_tb_line[j, 1]]
@@ -875,10 +1024,10 @@ class PD_Origami_Simulator:
             if self.crease_level[i] < self.sequence_level[1]:
                 self.sequence_level[1] = self.crease_level[i]
                 
-        self.folding_micro_step[None] = tm.pi / 900.0 / (1 + self.sequence_level[0] - self.sequence_level[1])
+        self.folding_micro_step[None] = tm.pi / 100.0 / (1 + self.sequence_level[0] - self.sequence_level[1])
 
         # 初始化渲染的线的颜色信息
-        for i in ti.ndrange(self.line_total_indice_num):
+        for i in ti.ndrange(self.line_total_indice_num_param[None]):
             if numpy_line_indices[i, 2] == BORDER:
                 self.line_color[2 * i] = [0, 0, 0]
                 self.line_color[2 * i + 1] = [0, 0, 0]
@@ -893,7 +1042,7 @@ class PD_Origami_Simulator:
                 self.line_color[2 * i + 1] = [0.5, 0.5, 0.5]
                 
             # pointer = 0
-            # for j in ti.ndrange(self.unit_indices_num):
+            # for j in ti.ndrange(unit_indices_num):
             #     unit_ids = self.unit_indices[j]
             #     exist1 = False
             #     exist2 = False
@@ -1173,7 +1322,7 @@ class PD_Origami_Simulator:
 
     @ti.kernel
     def fill_AK_field(self, h: data_type):
-        for i in ti.ndrange(self.kp_num_param[None]):
+        for i in ti.ndrange(self.kp_max_num_param[None]):
             self.AK_field[i * 3 + 0, i * 3 + 0] += self.masses[i] / (h ** 2)
             self.AK_field[i * 3 + 1, i * 3 + 1] += self.masses[i] / (h ** 2)
             self.AK_field[i * 3 + 2, i * 3 + 2] += self.masses[i] / (h ** 2)
@@ -1197,7 +1346,7 @@ class PD_Origami_Simulator:
 
     @ti.kernel
     def construct_hessian(self, builder: ti.types.sparse_matrix_builder()):
-        for i, j in ti.ndrange(3 * self.kp_num_param[None], 3 * self.kp_num_param[None]):
+        for i, j in ti.ndrange(3 * self.kp_max_num_param[None], 3 * self.kp_max_num_param[None]):
             if self.AK_field[i, j] != 0:
                 builder[i, j] += self.AK_field[i, j]
 
@@ -1335,6 +1484,10 @@ class PD_Origami_Simulator:
             numpy_connected_unit_id, 
             self.dt,
             self.kp_num,
+            self.maximum_kp_number,
+            self.unit_indices_num,
+            self.line_total_indice_num,
+            self.indices_num,
             self.spring_k, 
             self.bending_k, 
             self.facet_bending_k,
@@ -2347,10 +2500,10 @@ class PD_Origami_Simulator:
 
         self.canvas.scene(self.scene)
         try:
-            folder = f'./physResult/' + self.origami_name
+            folder = f'./physResult/cdf-' + self.origami_name
             if not os.path.exists(folder):
                 os.makedirs(folder)
-            self.window.save_image(f'./physResult/' + self.origami_name + "/" + str(self.ID).zfill(8) + '.png')
+            self.window.save_image(f'./physResult/cdf-' + self.origami_name + "/" + str(self.ID).zfill(8) + '.png')
             print(f"Picture ID {str(self.ID).zfill(8)} is saved.")
         except:
             pass
@@ -2423,6 +2576,12 @@ class PD_Origami_Simulator:
 
         self.update_vertices()
         # 面板（蓝灰色，双面）
+        # for i in range(self.maximum_kp_number):
+        #     print(self.vertices[i])
+        
+        # for i in range(self.maximum_indice_num // 3):
+        #     print(self.indices[3 * i + 0], self.indices[3 * i + 1], self.indices[3 * i + 2])
+
         scene.mesh(self.vertices, indices=self.indices, color=(0.80, 0.82, 0.93), two_sided=True)
 
         self.fill_line_vertex()
@@ -2440,7 +2599,7 @@ class PD_Origami_Simulator:
 
         self.spring_k = self.gui.slider_float('Spring k', self.spring_k, 40., 5000.)
         self.bending_k = self.gui.slider_float('Crease k', self.bending_k, 0.01, 1.)
-        self.facet_bending_k = self.gui.slider_float('Facet k', self.facet_bending_k, 1., 100.)
+        self.facet_bending_k = self.gui.slider_float('Facet k', self.facet_bending_k, 1., 200.)
 
         self.gui.text("If the above stiffnesses are modified, press 'r' to restart. ")
 
@@ -2466,6 +2625,7 @@ class PD_Origami_Simulator:
 
     def run(self):
         self.initializeRunning()
+        self.enable_add_folding_angle = 0.03141
         while self.window.running:
             self.step()
             # ti.profiler.print_kernel_profiler_info()  # 看每个kernel的执行时间、线程数
@@ -2473,6 +2633,7 @@ class PD_Origami_Simulator:
             if self.use_gui:
                 self.render()
             if self.stop():
+                self.backupSimulationSetting()
                 break 
         if not self.ref_target:
             self.appendCreaseInfo()
