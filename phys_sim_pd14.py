@@ -2386,7 +2386,7 @@ class PD_Origami_Simulator:
         reward_list = np.zeros(self.split_origami_num)
         individual_crease_num = self.crease_pairs_num // self.split_origami_num
 
-        if 1:
+        if 0:
             for i in range(self.split_origami_num):
                 reward_list[i] = self.split_energy[i]
                 start_index = individual_crease_num * i

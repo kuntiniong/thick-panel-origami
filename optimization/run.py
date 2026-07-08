@@ -284,8 +284,24 @@ def _format_param_token(value: Any) -> str:
     return str(value).replace(" ", "")
 
 
-def _build_result_prefix(spec: AlgorithmSpec, optimize_kwargs: Dict[str, Any]) -> str:
+def _build_result_prefix(
+    spec: AlgorithmSpec,
+    optimize_kwargs: Dict[str, Any],
+    framework_kwargs: Dict[str, Any],
+) -> str:
+    """Encode algorithm + framework settings in the physResult folder prefix."""
     parts = [spec.result_prefix]
+
+    parts.extend(
+        [
+            f"pop{_format_param_token(framework_kwargs['population_size'])}",
+            f"min{_format_param_token(framework_kwargs['min_thickness'])}",
+            f"ds{_format_param_token(framework_kwargs['discrete_step'])}",
+            f"mo{_format_param_token(framework_kwargs['max_offset'])}",
+        ]
+    )
+    if "generations" in optimize_kwargs:
+        parts.append(f"gen{_format_param_token(optimize_kwargs['generations'])}")
 
     if spec.key == "bo":
         parts.extend(
@@ -298,6 +314,12 @@ def _build_result_prefix(spec: AlgorithmSpec, optimize_kwargs: Dict[str, Any]) -
         )
     elif spec.key in ("cma_es", "cma_es_margin", "cma_es_elitist_margin"):
         parts.append(f"sigma{_format_param_token(optimize_kwargs['sigma_init'])}")
+        if optimize_kwargs.get("margin") is not None:
+            parts.append(f"margin{_format_param_token(optimize_kwargs['margin'])}")
+        if spec.key == "cma_es_elitist_margin" and "enc_m" in optimize_kwargs:
+            parts.append(
+                f"encm{_format_param_token(1 if optimize_kwargs['enc_m'] else 0)}"
+            )
     elif spec.key == "de":
         parts.extend(
             [
@@ -380,11 +402,14 @@ def create_framework(
     config: Dict[str, Any], json_path: str
 ) -> Tuple[ThickPanelDesignFramework, AlgorithmSpec, Dict[str, Any]]:
     spec = get_algorithm_spec(config.get("algorithm", "cma-es"))
+    framework_kwargs = _framework_kwargs(config, json_path)
     optimize_kwargs = spec.optimize_kwargs_builder(config, _common_optimize_kwargs(config))
     framework_cls = spec.framework_loader()
-    kwargs = _framework_kwargs(config, json_path)
+    kwargs = dict(framework_kwargs)
     kwargs["algorithm_key"] = spec.key
-    kwargs["result_prefix"] = ""
+    kwargs["result_prefix"] = _build_result_prefix(
+        spec, optimize_kwargs, framework_kwargs
+    )
     return framework_cls(**kwargs), spec, optimize_kwargs
 
 

@@ -3,7 +3,7 @@ from utils import *
 
 # 定义折纸系统，包含各刚度和单元信息
 class OrigamiSimulationSystem:
-    def __init__(self, unit_edge_max, spring_k=2000., bending_k=0.2, face_k=10., material_density=1.24e-9, controller_mass=5e-4, split_unit_list=[0]) -> None:
+    def __init__(self, unit_edge_max, spring_k=5000., bending_k=0.2, face_k=100., material_density=1.24e-9, controller_mass=5e-4, split_unit_list=[0]) -> None:
         self.unit_edge_max = unit_edge_max
         self.unit_list = []
         self.kps = []
