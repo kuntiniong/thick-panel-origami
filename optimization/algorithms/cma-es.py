@@ -1,6 +1,6 @@
 import os
 import sys
-from typing import Tuple
+from typing import List, Tuple
 
 import numpy as np
 from cmaes import CMA
@@ -11,10 +11,64 @@ from optimization.framework import ThickPanelDesignFramework
 
 
 class ThickPanelCMAFramework(ThickPanelDesignFramework):
-    """Thick-panel design framework using CMA-ES optimization."""
+    """Thick-panel design framework using CMA-ES optimization.
 
-    algorithm_key = "cma-es" # config.yml key for this algo
-    result_prefix = "cma-es" # output result folder prefix
+    Search space matches cdf_thick_panel.py: each crease is sampled in [-1, 1],
+    then mapped to physical height via type-specific affine transforms inside
+    _apply_constraints before discretisation.
+    """
+
+    algorithm_key = "cma-es"  # config.yml key for this algo
+    result_prefix = "cma-es"  # output result folder prefix
+
+    def _build_optimizer_bounds(self) -> np.ndarray:
+        """CDF-style normalized bounds per independent variable."""
+        return np.array([[-1.0, 1.0] for _ in range(self.num_independent)])
+
+    def _build_initial_mean(self) -> np.ndarray:
+        """
+        CDF-style initial mean in [-1, 1].
+
+        Default is zero for every crease. When initial_offsets are provided,
+        physical heights are inverted through the same affine map used in
+        cdf_thick_panel.py.
+        """
+        span = self.max_offset - self.min_thickness
+        mean = np.zeros(self.num_creases, dtype=float)
+
+        if self._initial_offsets_full is not None:
+            for i, info in enumerate(self.crease_info):
+                height = float(self._initial_offsets_full[i])
+                if info["type"] == 0:
+                    mean[i] = (height - self.min_thickness) / span * 2.0 - 1.0
+                else:
+                    mean[i] = (height + self.min_thickness) / span * 2.0 + 1.0
+
+        return self._reduce_offsets(mean)
+
+    def _optimizer_vars_to_magnitudes(self, optimizer_vars: np.ndarray) -> np.ndarray:
+        """Pass through [-1, 1] samples; physical mapping happens in constraints."""
+        return np.asarray(optimizer_vars, dtype=float)
+
+    def _apply_constraints(self, offsets: np.ndarray) -> np.ndarray:
+        """
+        CDF-style constraint pipeline:
+        1. Affine map from [-1, 1] to signed physical heights by crease type
+        2. Discretisation on the physical grid
+        """
+        constrained = np.copy(offsets)
+        span = self.max_offset - self.min_thickness
+
+        for i, info in enumerate(self.crease_info):
+            if info["type"] == 0:
+                constrained[i] = (constrained[i] + 1.0) * 0.5 * span + self.min_thickness
+            else:
+                constrained[i] = (constrained[i] - 1.0) * 0.5 * span - self.min_thickness
+
+        for i in range(len(constrained)):
+            constrained[i] = self._discretize_offset(constrained[i])
+
+        return constrained
 
     def optimize(
         self,
@@ -44,7 +98,6 @@ class ThickPanelCMAFramework(ThickPanelDesignFramework):
         self.extract_data["min_without_var"].clear()
 
         mean = self._build_initial_mean()
-
         bounds = self._build_optimizer_bounds()
 
         optimizer = CMA(
@@ -52,11 +105,14 @@ class ThickPanelCMAFramework(ThickPanelDesignFramework):
             sigma=sigma_init,
             bounds=bounds,
             population_size=population_size,
+            seed=42,
+            lr_adapt=True,
         )
 
         print("CMA-ES初始化完成 / CMA-ES initialized")
         print(f"  种群大小/Population size: {population_size}")
         print(f"  初始变异强度/Initial sigma: {sigma_init}")
+        print("  搜索空间/Search space: [-1, 1] per crease (CDF-style)")
         if self.symm_mode:
             print(
                 f"  维度/Dimension: {self.num_independent} independent "
@@ -73,7 +129,7 @@ class ThickPanelCMAFramework(ThickPanelDesignFramework):
             self.data.append([])
             generation += 1
 
-            candidate_heights = []
+            candidate_heights: List[np.ndarray] = []
             for _ in range(optimizer.population_size):
                 candidate_heights.append(optimizer.ask())
 

@@ -1078,29 +1078,42 @@ def _init_mp_worker(ti_lock) -> None:
     os.environ["TI_OFFLINE_CACHE_FILE_PATH"] = cache_root
 
 
+def _load_cma_es_framework_class():
+    import importlib.util
+
+    cma_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "algorithms", "cma-es.py")
+    spec = importlib.util.spec_from_file_location("optimization_cma_es_worker", cma_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ThickPanelCMAFramework
+
+
 def _create_worker_framework(payload: Dict[str, Any]) -> ThickPanelDesignFramework:
-    return ThickPanelDesignFramework(
-        json_path=payload["json_path"],
-        batch_size=payload["batch_size"],
-        population_size=payload["population_size"],
-        min_thickness=payload["min_thickness"],
-        discrete_step=payload["discrete_step"],
-        max_offset=payload["max_offset"],
-        use_gui=payload["use_gui"],
-        symm_mode=payload["symm_mode"],
-        algorithm_key=payload["algorithm_key"],
-        result_prefix=payload["result_prefix"],
-        max_steps=payload["max_steps"],
-        fold_angle_step=payload["fold_angle_step"],
-        ref_target=payload["ref_target"],
-        reuse_simulator=payload["reuse_simulator"],
-        n_processes=1,
-        _batch_json_dir=os.path.join(tempfile.gettempdir(), "thick_panel_opt", str(os.getpid())),
-        _simulator_name_override=payload["simulator_name"],
-        _quiet=True,
-        _force_cpu=True,
-        _reuse_ti_runtime=True,
-    )
+    worker_kwargs = {
+        "json_path": payload["json_path"],
+        "batch_size": payload["batch_size"],
+        "population_size": payload["population_size"],
+        "min_thickness": payload["min_thickness"],
+        "discrete_step": payload["discrete_step"],
+        "max_offset": payload["max_offset"],
+        "use_gui": payload["use_gui"],
+        "symm_mode": payload["symm_mode"],
+        "algorithm_key": payload["algorithm_key"],
+        "result_prefix": payload["result_prefix"],
+        "max_steps": payload["max_steps"],
+        "fold_angle_step": payload["fold_angle_step"],
+        "ref_target": payload["ref_target"],
+        "reuse_simulator": payload["reuse_simulator"],
+        "n_processes": 1,
+        "_batch_json_dir": os.path.join(tempfile.gettempdir(), "thick_panel_opt", str(os.getpid())),
+        "_simulator_name_override": payload["simulator_name"],
+        "_quiet": True,
+        "_force_cpu": True,
+        "_reuse_ti_runtime": True,
+    }
+    if payload.get("algorithm_key") == "cma_es":
+        return _load_cma_es_framework_class()(**worker_kwargs)
+    return ThickPanelDesignFramework(**worker_kwargs)
 
 
 def _evaluate_worker_payload(
