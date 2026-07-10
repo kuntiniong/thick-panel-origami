@@ -1272,6 +1272,138 @@ def triangles_intersect(tri1, tri2):
     
     return False
 
+def _triangle_aabb_overlap(tri1, tri2, eps=1e-9):
+    for axis in range(3):
+        mins1 = min(p[axis] for p in tri1)
+        maxs1 = max(p[axis] for p in tri1)
+        mins2 = min(p[axis] for p in tri2)
+        maxs2 = max(p[axis] for p in tri2)
+        if maxs1 < mins2 - eps or maxs2 < mins1 - eps:
+            return False
+    return True
+
+def _project_tri_to_2d(tri, drop_axis):
+    a = (drop_axis + 1) % 3
+    b = (drop_axis + 2) % 3
+    return [[p[a], p[b]] for p in tri]
+
+def _triangles_coplanar(tri1, tri2, eps=1e-4):
+    a = np.array(tri1[0], dtype=float)
+    b = np.array(tri1[1], dtype=float)
+    c = np.array(tri1[2], dtype=float)
+    n = np.cross(b - a, c - a)
+    norm = np.linalg.norm(n)
+    if norm < 1e-12:
+        return True
+    n = n / norm
+    for p in tri2:
+        if abs(np.dot(np.array(p, dtype=float) - a, n)) > eps:
+            return False
+    return True
+
+def _point_in_triangle_3d(point, tri, eps=1e-4):
+    a = np.array(tri[0], dtype=float)
+    b = np.array(tri[1], dtype=float)
+    c = np.array(tri[2], dtype=float)
+    n = np.cross(b - a, c - a)
+    norm = np.linalg.norm(n)
+    if norm < 1e-12:
+        return False
+    n = n / norm
+    p = np.array(point, dtype=float)
+    dist = np.dot(p - a, n)
+    if abs(dist) > eps:
+        return False
+    p_proj = p - dist * n
+    axis = int(np.argmax(np.abs(n)))
+    p2d = [p_proj[(axis + 1) % 3], p_proj[(axis + 2) % 3]]
+    t2d = _project_tri_to_2d(tri, axis)
+    return point_in_triangle(p2d, t2d)
+
+def _segment_triangle_intersect_3d(seg_start, seg_end, tri, eps=1e-4):
+    return _segment_triangle_intersect_point_3d(seg_start, seg_end, tri, eps) is not None
+
+def _segment_triangle_intersect_point_3d(seg_start, seg_end, tri, eps=1e-4):
+    """Return 3D hit point if segment pierces triangle, else None."""
+    a = np.array(tri[0], dtype=float)
+    b = np.array(tri[1], dtype=float)
+    c = np.array(tri[2], dtype=float)
+    n = np.cross(b - a, c - a)
+    norm = np.linalg.norm(n)
+    if norm < 1e-12:
+        return None
+    n = n / norm
+    s0 = np.array(seg_start, dtype=float)
+    s1 = np.array(seg_end, dtype=float)
+    d = s1 - s0
+    denom = np.dot(n, d)
+    if abs(denom) < eps:
+        return None
+    t = np.dot(n, a - s0) / denom
+    if t < -eps or t > 1.0 + eps:
+        return None
+    p = s0 + t * d
+    if not _point_in_triangle_3d(p.tolist(), tri, eps=eps * 10):
+        return None
+    return p.tolist()
+
+def _dedupe_points_3d(points, eps=1e-5):
+    unique = []
+    for p in points:
+        pa = np.asarray(p, dtype=float)
+        if any(np.linalg.norm(pa - np.asarray(q, dtype=float)) <= eps for q in unique):
+            continue
+        unique.append(pa.tolist())
+    return unique
+
+def triangle_intersection_contacts_3d(tri1, tri2, eps=1e-4):
+    """
+    Contact geometry for two non-coplanar triangles.
+    Returns a list of unique 3D points on the intersection
+    (typically 1–2 points = contact point or contact segment endpoints).
+    Empty list if no intersection or coplanar (caller may skip coplanar).
+    """
+    if not _triangle_aabb_overlap(tri1, tri2, eps):
+        return []
+    if _triangles_coplanar(tri1, tri2, eps):
+        return []
+
+    pts = []
+    edges1 = [(tri1[0], tri1[1]), (tri1[1], tri1[2]), (tri1[2], tri1[0])]
+    edges2 = [(tri2[0], tri2[1]), (tri2[1], tri2[2]), (tri2[2], tri2[0])]
+    for e in edges1:
+        hit = _segment_triangle_intersect_point_3d(e[0], e[1], tri2, eps)
+        if hit is not None:
+            pts.append(hit)
+    for e in edges2:
+        hit = _segment_triangle_intersect_point_3d(e[0], e[1], tri1, eps)
+        if hit is not None:
+            pts.append(hit)
+    for p in tri1:
+        if _point_in_triangle_3d(p, tri2, eps):
+            pts.append(list(p))
+    for p in tri2:
+        if _point_in_triangle_3d(p, tri1, eps):
+            pts.append(list(p))
+    return _dedupe_points_3d(pts, eps=max(eps * 10, 1e-6))
+
+def triangles_intersect_3d(tri1, tri2, eps=1e-4):
+    """
+    Determine whether two 3D triangles intersect (including edge/vertex contact).
+    """
+    if not _triangle_aabb_overlap(tri1, tri2, eps):
+        return False
+
+    if _triangles_coplanar(tri1, tri2, eps):
+        a = np.array(tri1[0], dtype=float)
+        b = np.array(tri1[1], dtype=float)
+        c = np.array(tri1[2], dtype=float)
+        n = np.cross(b - a, c - a)
+        axis = int(np.argmax(np.abs(n)))
+        return triangles_intersect(_project_tri_to_2d(tri1, axis), _project_tri_to_2d(tri2, axis))
+
+    return len(triangle_intersection_contacts_3d(tri1, tri2, eps)) > 0
+
 def process_triangles(input_triangles):
     """
     处理三角形列表：

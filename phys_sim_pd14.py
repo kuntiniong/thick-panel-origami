@@ -6,6 +6,7 @@ import yaml
 import gc
 from spatialhash import SpatialHash
 from ori_sim_sys import *
+from utils import triangle_intersection_contacts_3d, _triangle_aabb_overlap, _triangles_coplanar
 
 data_type = ti.f64
 numpy_data_type = np.float64
@@ -16,28 +17,14 @@ if use_gpu:
 else:
     ti.init(arch=ti.cpu, default_fp=data_type, fast_math=False, advanced_optimization=False, cpu_max_num_threads=1) #, kernel_profiler=False, verbose=True, debug=True, gdb_trigger=True)
 
-
-
-def ensure_taichi_init(force_cpu: bool = False):
-    """Compatibility shim for optimization framework.
-
-    Taichi is initialized eagerly at module import in this version, so this is a no-op.
-    """
-    return
-
-
-def mark_taichi_reset():
-    """Compatibility shim for optimization framework.
-
-    The old API used this to track lazy initialization state. Keep as no-op so
-    existing callers can import and call it safely.
-    """
-    return
-
 @ti.data_oriented
 class PD_Origami_Simulator:
-    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.95, material_type=1, ref_target=False, verbose=False):
+    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.975, material_type=1, ref_target=False, verbose=False, collision_shading=True):
         self.use_gui = use_gui
+        self.collision_shading = collision_shading
+        self._collision_contact_count = 0
+        self._collision_segment_count = 0
+        self._collision_contact_max = 4096
         self.ID = 0
 
         self.pd_local_time = pd_local_time
@@ -81,7 +68,6 @@ class PD_Origami_Simulator:
 
         self.time = time.strftime('%Y%m%d-%H%M%S', time.localtime())
         self.origami_name = origami_name
-        self.json_stem = origami_name
 
         self.image_id = 0
         if not self.fast_simulation_mode and use_gui:
@@ -327,6 +313,7 @@ class PD_Origami_Simulator:
             self.masses = ti.field(dtype=data_type, shape=self.maximum_kp_number) # 质量信息
 
             self.energy = ti.field(dtype=data_type, shape=())
+            self.backup_energy = ti.field(dtype=data_type, shape=())
             self.split_energy = ti.field(dtype=data_type, shape=self.split_origami_num)
 
             self.spring_k_param = ti.field(dtype=data_type, shape=())
@@ -367,6 +354,9 @@ class PD_Origami_Simulator:
             self.line_pairs = ti.field(dtype=int, shape=(self.maximum_line_indice_num, 2)) #线段索引信息，用于初始化渲染
             self.line_color = ti.Vector.field(3, dtype=data_type, shape=self.maximum_line_indice_num*2) #线段颜色，用于渲染
             self.line_vertex = ti.Vector.field(3, dtype=ti.f32, shape=self.maximum_line_indice_num*2) #线段顶点位置，用于渲染
+            # Contact markers for refined collision shading (points + segments, not full tris)
+            self.collision_contact_points = ti.Vector.field(3, dtype=ti.f32, shape=self._collision_contact_max)
+            self.collision_contact_lines = ti.Vector.field(3, dtype=ti.f32, shape=self._collision_contact_max * 2)
 
             self.indices = ti.field(int, shape=self.maximum_indice_num) #三角面索引信息
 
@@ -389,6 +379,7 @@ class PD_Origami_Simulator:
 
             self.crease_angle = ti.field(dtype=data_type, shape=self.bending_pairs_num)
             self.backup_crease_angle = ti.field(dtype=data_type, shape=self.bending_pairs_num)
+            self.backup_crease_angle_sum = ti.field(dtype=data_type, shape=())
             self.target_crease_angle = ti.field(dtype=data_type, shape=self.bending_pairs_num)
             self.previous_dir = ti.field(dtype=data_type, shape=self.bending_pairs_num)
             self.folding_angle_upper_bound = ti.field(dtype=data_type, shape=self.bending_pairs_num) #折痕折角上限，正值或0
@@ -444,21 +435,9 @@ class PD_Origami_Simulator:
     def start(self, filepath, unit_edge_max, thick_mode=False, occupy_memory=True):
         # 存储厚板模式标志 / Store thick mode flag
         self.thick_mode_flag = thick_mode
-        # origami_name is the export folder key (set in __init__); filepath may be a
-        # per-worker batch JSON copy during multiprocess optimization.
+        self.origami_name = filepath
 
-        if os.path.isabs(filepath):
-            json_path = filepath
-        elif os.path.isfile(filepath):
-            json_path = filepath
-        elif os.path.isfile(filepath + ".json"):
-            json_path = filepath + ".json"
-        else:
-            json_path = os.path.join("./descriptionData", filepath + ".json")
-
-        self.json_stem = os.path.splitext(os.path.basename(json_path))[0]
-
-        with open(json_path, 'r', encoding='utf-8') as fw:
+        with open("./descriptionData/" + filepath + ".json", 'r', encoding='utf-8') as fw:
             input_json = json.load(fw)
         self.input_json = input_json
         self.kps = []
@@ -869,6 +848,8 @@ class PD_Origami_Simulator:
         self.line_vertex.fill(0.)
 
         self.energy[None] = 0.
+        self.backup_energy[None] = 0.
+        self.backup_crease_angle_sum[None] = 0.
         self.folding_angle_reach_pi[None] = False
         self.split_energy.fill(0.)
 
@@ -1386,7 +1367,6 @@ class PD_Origami_Simulator:
 
         self.folding_angle = 0.
         self.enable_add_folding_angle = 0.
-        self.backup_energy = 0.
 
         self.substeps = 1
         self.dt = 1. / (60. * self.substeps) #仿真的时间间隔
@@ -1527,6 +1507,8 @@ class PD_Origami_Simulator:
         self.construct_hessian(self.AK)
         self.AM = self.AK.build() # 1 time
         self.sparse_solver.compute(self.AM)  # A 矩阵在仿真期间不变，提前分解 / A is constant, factorize once
+        if self.collision_shading:
+            self._build_collision_topology()
 
     def deal_with_key(self, key):
         self.key = ''
@@ -2501,8 +2483,9 @@ class PD_Origami_Simulator:
         self.scene.point_light(pos=(0., 0., 2 * self.max_size), color=(0.8, 0.8, 0.8))
 
         self.update_vertices()
-        # 面板（蓝灰色，双面）
-        self.scene.mesh(self.vertices, indices=self.indices, color=(0.80, 0.82, 0.93), two_sided=True)
+        if self.collision_shading:
+            self.detect_panel_collisions()
+        self._render_panel_meshes(self.scene)
 
         self.fill_line_vertex()
         self.scene.lines(vertices=self.line_vertex,
@@ -2511,20 +2494,31 @@ class PD_Origami_Simulator:
 
         self.canvas.scene(self.scene)
         try:
-            folder = f'./physResult/{self.origami_name}'
+            folder = f'./physResult/cdf-' + self.origami_name
             if not os.path.exists(folder):
                 os.makedirs(folder)
-            self.window.save_image(f'{folder}/{str(self.ID).zfill(8)}.png')
+            self.window.save_image(f'./physResult/cdf-' + self.origami_name + "/" + str(self.ID).zfill(8) + '.png')
             print(f"Picture ID {str(self.ID).zfill(8)} is saved.")
         except:
             pass
 
+    @ti.kernel
+    def calculateCreaseAngleSum(self) -> data_type:
+        ret = 0.
+        for i in ti.ndrange(self.crease_pairs_num):
+            ret += abs(self.crease_angle[i])
+        return ret
+
     def stop(self):
-        if self.energy[None] < self.backup_energy and \
-            abs(self.energy[None] - self.backup_energy) < 1e-3 * self.energy[None] \
-                and self.folding_angle > 3.14 and self.folding_angle_reach_pi[None]:
+        # if self.energy[None] < self.backup_energy[None] and \
+        #     abs(self.energy[None] - self.backup_energy[None]) < 1e-3 * self.energy[None] \
+        #         and self.folding_angle > 3.14 and self.folding_angle_reach_pi[None]:
+        #     return True
+        # self.backup_energy[None] = self.energy[None]
+        angle_sum = self.calculateCreaseAngleSum()
+        if abs(angle_sum - self.backup_crease_angle_sum[None]) < 1e-3 * angle_sum and self.folding_angle > 3.14:
             return True
-        self.backup_energy = self.energy[None]
+        self.backup_crease_angle_sum[None] = angle_sum
         return False
 
     def step(self):
@@ -2586,14 +2580,9 @@ class PD_Origami_Simulator:
         self.scene.point_light(pos=(0., 0., 2 * self.max_size), color=(0.8, 0.8, 0.8))
 
         self.update_vertices()
-        # 面板（蓝灰色，双面）
-        # for i in range(self.maximum_kp_number):
-        #     print(self.vertices[i])
-        
-        # for i in range(self.maximum_indice_num // 3):
-        #     print(self.indices[3 * i + 0], self.indices[3 * i + 1], self.indices[3 * i + 2])
-
-        scene.mesh(self.vertices, indices=self.indices, color=(0.80, 0.82, 0.93), two_sided=True)
+        if self.collision_shading:
+            self.detect_panel_collisions()
+        self._render_panel_meshes(scene)
 
         self.fill_line_vertex()
         self.scene.lines(vertices=self.line_vertex,
@@ -2602,6 +2591,11 @@ class PD_Origami_Simulator:
 
         self.gui.text(f"System time: {round(self.current_t, 3)}s")
         self.gui.text(f"Energy: {round(self.energy[None], 3)}")
+        if self.collision_shading:
+            self.gui.text(
+                f"Contacts: {self._collision_contact_count} pts, "
+                f"{self._collision_segment_count} segs"
+            )
 
         # for i in range(self.split_origami_num):
         #     self.gui.text(f"Sub-energy: {round(self.split_energy[i], 3)}")
@@ -2631,12 +2625,17 @@ class PD_Origami_Simulator:
         self.input_json["crease_info"] = [
             [self.kps[self.crease_pairs[i, 0]], self.kps[self.crease_pairs[i, 1]]] for i in range(self.crease_pairs_num)
         ]
-        with open("./descriptionData/" + self.json_stem + ".json", 'w', encoding='utf-8') as fw:
+        with open("./descriptionData/" + self.origami_name + ".json", 'w', encoding='utf-8') as fw:
             json.dump(self.input_json, fw, indent=4)
 
     def run(self):
         self.initializeRunning()
-        self.enable_add_folding_angle = 0.03141
+        # GUI: hold angle (use slider / i=start, k=stop, m=reverse).
+        # Headless: auto-drive fold target each step (same as phy_sim_target).
+        if self.use_gui:
+            self.enable_add_folding_angle = 0.0
+        else:
+            self.enable_add_folding_angle = 0.105
         while self.window.running:
             self.step()
             # ti.profiler.print_kernel_profiler_info()  # 看每个kernel的执行时间、线程数
@@ -2648,6 +2647,300 @@ class PD_Origami_Simulator:
                 break 
         if not self.ref_target:
             self.appendCreaseInfo()
+
+    # =========================================================================
+    # Panel / layer identity (JSON unit -> sim unit layers)
+    # =========================================================================
+
+    def _panel_layer_mapping(self):
+        """Return JSON panel index -> list of simulator unit ids (one entry per layer)."""
+        if getattr(self, "unit_mapping", None):
+            return self.unit_mapping
+        if hasattr(self, "input_json") and "units" in self.input_json:
+            n_panels = len(self.input_json["units"])
+        else:
+            n_panels = self.unit_indices_num
+        return [[i] for i in range(n_panels)]
+
+    def _unit_layer_height_z(self, sim_unit_id):
+        kps = self.units[sim_unit_id].getSeqPoint()
+        if not kps:
+            return 0.0
+        zs = [kp[Z] if len(kp) > 2 else 0.0 for kp in kps]
+        return sum(zs) / len(zs)
+
+    def _unit_kp_indices(self, sim_unit_id):
+        if not hasattr(self, "ori_sim"):
+            return []
+        return [idx for idx in self.ori_sim.indices[sim_unit_id] if idx != -1]
+
+    def get_panel_layer_registry(self):
+        """
+        List every (panel, layer) pair with stable identifiers for downstream use
+        (rendering, constraints, analysis, etc.).
+
+        Each entry contains:
+          - panel_idx:    index in the original JSON "units" list
+          - layer_idx:    0 = lowest-Z layer within that panel (thick mode)
+          - sim_unit_id:  index into self.units / self.unit_indices / self.ori_sim.indices
+          - height_z:     mean vertex Z of the layer (mm)
+          - num_layers:   how many layers this panel was expanded into
+          - kp_indices:   merged-mesh keypoint indices owned by this unit
+          - thick_mode:   whether thick-panel expansion was used at startup
+        """
+        mapping = self._panel_layer_mapping()
+        thick_mode = bool(getattr(self, "thick_mode_flag", False))
+        registry = []
+        for panel_idx, unit_ids in enumerate(mapping):
+            num_layers = len(unit_ids)
+            for layer_idx, sim_unit_id in enumerate(unit_ids):
+                registry.append({
+                    "panel_idx": panel_idx,
+                    "layer_idx": layer_idx,
+                    "sim_unit_id": sim_unit_id,
+                    "height_z": self._unit_layer_height_z(sim_unit_id),
+                    "num_layers": num_layers,
+                    "kp_indices": self._unit_kp_indices(sim_unit_id),
+                    "thick_mode": thick_mode,
+                })
+        return registry
+
+    def panel_layer_to_unit(self, panel_idx, layer_idx=0):
+        """
+        Forward lookup: (panel_idx, layer_idx) -> simulator unit id.
+
+        :param panel_idx: index in the original JSON "units" list
+        :param layer_idx: layer within that panel (0 = lowest Z in thick mode)
+        :return: sim_unit_id
+        """
+        mapping = self._panel_layer_mapping()
+        if panel_idx < 0 or panel_idx >= len(mapping):
+            raise IndexError(
+                f"panel_idx {panel_idx} out of range [0, {len(mapping)})"
+            )
+        unit_ids = mapping[panel_idx]
+        if layer_idx < 0 or layer_idx >= len(unit_ids):
+            raise IndexError(
+                f"layer_idx {layer_idx} out of range [0, {len(unit_ids)}) "
+                f"for panel {panel_idx}"
+            )
+        return unit_ids[layer_idx]
+
+    def unit_to_panel_layer(self, sim_unit_id):
+        """
+        Reverse lookup: simulator unit id -> (panel_idx, layer_idx) metadata.
+
+        :param sim_unit_id: index into self.units
+        :return: dict with panel_idx, layer_idx, height_z, num_layers, kp_indices, thick_mode
+        """
+        mapping = self._panel_layer_mapping()
+        for panel_idx, unit_ids in enumerate(mapping):
+            for layer_idx, unit_id in enumerate(unit_ids):
+                if unit_id == sim_unit_id:
+                    return {
+                        "panel_idx": panel_idx,
+                        "layer_idx": layer_idx,
+                        "sim_unit_id": sim_unit_id,
+                        "height_z": self._unit_layer_height_z(sim_unit_id),
+                        "num_layers": len(unit_ids),
+                        "kp_indices": self._unit_kp_indices(sim_unit_id),
+                        "thick_mode": bool(getattr(self, "thick_mode_flag", False)),
+                    }
+        raise ValueError(f"sim_unit_id {sim_unit_id} does not belong to any panel/layer")
+
+    # =========================================================================
+    # Panel contact detection / shading (refined)
+    # Pipeline when collision_shading=True:
+    #   initializeRunning -> _build_collision_topology
+    #   render/outputFigure -> detect_panel_collisions -> _render_panel_meshes
+    # Draws contact segments + small points, not whole mesh triangles.
+    # =========================================================================
+
+    def _unit_triangle_indices_flat(self, sim_unit_id):
+        refs = self.ori_sim.tri_indices_ref
+        tri_start = refs[sim_unit_id]
+        tri_end = refs[sim_unit_id + 1] if sim_unit_id + 1 < len(refs) else len(self.ori_sim.tri_indices) // 3
+        return np.array(self.ori_sim.tri_indices[3 * tri_start:3 * tri_end], dtype=np.int32)
+
+    def _build_collision_topology(self):
+        """Precompute triangle-to-unit and panel-index maps for collision detection."""
+        refs = self.ori_sim.tri_indices_ref
+        tri_indices = self.ori_sim.tri_indices
+        num_tris = len(tri_indices) // 3
+
+        tri_unit_ids = np.zeros(num_tris, dtype=np.int32)
+        for unit_id, tri_start in enumerate(refs):
+            tri_end = refs[unit_id + 1] if unit_id + 1 < len(refs) else num_tris
+            for tri_idx in range(tri_start, tri_end):
+                tri_unit_ids[tri_idx] = unit_id
+
+        unit_panel_idx = np.full(self.unit_indices_num, -1, dtype=np.int32)
+        unit_layer_idx = np.full(self.unit_indices_num, -1, dtype=np.int32)
+        for entry in self.get_panel_layer_registry():
+            unit_panel_idx[entry["sim_unit_id"]] = entry["panel_idx"]
+            unit_layer_idx[entry["sim_unit_id"]] = entry["layer_idx"]
+
+        tri_kp_indices = np.zeros((num_tris, 3), dtype=np.int32)
+        for tri_idx in range(num_tris):
+            base = 3 * tri_idx
+            tri_kp_indices[tri_idx] = tri_indices[base:base + 3]
+
+        self._collision_tri_unit_ids = tri_unit_ids
+        self._collision_unit_panel_idx = unit_panel_idx
+        self._collision_unit_layer_idx = unit_layer_idx
+        self._collision_tri_kp_indices = tri_kp_indices
+        self._collision_num_tris = num_tris
+        self._collision_spatial_cell_size = max(self.max_size / 20.0, 1.0)
+        # Particle radius scales with model size for visibility without covering panels
+        self._collision_point_radius = max(self.max_size * 0.008, 0.15)
+
+    def detect_panel_collisions(self):
+        """Find inter-panel contact geometry and upload point/segment markers."""
+        if not hasattr(self, "_collision_tri_kp_indices"):
+            return
+        if not hasattr(self, "collision_contact_points"):
+            return
+
+        positions = self.x.to_numpy()[:self.kp_num]
+        tri_kp_indices = self._collision_tri_kp_indices
+        tri_unit_ids = self._collision_tri_unit_ids
+        unit_panel_idx = self._collision_unit_panel_idx
+        unit_layer_idx = self._collision_unit_layer_idx
+        num_tris = self._collision_num_tris
+
+        tri_coords = positions[tri_kp_indices]
+        tri_aabb_min = tri_coords.min(axis=1)
+        tri_aabb_max = tri_coords.max(axis=1)
+        grid = {}
+        cell_size = self._collision_spatial_cell_size
+        inv_cell = 1.0 / cell_size
+
+        for tri_idx in range(num_tris):
+            min_cell = np.floor(tri_aabb_min[tri_idx] * inv_cell).astype(np.int32)
+            max_cell = np.floor(tri_aabb_max[tri_idx] * inv_cell).astype(np.int32)
+            for ix in range(min_cell[0], max_cell[0] + 1):
+                for iy in range(min_cell[1], max_cell[1] + 1):
+                    for iz in range(min_cell[2], max_cell[2] + 1):
+                        grid.setdefault((ix, iy, iz), []).append(tri_idx)
+
+        checked_pairs = set()
+        contact_points = []
+        contact_segments = []  # list of (p0, p1)
+        max_pts = self._collision_contact_max
+        max_segs = self._collision_contact_max
+
+        for tri_list in grid.values():
+            for i in range(len(tri_list)):
+                tri_a = tri_list[i]
+                unit_a = tri_unit_ids[tri_a]
+                panel_a = unit_panel_idx[unit_a]
+                layer_a = unit_layer_idx[unit_a]
+                if panel_a < 0:
+                    continue
+                verts_a = set(tri_kp_indices[tri_a].tolist())
+                coords_a = tri_coords[tri_a].tolist()
+
+                for j in range(i + 1, len(tri_list)):
+                    if len(contact_points) >= max_pts and len(contact_segments) >= max_segs:
+                        break
+
+                    tri_b = tri_list[j]
+                    pair_key = (tri_a, tri_b) if tri_a < tri_b else (tri_b, tri_a)
+                    if pair_key in checked_pairs:
+                        continue
+                    checked_pairs.add(pair_key)
+
+                    unit_b = tri_unit_ids[tri_b]
+                    panel_b = unit_panel_idx[unit_b]
+                    layer_b = unit_layer_idx[unit_b]
+                    # Only different panels on the same thickness layer; skip shared verts
+                    if panel_b < 0 or panel_a == panel_b or layer_a != layer_b:
+                        continue
+                    if verts_a.intersection(tri_kp_indices[tri_b].tolist()):
+                        continue
+
+                    coords_b = tri_coords[tri_b].tolist()
+                    if not _triangle_aabb_overlap(coords_a, coords_b):
+                        continue
+                    # Coplanar pairs are treated as non-colliding (stacked/adjacent faces)
+                    if _triangles_coplanar(coords_a, coords_b, eps=1e-2):
+                        continue
+
+                    pts = triangle_intersection_contacts_3d(coords_a, coords_b)
+                    if not pts:
+                        continue
+
+                    if len(pts) == 1:
+                        if len(contact_points) < max_pts:
+                            contact_points.append(pts[0])
+                    else:
+                        # Sort along principal direction → one contact segment (endpoints)
+                        arr = np.asarray(pts, dtype=float)
+                        direction = arr[-1] - arr[0]
+                        if np.linalg.norm(direction) < 1e-12:
+                            direction = arr.max(axis=0) - arr.min(axis=0)
+                        if np.linalg.norm(direction) < 1e-12:
+                            if len(contact_points) < max_pts:
+                                contact_points.append(arr[0].tolist())
+                            continue
+                        direction = direction / np.linalg.norm(direction)
+                        order = np.argsort(arr @ direction)
+                        p0 = arr[order[0]].tolist()
+                        p1 = arr[order[-1]].tolist()
+                        if len(contact_segments) < max_segs:
+                            contact_segments.append((p0, p1))
+                        # Also mark endpoints as points for visibility
+                        if len(contact_points) < max_pts:
+                            contact_points.append(p0)
+                        if len(contact_points) < max_pts:
+                            contact_points.append(p1)
+
+        self._collision_contact_count = len(contact_points)
+        self._collision_segment_count = len(contact_segments)
+
+        # Upload to Taichi fields (zero unused slots)
+        pt_buf = np.zeros((max_pts, 3), dtype=np.float32)
+        if contact_points:
+            pt_buf[:len(contact_points)] = np.asarray(contact_points, dtype=np.float32)
+        self.collision_contact_points.from_numpy(pt_buf)
+
+        ln_buf = np.zeros((max_segs * 2, 3), dtype=np.float32)
+        for k, (p0, p1) in enumerate(contact_segments):
+            ln_buf[2 * k] = p0
+            ln_buf[2 * k + 1] = p1
+        self.collision_contact_lines.from_numpy(ln_buf)
+
+    def _render_panel_meshes(self, scene):
+        """Draw base mesh plus refined contact markers (points + segments)."""
+        scene.mesh(
+            self.vertices,
+            indices=self.indices,
+            color=(0.80, 0.82, 0.93),
+            two_sided=True,
+        )
+
+        n_pts = self._collision_contact_count
+        n_segs = self._collision_segment_count
+        if n_pts == 0 and n_segs == 0:
+            return
+
+        if n_segs > 0:
+            scene.lines(
+                self.collision_contact_lines,
+                width=4.0,
+                color=(0.95, 0.15, 0.10),
+                vertex_count=n_segs * 2,
+            )
+
+        if n_pts > 0:
+            radius = getattr(self, "_collision_point_radius", 0.3)
+            scene.particles(
+                self.collision_contact_points,
+                radius=radius,
+                color=(0.95, 0.15, 0.10),
+                index_count=n_pts,
+            )
+
 
 if __name__ == '__main__':
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2685,11 +2978,12 @@ if __name__ == '__main__':
             fast=sim.get("fast", True),
             material_type=sim.get("material_type", 1),
             ref_target=sim.get("ref_target", False),
-            damping=sim.get("damping", 0.95),
+            damping=sim.get("damping", 0.975),
             pd_local_time=sim.get("pd_local_time", 1),
             pd_global_time=sim.get("pd_global_time", 1),
             pd_iter_time=sim.get("pd_iter_time", 5),
             verbose=sim.get("verbose", False),
+            collision_shading=sim.get("collision_shading", True),
         )
 
         ori.start(
