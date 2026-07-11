@@ -1,9 +1,9 @@
 """
 Panel-trimming visualizer — 2D contact-line sweep paint + first/last fallback.
 
-Primary shade (design plane only, no 3D):
-  1) paint_polygon / sweep_polygon — ribbon swept by the two-node contact
-     line as folding progresses (preferred)
+Primary shade (design plane only, no 3D) = **exported coordinates**:
+  1) coordinates / shaded_polygon / paint_polygon — sweep ribbon of the
+     two-node contact line (preferred; matches sim GUI locus)
   2) closed_triangle — first crease edge + max-area last apex (fallback)
 
   first      = JSON mountain/valley crease endpoints (green)
@@ -11,7 +11,7 @@ Primary shade (design plane only, no 3D):
   sweep line samples drawn as thin strokes when present
 
 Data sources (in order):
-  1) collision_stats.closed_polygons[]  (sim export: sweep / triangle)
+  1) collision_stats.closed_polygons[] / shaded_areas[]  (sim export)
   2) collision_stats.segments  (recomputed max-area triangle)
   3) Reconstructed: shared crease (first) + matched cut (last)
 
@@ -484,19 +484,58 @@ def _items_from_collision_stats(
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
 
-    for cp in stats.get("closed_polygons") or []:
+    # Prefer dedicated shaded_areas list when present (primary export payload)
+    shaded_list = stats.get("shaded_areas") or []
+    poly_list = stats.get("closed_polygons") or []
+    # If shaded_areas is non-empty, still walk closed_polygons (has more meta);
+    # fall back to shaded_areas alone when closed_polygons empty.
+    source_entries = poly_list if poly_list else [
+        {
+            "layer_h": sh.get("layer_h"),
+            "coordinates": sh.get("coordinates"),
+            "shaded_polygon": sh.get("coordinates"),
+            "paint_polygon": sh.get("coordinates"),
+            "paint_kind": sh.get("kind"),
+            "shaded_kind": sh.get("kind"),
+            "paint_area": sh.get("area"),
+            "shaded_area": sh.get("area"),
+            "panel": sh.get("panel"),
+            "unit": sh.get("unit"),
+            "side": sh.get("side"),
+            "intruder_panel": sh.get("intruder_panel"),
+            "other_panel": sh.get("other_panel"),
+            "tri_a": sh.get("tri_a"),
+            "tri_b": sh.get("tri_b"),
+            "sweep_n_samples": sh.get("sweep_n_samples"),
+        }
+        for sh in shaded_list
+    ]
+
+    for cp in source_entries:
         if not _layer_match(cp.get("layer_h"), layer_h, eps):
             continue
 
-        # Prefer 2D sweep paint ribbon (contact line trail on design plane)
-        paint_kind = cp.get("paint_kind") or ""
+        # Prefer exported shaded-area coordinates (sweep ribbon on design plane)
+        paint_kind = cp.get("shaded_kind") or cp.get("paint_kind") or ""
         poly = None
         source = "collision_stats.closed_triangle"
-        for key in ("paint_polygon", "sweep_polygon", "closed_triangle", "polygon"):
+        for key in (
+            "coordinates",
+            "shaded_polygon",
+            "paint_polygon",
+            "sweep_polygon",
+            "closed_triangle",
+            "polygon",
+        ):
             raw = cp.get(key)
             if raw and len(raw) >= 3:
                 poly = np.asarray(raw, dtype=float)[:, :2]
-                if key in ("paint_polygon", "sweep_polygon") or paint_kind == "sweep":
+                if key in (
+                    "coordinates",
+                    "shaded_polygon",
+                    "paint_polygon",
+                    "sweep_polygon",
+                ) or paint_kind == "sweep":
                     source = "collision_stats.sweep"
                 elif key == "polygon":
                     source = "collision_stats.polygon"
@@ -715,6 +754,9 @@ def _active_layers_from_stats(stats: dict) -> set:
     for cp in stats.get("closed_polygons") or []:
         if cp.get("layer_h") is not None:
             active.add(_layer_key(cp["layer_h"]))
+    for sh in stats.get("shaded_areas") or []:
+        if sh.get("layer_h") is not None:
+            active.add(_layer_key(sh["layer_h"]))
     for seg in stats.get("segments") or []:
         if seg.get("layer_h") is not None:
             active.add(_layer_key(seg["layer_h"]))
@@ -1055,7 +1097,7 @@ def visualize_trimmed(
         ),
         Patch(
             facecolor=TRIM_POLY_FACE, edgecolor=TRIM_POLY_EDGE, alpha=TRIM_POLY_ALPHA,
-            hatch="///", label="Closed trim tri (first + max-area last)",
+            label="Shaded area (exported sweep coordinates)",
         ),
         Line2D([0], [0], color=FIRST_LINE_COLOR, lw=2.4, label="first (JSON crease)"),
         Line2D([0], [0], color=LAST_LINE_COLOR, lw=2.4, label="last (cut / contact)"),
@@ -1067,16 +1109,16 @@ def visualize_trimmed(
 
     fig_title = title or "Panel trimming"
     fig_title += (
-        "\nshaded = closed_triangle  first(JSON crease) + max-area last apex"
+        "\nshaded = exported coordinates (contact-line sweep ribbon on design xy)"
     )
     meta = trimmed.get("trim_3d_metadata") or {}
-    bits = [f"closed_tris={total_polys}"]
+    bits = [f"shaded={total_polys}"]
     if meta:
         bits.append(f"trimmer_cuts={meta.get('n_cuts', '?')}")
     if stats:
         bits.append(f"stats_segs={stats.get('n_segments', '?')}")
         bits.append(
-            f"stats_tris={stats.get('n_closed_triangles', stats.get('n_closed_polygons', '?'))}"
+            f"stats_shaded={stats.get('n_shaded_areas', stats.get('n_closed_polygons', '?'))}"
         )
     if sources:
         bits.append("src=" + ",".join(sorted(s.split(".")[0] for s in sources)))
@@ -1140,9 +1182,8 @@ def _run_one(sim: dict, output_dir: str) -> str:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Visualize trimmed JSON with max-area closed_triangle shading "
-            "(first=JSON crease, last apex = larger of two cut ends). "
-            "Prefers collision_stats.closed_triangle."
+            "Visualize trimmed JSON; shaded regions use exported coordinates "
+            "(contact-line sweep ribbon). Falls back to first/last triangle."
         )
     )
     parser.add_argument(

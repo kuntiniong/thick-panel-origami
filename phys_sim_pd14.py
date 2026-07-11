@@ -4,6 +4,7 @@ import json
 import time, os
 import yaml
 import gc
+from collections import defaultdict
 from spatialhash import SpatialHash
 from ori_sim_sys import *
 from utils import triangle_intersection_contacts_3d, _triangle_aabb_overlap, _triangles_coplanar
@@ -952,6 +953,7 @@ class PD_Origami_Simulator:
         self._collision_fixed_segments = {}    # finalized when that pair's contact ended
         self._collision_fixed_points = {}
         self._collision_coords_exported = False  # one-shot export at π done
+        self._sweep_draw_stopped = False  # True once θ hits π — no more paint growth
         self._intruder_classifications = []
         self._intruder_by_unit_pair = {}  # (min_u, max_u) -> classification dict
         self._intruder_indice_count = 0
@@ -959,13 +961,22 @@ class PD_Origami_Simulator:
         self._paint_canvas = {}          # unit_id -> list[{p0,p1}]
         self._paint_line_vert_count = 0
         self._paint_n_strokes = 0
-        self._paint_max_line_verts = 4096
-        self._paint_max_samples = 48
+        # Starting GPU buffer size only — grows as needed (no sample/line cap)
+        self._paint_max_line_verts = 8192
         self._paint_min_move = None
         # Collision / paint are expensive in pure Python — throttle hard
         self._collision_frame_i = 0
         self._collision_every_n = 4      # run broadphase every N render frames
         self._paint_dirty = False
+        # Per-frame host cache of x (shared by collision / paint / intruder)
+        self._frame_positions = None
+        self._frame_positions_gen = -1
+        self._render_gen = 0
+        self._stamp_paint_needed = False
+        self._crease_pairs_np = None
+        self._flat_kps_np = None
+        self._mesh_advanced = True
+        self._collision_ran_once = False
         self.ID = 0
 
         self.pd_local_time = pd_local_time
@@ -2315,12 +2326,49 @@ class PD_Origami_Simulator:
         self.folding_angle = 0.
         self.enable_add_folding_angle = 0.
 
-        # Clear per-pair contact tracking on restart ('r')
+        # Clear per-pair contact tracking + paint locus on restart ('r')
         self._collision_active_segments = {}
         self._collision_active_points = {}
         self._collision_fixed_segments = {}
         self._collision_fixed_points = {}
         self._collision_coords_exported = False
+        self._sweep_draw_stopped = False
+        self._collision_contact_count = 0
+        self._collision_segment_count = 0
+        self._collision_contact_points_list = []
+        self._collision_contact_segments_list = []
+        self._collision_contact_points_flat = []
+        self._collision_contact_segments_flat = []
+        self._collision_stats = None
+        self._intruder_classifications = []
+        self._intruder_by_unit_pair = {}
+        self._intruder_indice_count = 0
+        self._collision_ran_once = False
+        self._collision_frame_i = 0
+        # Surface sweep paint (red locus on panels)
+        self._paint_canvas = {}
+        self._paint_line_vert_count = 0
+        self._paint_n_strokes = 0
+        self._paint_dirty = True
+        self._stamp_paint_needed = False
+        self._debug_lines = None
+        self._debug_lines_key = None
+        if hasattr(self, "paint_line_vertices"):
+            try:
+                self.paint_line_vertices.fill(0)
+            except Exception:
+                pass
+        if hasattr(self, "collision_contact_points"):
+            try:
+                self.collision_contact_points.fill(0)
+                self.collision_contact_lines.fill(0)
+            except Exception:
+                pass
+        if hasattr(self, "intruder_indices"):
+            try:
+                self.intruder_indices.fill(0)
+            except Exception:
+                pass
 
         self.substeps = 1
         self.dt = 1. / (60. * self.substeps) #仿真的时间间隔
@@ -2472,12 +2520,20 @@ class PD_Origami_Simulator:
             self.folding_angle += math.pi
             if self.folding_angle >= math.pi:
                 self.folding_angle = math.pi
+                if self.collision_shading:
+                    self._stop_sweep_drawing_at_pi()
+                if float(getattr(self, "enable_add_folding_angle", 0.0)) > 0.0:
+                    self.enable_add_folding_angle = 0.0
         elif key == 'j': 
             self.folding_angle -= math.pi
             if self.folding_angle <= 0:
                 self.folding_angle = 0
         elif key == 'i': 
-            self.enable_add_folding_angle = self.folding_micro_step[None]
+            # Do not resume auto-fold past a sealed π fold without restart
+            if getattr(self, "_sweep_draw_stopped", False):
+                self.enable_add_folding_angle = 0.0
+            else:
+                self.enable_add_folding_angle = self.folding_micro_step[None]
         elif key == 'k': 
             self.enable_add_folding_angle = 0.0
         elif key == 'm': 
@@ -3382,6 +3438,12 @@ class PD_Origami_Simulator:
         self.folding_angle += self.enable_add_folding_angle
         if self.folding_angle >= 3.1415:
             self.folding_angle = 3.1415
+            # Hit π this step → freeze paint/export immediately (not next render)
+            if self.collision_shading:
+                self._stop_sweep_drawing_at_pi()
+            # Stop auto-fold so θ does not keep “driving” past clamp
+            if float(getattr(self, "enable_add_folding_angle", 0.0)) > 0.0:
+                self.enable_add_folding_angle = 0.0
         if self.folding_angle <= 0:
             self.folding_angle = 0
 
@@ -3431,13 +3493,29 @@ class PD_Origami_Simulator:
             self.u0.from_numpy(dx)
         self.update_x()
 
+    def _cache_frame_positions(self, force=False):
+        """Host copy of x once per render/export frame (shared by hot paths)."""
+        gen = int(getattr(self, "_render_gen", 0))
+        if (
+            not force
+            and self._frame_positions is not None
+            and int(getattr(self, "_frame_positions_gen", -1)) == gen
+        ):
+            return self._frame_positions
+        pos = self.x.to_numpy()[: self.kp_num]
+        self._frame_positions = pos
+        self._frame_positions_gen = gen
+        return pos
+
     def outputFigure(self):
         self.scene.set_camera(self.camera)
         self.scene.ambient_light((0.5, 0.5, 0.5))
         self.scene.point_light(pos=(0., 0., 2 * self.max_size), color=(0.8, 0.8, 0.8))
 
         self.update_vertices()
+        self._render_gen = int(getattr(self, "_render_gen", 0)) + 1
         if self.collision_shading:
+            self._cache_frame_positions(force=True)
             self._maybe_detect_panel_collisions()
         self._render_panel_meshes(self.scene)
 
@@ -3483,6 +3561,7 @@ class PD_Origami_Simulator:
             if self.window.get_event(ti.ui.PRESS):
                 self.deal_with_key(self.window.event.key)
 
+        self._mesh_advanced = False
         for _ in range(self.substeps):
             if not self.paused or self.step_once:
                 # print("---begin---")
@@ -3495,6 +3574,7 @@ class PD_Origami_Simulator:
                 self.update_vel(self.dt)
                 # print("---end---")
                 self.step_once = False
+                self._mesh_advanced = True
             self.current_t += self.dt
 
     def reward(self):
@@ -3537,7 +3617,9 @@ class PD_Origami_Simulator:
         self.scene.point_light(pos=(0., 0., 2 * self.max_size), color=(0.8, 0.8, 0.8))
 
         self.update_vertices()
+        self._render_gen = int(getattr(self, "_render_gen", 0)) + 1
         if self.collision_shading:
+            self._cache_frame_positions(force=True)
             self._maybe_detect_panel_collisions()
         self._render_panel_meshes(scene)
 
@@ -3554,6 +3636,11 @@ class PD_Origami_Simulator:
         #     self.gui.text(f"Sub-energy: {round(self.split_energy[i], 3)}")
 
         self.folding_angle = self.gui.slider_float('Folding angle', self.folding_angle, 0, 3.135)
+        if (
+            self.collision_shading
+            and float(self.folding_angle) >= 3.1415 - 1e-6
+        ):
+            self._stop_sweep_drawing_at_pi()
 
         self.spring_k = self.gui.slider_float('Spring k', self.spring_k, 40., 5000.)
         self.bending_k = self.gui.slider_float('Crease k', self.bending_k, 0.01, 1.)
@@ -3561,8 +3648,8 @@ class PD_Origami_Simulator:
 
         self.gui.text("If the above stiffnesses are modified, press 'r' to restart. ")
 
-        # Debug window is optional — skip every other frame to reduce ImGui cost
-        if self.collision_shading and (self._collision_frame_i % 2 == 0):
+        # Must draw every frame — skipping frames makes ImGui sub_window flicker
+        if self.collision_shading:
             self._render_collision_debug_window()
 
         self.canvas.scene(scene)
@@ -3788,17 +3875,74 @@ class PD_Origami_Simulator:
         # Per-unit outer/thickness meta for intruder prioritization
         self._collision_unit_layer_meta = self._build_unit_layer_meta()
 
+    def _stop_sweep_drawing_at_pi(self):
+        """
+        Immediately freeze locus paint and seal export when θ hits π.
+
+        Called from update_folding_target / slider / 'u' so drawing stops on the
+        same step the clamp happens — not delayed until the next collision frame.
+        """
+        if getattr(self, "_sweep_draw_stopped", False):
+            return
+        self._sweep_draw_stopped = True
+        # No further canvas stamps or trail growth / reproject
+        self._paint_dirty = False
+        self._stamp_paint_needed = False
+        # Drop live red contact markers (locus strokes stay frozen as last drawn)
+        self._collision_contact_count = 0
+        self._collision_segment_count = 0
+        self._collision_contact_points_list = []
+        self._collision_contact_segments_list = []
+        self._collision_contact_points_flat = []
+        self._collision_contact_segments_flat = []
+        if getattr(self, "_collision_coords_exported", False):
+            return
+        angle = float(getattr(self, "folding_angle", 3.1415))
+        for ent in (getattr(self, "_collision_active_segments", None) or {}).values():
+            for sk in ("side_a", "side_b"):
+                side = ent.get(sk)
+                if side is not None and "p0" in side:
+                    try:
+                        self._append_sweep_sample_2d(side, angle, min_move=0.0)
+                    except Exception:
+                        pass
+        try:
+            self._seal_and_export_fixed_flat_contacts(reason="fold_pi")
+        except Exception as exc:
+            if getattr(self, "verbose", False):
+                print(f"[Contact] seal@π failed: {exc}")
+            self._collision_coords_exported = True
+
     def _maybe_detect_panel_collisions(self):
         """
         Throttle collision broadphase / paint. Full triangle tests every frame
         freeze the GUI; run every N frames (still tracks contacts while folding).
+
+        When the mesh did not advance this frame (paused), skip entirely — same
+        contacts, same sample density when it was last running.
         """
         self._collision_frame_i = int(getattr(self, "_collision_frame_i", 0)) + 1
+        # Drawing sealed at π → no more collision / paint work
+        if getattr(self, "_sweep_draw_stopped", False) or (
+            float(getattr(self, "folding_angle", 0.0)) >= 3.1415 - 1e-6
+            and getattr(self, "_collision_coords_exported", False)
+        ):
+            return
+        # Hit π but not sealed yet (e.g. headless jumped) → freeze now
+        at_pi = float(getattr(self, "folding_angle", 0.0)) >= 3.1415 - 1e-6
+        if at_pi:
+            self._stop_sweep_drawing_at_pi()
+            return
+        if (
+            not getattr(self, "_mesh_advanced", True)
+            and getattr(self, "_collision_ran_once", False)
+        ):
+            return
         n = max(1, int(getattr(self, "_collision_every_n", 4)))
-        # Always run when folding is actively changing this frame
+        # While folding: sample every frame so the locus trail is not sparse
         folding = abs(float(getattr(self, "enable_add_folding_angle", 0.0))) > 1e-12
         if folding:
-            n = max(2, n // 2)  # a bit more often while animating
+            n = 1
         if (self._collision_frame_i % n) != 0 and self._collision_frame_i > 1:
             return
         self.detect_panel_collisions()
@@ -3810,7 +3954,7 @@ class PD_Origami_Simulator:
         if not hasattr(self, "collision_contact_points"):
             return
 
-        positions = self.x.to_numpy()[:self.kp_num]
+        positions = self._cache_frame_positions()
         tri_kp_indices = self._collision_tri_kp_indices
         tri_unit_ids = self._collision_tri_unit_ids
         unit_panel_idx = self._collision_unit_panel_idx
@@ -3818,7 +3962,10 @@ class PD_Origami_Simulator:
         num_tris = self._collision_num_tris
 
         # Flat design keypoints (JSON unfolded layout) for 2D coordinate readout
-        flat_kps = np.asarray(self.kps, dtype=float)
+        flat_kps = getattr(self, "_flat_kps_np", None)
+        if flat_kps is None:
+            flat_kps = np.asarray(self.kps, dtype=float)
+            self._flat_kps_np = flat_kps
         if flat_kps.ndim != 2 or flat_kps.shape[0] < self.kp_num:
             flat_kps = positions  # fallback (should not happen after init)
 
@@ -3827,17 +3974,19 @@ class PD_Origami_Simulator:
         tri_coords = positions[tri_kp_indices]
         tri_aabb_min = tri_coords.min(axis=1)
         tri_aabb_max = tri_coords.max(axis=1)
-        grid = {}
         cell_size = self._collision_spatial_cell_size
         inv_cell = 1.0 / cell_size
-
+        # Vectorized cell ranges (one floor per tri, not per axis call)
+        min_cells = np.floor(tri_aabb_min * inv_cell).astype(np.int32)
+        max_cells = np.floor(tri_aabb_max * inv_cell).astype(np.int32)
+        grid = defaultdict(list)
         for tri_idx in range(num_tris):
-            min_cell = np.floor(tri_aabb_min[tri_idx] * inv_cell).astype(np.int32)
-            max_cell = np.floor(tri_aabb_max[tri_idx] * inv_cell).astype(np.int32)
-            for ix in range(min_cell[0], max_cell[0] + 1):
-                for iy in range(min_cell[1], max_cell[1] + 1):
-                    for iz in range(min_cell[2], max_cell[2] + 1):
-                        grid.setdefault((ix, iy, iz), []).append(tri_idx)
+            mnx, mny, mnz = int(min_cells[tri_idx, 0]), int(min_cells[tri_idx, 1]), int(min_cells[tri_idx, 2])
+            mxx, mxy, mxz = int(max_cells[tri_idx, 0]), int(max_cells[tri_idx, 1]), int(max_cells[tri_idx, 2])
+            for ix in range(mnx, mxx + 1):
+                for iy in range(mny, mxy + 1):
+                    for iz in range(mnz, mxz + 1):
+                        grid[(ix, iy, iz)].append(tri_idx)
 
         checked_pairs = set()
         contact_points = []
@@ -3847,6 +3996,7 @@ class PD_Origami_Simulator:
         colliding_unit_pairs = set()  # (sim_unit_a, sim_unit_b) with real intersection
         max_pts = self._collision_contact_max
         max_segs = self._collision_contact_max
+        aabb_eps = 1e-9
 
         def _flat_of(p3d, tri_idx):
             """
@@ -3883,18 +4033,50 @@ class PD_Origami_Simulator:
                     layer_h = 0.0
             return int(layer_idx), float(layer_h)
 
+        def _share_vert(ta, tb):
+            """True if triangles share any keypoint (no set/list alloc)."""
+            a0 = int(tri_kp_indices[ta, 0])
+            a1 = int(tri_kp_indices[ta, 1])
+            a2 = int(tri_kp_indices[ta, 2])
+            b0 = int(tri_kp_indices[tb, 0])
+            b1 = int(tri_kp_indices[tb, 1])
+            b2 = int(tri_kp_indices[tb, 2])
+            return (
+                a0 == b0 or a0 == b1 or a0 == b2
+                or a1 == b0 or a1 == b1 or a1 == b2
+                or a2 == b0 or a2 == b1 or a2 == b2
+            )
+
+        def _aabb_overlap_idx(ta, tb):
+            """Precomputed AABB overlap (avoids min/max over coord lists)."""
+            if tri_aabb_max[ta, 0] < tri_aabb_min[tb, 0] - aabb_eps:
+                return False
+            if tri_aabb_max[tb, 0] < tri_aabb_min[ta, 0] - aabb_eps:
+                return False
+            if tri_aabb_max[ta, 1] < tri_aabb_min[tb, 1] - aabb_eps:
+                return False
+            if tri_aabb_max[tb, 1] < tri_aabb_min[ta, 1] - aabb_eps:
+                return False
+            if tri_aabb_max[ta, 2] < tri_aabb_min[tb, 2] - aabb_eps:
+                return False
+            if tri_aabb_max[tb, 2] < tri_aabb_min[ta, 2] - aabb_eps:
+                return False
+            return True
+
         for tri_list in grid.values():
-            for i in range(len(tri_list)):
+            n_cell = len(tri_list)
+            if n_cell < 2:
+                continue
+            for i in range(n_cell):
                 tri_a = tri_list[i]
                 unit_a = int(tri_unit_ids[tri_a])
-                panel_a = unit_panel_idx[unit_a]
-                layer_a = unit_layer_idx[unit_a]
+                panel_a = int(unit_panel_idx[unit_a])
+                layer_a = int(unit_layer_idx[unit_a])
                 if panel_a < 0:
                     continue
-                verts_a = set(tri_kp_indices[tri_a].tolist())
-                coords_a = tri_coords[tri_a].tolist()
+                coords_a = tri_coords[tri_a]  # ndarray view; no .tolist()
 
-                for j in range(i + 1, len(tri_list)):
+                for j in range(i + 1, n_cell):
                     if len(contact_points) >= max_pts and len(contact_segments) >= max_segs:
                         break
 
@@ -3905,19 +4087,19 @@ class PD_Origami_Simulator:
                     checked_pairs.add(pair_key)
 
                     unit_b = int(tri_unit_ids[tri_b])
-                    panel_b = unit_panel_idx[unit_b]
-                    layer_b = unit_layer_idx[unit_b]
+                    panel_b = int(unit_panel_idx[unit_b])
+                    layer_b = int(unit_layer_idx[unit_b])
                     # Only different panels on the same thickness layer; skip shared verts
                     if panel_b < 0 or panel_a == panel_b or layer_a != layer_b:
                         continue
                     if unit_a == unit_b:
                         continue
-                    if verts_a.intersection(tri_kp_indices[tri_b].tolist()):
+                    if _share_vert(tri_a, tri_b):
+                        continue
+                    if not _aabb_overlap_idx(tri_a, tri_b):
                         continue
 
-                    coords_b = tri_coords[tri_b].tolist()
-                    if not _triangle_aabb_overlap(coords_a, coords_b):
-                        continue
+                    coords_b = tri_coords[tri_b]
                     # Coplanar pairs are treated as non-colliding (stacked/adjacent faces)
                     if _triangles_coplanar(coords_a, coords_b, eps=1e-2):
                         continue
@@ -4078,17 +4260,24 @@ class PD_Origami_Simulator:
         # Per-pair: update last-seen; finalize each pair when its contact ends;
         # export the full accumulated set once π fold is done.
         self._track_per_pair_flat_contacts()
+        # Stamp locus canvas only when contacts refreshed and fold not sealed
+        if not getattr(self, "_collision_coords_exported", False):
+            try:
+                self._stamp_paint_canvas_from_contacts()
+                self._stamp_paint_needed = False
+            except Exception:
+                pass
 
         # Upload to Taichi fields (zero unused slots)
         pt_buf = np.zeros((max_pts, 3), dtype=np.float32)
         if contact_points:
-            pt_buf[:len(contact_points)] = np.asarray(contact_points, dtype=np.float32)
+            pt_buf[: len(contact_points)] = np.asarray(contact_points, dtype=np.float32)
         self.collision_contact_points.from_numpy(pt_buf)
 
         ln_buf = np.zeros((max_segs * 2, 3), dtype=np.float32)
-        for k, (p0, p1) in enumerate(contact_segments):
-            ln_buf[2 * k] = p0
-            ln_buf[2 * k + 1] = p1
+        if contact_segments:
+            seg_arr = np.asarray(contact_segments, dtype=np.float32).reshape(-1, 3)
+            ln_buf[: seg_arr.shape[0]] = seg_arr
         self.collision_contact_lines.from_numpy(ln_buf)
 
         # Intruder logic starts only when red contact geometry exists.
@@ -4100,6 +4289,7 @@ class PD_Origami_Simulator:
             self._update_intruder_classification(positions, colliding_unit_pairs)
         else:
             self._update_intruder_classification(positions, set())
+        self._collision_ran_once = True
 
     # 3. intruder classification
 
@@ -4309,27 +4499,38 @@ class PD_Origami_Simulator:
         """
         Return (p0, p1) as lists, swapped if needed so p0 tracks ref0 and p1 tracks ref1
         (avoids bow-tie when chaining successive contact lines into a sweep ribbon).
+        Pure Python (no numpy) — hot path during sweep sample append.
         """
         a = [float(p0[0]), float(p0[1])]
         b = [float(p1[0]), float(p1[1])]
         if ref0 is None or ref1 is None:
             return a, b
-        r0 = np.asarray(ref0, dtype=float)[:2]
-        r1 = np.asarray(ref1, dtype=float)[:2]
-        aa = np.asarray(a, dtype=float)
-        bb = np.asarray(b, dtype=float)
-        cost_keep = float(np.linalg.norm(aa - r0) + np.linalg.norm(bb - r1))
-        cost_swap = float(np.linalg.norm(aa - r1) + np.linalg.norm(bb - r0))
+        r0x, r0y = float(ref0[0]), float(ref0[1])
+        r1x, r1y = float(ref1[0]), float(ref1[1])
+        dx0 = a[0] - r0x
+        dy0 = a[1] - r0y
+        dx1 = b[0] - r1x
+        dy1 = b[1] - r1y
+        cost_keep = (dx0 * dx0 + dy0 * dy0) ** 0.5 + (dx1 * dx1 + dy1 * dy1) ** 0.5
+        sx0 = a[0] - r1x
+        sy0 = a[1] - r1y
+        sx1 = b[0] - r0x
+        sy1 = b[1] - r0y
+        cost_swap = (sx0 * sx0 + sy0 * sy0) ** 0.5 + (sx1 * sx1 + sy1 * sy1) ** 0.5
         if cost_swap < cost_keep:
             return b, a
         return a, b
 
     @staticmethod
     def _segment_mid_dist_2d(a0, a1, b0, b1):
-        """Distance between midpoints of two 2D segments."""
-        m0 = 0.5 * (np.asarray(a0, dtype=float)[:2] + np.asarray(a1, dtype=float)[:2])
-        m1 = 0.5 * (np.asarray(b0, dtype=float)[:2] + np.asarray(b1, dtype=float)[:2])
-        return float(np.linalg.norm(m1 - m0))
+        """Distance between midpoints of two 2D segments (pure Python)."""
+        m0x = 0.5 * (float(a0[0]) + float(a1[0]))
+        m0y = 0.5 * (float(a0[1]) + float(a1[1]))
+        m1x = 0.5 * (float(b0[0]) + float(b1[0]))
+        m1y = 0.5 * (float(b0[1]) + float(b1[1]))
+        dx = m1x - m0x
+        dy = m1y - m0y
+        return (dx * dx + dy * dy) ** 0.5
 
     @classmethod
     def _maybe_seed_sweep_with_first(cls, side):
@@ -4355,19 +4556,22 @@ class PD_Origami_Simulator:
         })
 
     @classmethod
-    def _append_sweep_sample_2d(cls, side, angle, min_move=0.15, max_samples=512):
+    def _append_sweep_sample_2d(cls, side, angle, min_move=0.15, max_samples=None):
         """
         Append current side p0–p1 to a 2D sweep trail (paint stroke on the design panel).
 
         - Seeds the trail with crease-snapped first_* when present (so paint starts on hinge).
-        - Skips samples that barely moved (min_move) to keep history compact.
+        - Skips samples that barely moved (min_move) to avoid pure duplicates.
         - Endpoint order is stabilized against the previous sample (no twist).
+        - **No sample count cap** (max_samples ignored; kept for call-site compat).
         """
         if side is None or "p0" not in side or "p1" not in side:
             return
         p0 = [float(side["p0"][0]), float(side["p0"][1])]
         p1 = [float(side["p1"][0]), float(side["p1"][1])]
-        if float(np.hypot(p1[0] - p0[0], p1[1] - p0[1])) < 1e-12:
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        if (dx * dx + dy * dy) < 1e-24:
             return
 
         samples = side.get("sweep_samples")
@@ -4379,7 +4583,9 @@ class PD_Origami_Simulator:
         if not samples and "first_p0" in side and "first_p1" in side:
             f0 = [float(side["first_p0"][0]), float(side["first_p0"][1])]
             f1 = [float(side["first_p1"][0]), float(side["first_p1"][1])]
-            if float(np.hypot(f1[0] - f0[0], f1[1] - f0[1])) >= 1e-12:
+            fdx = f1[0] - f0[0]
+            fdy = f1[1] - f0[1]
+            if (fdx * fdx + fdy * fdy) >= 1e-24:
                 samples.append({
                     "angle": float(side.get("first_folding_angle", angle)),
                     "p0": f0,
@@ -4390,12 +4596,14 @@ class PD_Origami_Simulator:
             last = samples[-1]
             p0, p1 = cls._order_segment_endpoints_2d(p0, p1, last["p0"], last["p1"])
             moved = cls._segment_mid_dist_2d(last["p0"], last["p1"], p0, p1)
-            end_move = max(
-                float(np.hypot(p0[0] - last["p0"][0], p0[1] - last["p0"][1])),
-                float(np.hypot(p1[0] - last["p1"][0], p1[1] - last["p1"][1])),
-            )
+            e0x = p0[0] - last["p0"][0]
+            e0y = p0[1] - last["p0"][1]
+            e1x = p1[0] - last["p1"][0]
+            e1y = p1[1] - last["p1"][1]
+            end_move = max((e0x * e0x + e0y * e0y) ** 0.5, (e1x * e1x + e1y * e1y) ** 0.5)
             # Same pose → skip (but allow last lock rewrite via force path elsewhere)
-            if moved < float(min_move) and end_move < float(min_move):
+            mm = float(min_move)
+            if moved < mm and end_move < mm:
                 # Still refresh last sample angle/position lightly if tiny drift
                 if moved < 1e-9:
                     return
@@ -4403,11 +4611,7 @@ class PD_Origami_Simulator:
                 return
 
         samples.append({"angle": float(angle), "p0": p0, "p1": p1})
-        if len(samples) > int(max_samples):
-            # Keep first + evenly thinned middle + last
-            keep = int(max_samples)
-            idxs = np.linspace(0, len(samples) - 1, keep).astype(int)
-            side["sweep_samples"] = [samples[i] for i in idxs]
+        # No thinning / max_samples cap — keep every sample
 
     @classmethod
     def sweep_paint_polygon_2d(cls, samples):
@@ -4628,17 +4832,47 @@ class PD_Origami_Simulator:
 
     @staticmethod
     def _point_segment_distance_3d(p, a, b):
-        """Distance from point p to segment ab in 3D."""
-        p = np.asarray(p, dtype=float).reshape(3)
-        a = np.asarray(a, dtype=float).reshape(3)
-        b = np.asarray(b, dtype=float).reshape(3)
-        ab = b - a
-        lab2 = float(np.dot(ab, ab))
+        """Distance from point p to segment ab in 3D (pure Python, hot path)."""
+        px, py, pz = float(p[0]), float(p[1]), float(p[2])
+        ax, ay, az = float(a[0]), float(a[1]), float(a[2])
+        bx, by, bz = float(b[0]), float(b[1]), float(b[2])
+        abx, aby, abz = bx - ax, by - ay, bz - az
+        lab2 = abx * abx + aby * aby + abz * abz
         if lab2 < 1e-18:
-            return float(np.linalg.norm(p - a))
-        t = float(np.dot(p - a, ab) / lab2)
-        t = max(0.0, min(1.0, t))
-        return float(np.linalg.norm(p - (a + t * ab)))
+            dx, dy, dz = px - ax, py - ay, pz - az
+            return (dx * dx + dy * dy + dz * dz) ** 0.5
+        t = ((px - ax) * abx + (py - ay) * aby + (pz - az) * abz) / lab2
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+        dx = px - (ax + t * abx)
+        dy = py - (ay + t * aby)
+        dz = pz - (az + t * abz)
+        return (dx * dx + dy * dy + dz * dz) ** 0.5
+
+    def _get_crease_pairs_np(self):
+        """Cached crease endpoint indices (host array)."""
+        cached = getattr(self, "_crease_pairs_np", None)
+        if cached is not None:
+            return cached
+        n = int(getattr(self, "crease_pairs_num", 0) or 0)
+        if n <= 0 or not hasattr(self, "crease_pairs"):
+            self._crease_pairs_np = np.zeros((0, 2), dtype=np.int32)
+            return self._crease_pairs_np
+        try:
+            pairs = self.crease_pairs.to_numpy() if hasattr(self.crease_pairs, "to_numpy") else None
+        except Exception:
+            pairs = None
+        if pairs is None:
+            pairs = np.array(
+                [[int(self.crease_pairs[i, 0]), int(self.crease_pairs[i, 1])] for i in range(n)],
+                dtype=np.int32,
+            )
+        else:
+            pairs = np.asarray(pairs[:n], dtype=np.int32)
+        self._crease_pairs_np = pairs
+        return pairs
 
     def _fold_crease_records(self, positions):
         """
@@ -4649,37 +4883,30 @@ class PD_Origami_Simulator:
           a_flat, b_flat — design xy from self.kps (true paper line)
         """
         recs = []
-        n = int(getattr(self, "crease_pairs_num", 0) or 0)
-        if n <= 0 or not hasattr(self, "crease_pairs"):
+        pairs = self._get_crease_pairs_np()
+        if pairs is None or len(pairs) == 0:
             return recs
-        flat_kps = np.asarray(self.kps, dtype=float)
-        try:
-            pairs = self.crease_pairs.to_numpy() if hasattr(self.crease_pairs, "to_numpy") else None
-        except Exception:
-            pairs = None
-
-        def _add(i0, i1):
-            if i0 < 0 or i1 < 0 or i0 >= len(positions) or i1 >= len(positions):
-                return
-            if i0 >= len(flat_kps) or i1 >= len(flat_kps):
-                return
-            a_f = flat_kps[i0][:2]
-            b_f = flat_kps[i1][:2]
+        flat_kps = getattr(self, "_flat_kps_np", None)
+        if flat_kps is None:
+            flat_kps = np.asarray(self.kps, dtype=float)
+            self._flat_kps_np = flat_kps
+        n_pos = len(positions)
+        n_flat = len(flat_kps)
+        for i0, i1 in pairs:
+            i0 = int(i0)
+            i1 = int(i1)
+            if i0 < 0 or i1 < 0 or i0 >= n_pos or i1 >= n_pos:
+                continue
+            if i0 >= n_flat or i1 >= n_flat:
+                continue
             recs.append({
-                "a3d": np.asarray(positions[i0], dtype=float)[:3],
-                "b3d": np.asarray(positions[i1], dtype=float)[:3],
-                "a_flat": np.asarray(a_f, dtype=float),
-                "b_flat": np.asarray(b_f, dtype=float),
-                "i0": int(i0),
-                "i1": int(i1),
+                "a3d": positions[i0][:3],
+                "b3d": positions[i1][:3],
+                "a_flat": flat_kps[i0][:2],
+                "b_flat": flat_kps[i1][:2],
+                "i0": i0,
+                "i1": i1,
             })
-
-        if pairs is None:
-            for i in range(n):
-                _add(int(self.crease_pairs[i, 0]), int(self.crease_pairs[i, 1]))
-        else:
-            for i in range(min(n, len(pairs))):
-                _add(int(pairs[i, 0]), int(pairs[i, 1]))
         return recs
 
     def _fold_crease_segments_3d(self, positions):
@@ -4810,22 +5037,36 @@ class PD_Origami_Simulator:
           the creases (or contact ends).
         - **sweep (2D paint)**: successive p0–p1 samples on the design plane
           while the contact line is live. The ribbon those samples sweep out
-          is the 2D panel paint region (no 3D paint geometry).
+          is the 2D panel paint region (no 3D paint geometry) and the
+          **exported shaded-area coordinates**.
 
         Multiple concurrent segments between the same unit pair are all kept
         (keyed by tri_a/tri_b), matching the GUI red lines.
         """
-        if self._collision_coords_exported:
+        # Drawing frozen at π — never record more samples
+        if getattr(self, "_sweep_draw_stopped", False):
             return
+        # Recover from a premature empty seal (exported=True with no fixed data)
+        if self._collision_coords_exported:
+            has_fixed = bool(self._collision_fixed_segments) or bool(
+                self._collision_fixed_points
+            )
+            if has_fixed:
+                return
+            # Empty seal — reopen tracking until we have real contacts or hit π
+            if float(getattr(self, "folding_angle", 0.0)) < 3.1415 - 1e-6:
+                self._collision_coords_exported = False
+            else:
+                return
 
         angle = float(self.folding_angle)
-        positions = self.x.to_numpy()[: self.kp_num]
+        positions = self._cache_frame_positions()
         crease_recs = self._fold_crease_records(positions)
         crease_segs = [(r["a3d"], r["b3d"]) for r in crease_recs]
         crease_tol = max(float(getattr(self, "max_size", 100.0)) * 0.012, 0.35)
         # Min mid-point travel (design units) before recording another sweep sample
-        # Dense enough for continuous sweep trails (not only coarse keyframes)
-        sweep_min_move = max(float(getattr(self, "max_size", 100.0)) * 8e-4, 0.03)
+        # Dense trail (smaller threshold → less sparse ribbon / locus)
+        sweep_min_move = max(float(getattr(self, "max_size", 100.0)) * 3e-4, 0.012)
 
         # One entry per triangle–triangle contact (same as each red GUI segment/point).
         # Do NOT collapse multiple contacts that share the same unit pair.
@@ -4857,7 +5098,11 @@ class PD_Origami_Simulator:
                     ent[fld] = prev[fld]
 
         def _carry_sweep(ent, prev):
-            """Bring prior 2D sweep trail onto the live entry (fresh copy has none)."""
+            """Bring prior 2D sweep trail onto the live entry (fresh copy has none).
+
+            Share the list by reference while the contact is live (append in place).
+            Deep-copy only when locking / exporting via _copy_segment_entry.
+            """
             if prev is None:
                 return
             for sk in ("side_a", "side_b"):
@@ -4867,10 +5112,9 @@ class PD_Origami_Simulator:
                     continue
                 if side.get("sweep_samples"):
                     continue  # already has trail
-                if pside.get("sweep_samples"):
-                    side["sweep_samples"] = self._copy_sweep_samples(
-                        pside["sweep_samples"]
-                    )
+                samples = pside.get("sweep_samples")
+                if samples:
+                    side["sweep_samples"] = samples  # shared mutable trail
 
         def _record_sweep(ent, force_last=False):
             """Append current 2D contact line to the paint sweep on each panel side."""
@@ -5092,26 +5336,42 @@ class PD_Origami_Simulator:
             if key in self._collision_fixed_segments:
                 del self._collision_fixed_points[key]
 
-        fold_done = angle >= 3.0
-        nothing_active = (
-            not self._collision_active_segments and not self._collision_active_points
-        )
-        if fold_done and nothing_active:
-            self._seal_and_export_fixed_flat_contacts()
+        # Freeze sweeping immediately at π (also handled in update_folding_target;
+        # keep this as a safety net if track runs without that path).
+        if angle >= 3.1415 - 1e-6:
+            self._stop_sweep_drawing_at_pi()
 
     # 5. coordinates export
 
-    def _seal_and_export_fixed_flat_contacts(self):
-        """Move any remaining actives into fixed, then export once."""
+    def _seal_and_export_fixed_flat_contacts(self, reason="fold_complete"):
+        """Move any remaining actives into fixed, then export once.
+
+        reason: fixed_reason tag for still-live contacts (e.g. fold_pi).
+        After a successful export, sweep sample recording and paint stamping stop.
+
+        Exported coordinates for each panel side are the **shaded sweep region**
+        (ribbon of successive two-node contact lines in design xy).
+        """
         if self._collision_coords_exported:
-            return
+            # Allow recovery only when previous seal stored nothing
+            if self._collision_fixed_segments or self._collision_fixed_points:
+                return
+            self._collision_coords_exported = False
+        seal_reason = reason or "fold_complete"
         for key, ent in list(self._collision_active_segments.items()):
             existing = self._collision_fixed_segments.get(key)
             if existing and existing.get("coords_locked"):
+                # Prefer the longer sweep trail if active has more samples
+                for sk in ("side_a", "side_b"):
+                    es = (ent.get(sk) or {}).get("sweep_samples") or []
+                    xs = (existing.get(sk) or {}).get("sweep_samples") or []
+                    if len(es) > len(xs) and existing.get(sk) is not None:
+                        existing[sk]["sweep_samples"] = self._copy_sweep_samples(es)
                 continue  # keep off_crease (or earlier) lock
-            ent = dict(ent)
+            # Snapshot so later shared-list mutations cannot grow sealed trails
+            ent = self._copy_segment_entry(ent)
             ent["coords_locked"] = True
-            ent["fixed_reason"] = ent.get("fixed_reason") or "fold_complete"
+            ent["fixed_reason"] = ent.get("fixed_reason") or seal_reason
             self._collision_fixed_segments[key] = ent
         self._collision_active_segments.clear()
         for key, ent in list(self._collision_active_points.items()):
@@ -5119,28 +5379,56 @@ class PD_Origami_Simulator:
                 continue
             ent = dict(ent)
             ent["coords_locked"] = True
-            ent["fixed_reason"] = ent.get("fixed_reason") or "fold_complete"
+            ent["fixed_reason"] = ent.get("fixed_reason") or seal_reason
             self._collision_fixed_points.setdefault(key, ent)
         self._collision_active_points.clear()
         for key in list(self._collision_fixed_points.keys()):
             if key in self._collision_fixed_segments:
                 del self._collision_fixed_points[key]
+
+        # Last resort at π: harvest this-frame flat contacts if tracker is empty
+        if (
+            seal_reason == "fold_pi"
+            and not self._collision_fixed_segments
+            and getattr(self, "_collision_contact_segments_flat", None)
+        ):
+            for s in self._collision_contact_segments_flat:
+                try:
+                    key = self._contact_pair_key(s)
+                except Exception:
+                    continue
+                if key in self._collision_fixed_segments:
+                    continue
+                ent = self._copy_segment_entry(s)
+                ent["coords_locked"] = True
+                ent["fixed_reason"] = "fold_pi"
+                self._collision_fixed_segments[key] = ent
+
         if self._collision_fixed_segments or self._collision_fixed_points:
             self._export_all_fixed_flat_contacts()
-        else:
+        elif seal_reason == "fold_pi":
+            # Truly nothing to export this fold — stop thrashing
             self._collision_coords_exported = True
+            self._collision_stats = self.build_collision_stats(include_live=False)
+            print(
+                "[Contact] Seal @π with no fixed contacts "
+                f"(GUI segs={getattr(self, '_collision_segment_count', 0)} "
+                f"pts={getattr(self, '_collision_contact_count', 0)})."
+            )
+        # else: leave open so later frames can still accumulate
 
     def build_collision_stats(self, include_live=False):
         """
         Structured dump of every tracked contact (for JSON / debugging).
         One entry per red triangle–triangle contact the tracker kept.
 
-        Paint region on each 2D panel side is the **sweep** of the two-node
-        contact line (design xy), not a 3D mesh. Falls back to first/last
-        triangle when fewer than two sweep samples exist.
+        **Exported coordinates** for each panel side = the **shaded area**:
+        the 2D sweep ribbon of the two-node contact line (design xy).
+        Falls back to first/last triangle only when fewer than two samples.
         """
         groups = self.get_collision_groups(include_live=include_live)
         closed_polygons = []
+        shaded_areas = []
         segments_out = []
         points_out = []
         n_sweep = 0
@@ -5154,13 +5442,16 @@ class PD_Origami_Simulator:
                     sweep_samples = self._copy_sweep_samples(
                         side.get("sweep_samples") or []
                     )
+                    # Also accept bare [p0,p1] samples if stored as lists
+                    if not sweep_samples and side.get("sweep_samples"):
+                        sweep_samples = side.get("sweep_samples") or []
                     sweep_poly = self.sweep_paint_polygon_2d(sweep_samples)
                     tri_info = self.closed_triangle_max_area_from_first_last(
                         seg, side_key
                     )
                     poly4 = self.closed_polygon_from_first_last(seg, side_key)
 
-                    # Prefer swept 2D ribbon; else first+last triangle; else skip
+                    # Primary: swept shaded ribbon (matches viz paint)
                     paint_poly = sweep_poly
                     paint_kind = "sweep"
                     paint_area = (
@@ -5179,6 +5470,11 @@ class PD_Origami_Simulator:
                     if paint_kind == "sweep":
                         n_sweep += 1
 
+                    # Coordinate list as plain [[x,y], ...] for consumers
+                    coordinates = [
+                        [float(q[0]), float(q[1])] for q in paint_poly
+                    ]
+
                     entry = {
                         "panel": side.get("panel", seg.get("panel_a")),
                         "unit": side.get("unit"),
@@ -5195,9 +5491,15 @@ class PD_Origami_Simulator:
                         "layer_h": seg.get("layer_h"),
                         "tri_a": seg.get("tri_a"),
                         "tri_b": seg.get("tri_b"),
-                        # 2D paint (primary): swept region of the contact line
+                        # === primary export: shaded region coordinates ===
+                        "coordinates": coordinates,
+                        "shaded_polygon": coordinates,
+                        "shaded_area": float(paint_area),
+                        "shaded_kind": paint_kind,
+                        "n_vertices": len(coordinates),
+                        # aliases used by visualizer / older consumers
                         "paint_kind": paint_kind,
-                        "paint_polygon": paint_poly,
+                        "paint_polygon": coordinates,
                         "paint_area": float(paint_area),
                         "sweep_samples": sweep_samples,
                         "sweep_n_samples": len(sweep_samples),
@@ -5225,12 +5527,41 @@ class PD_Origami_Simulator:
                             if tri_info
                             else side.get("first_p1", seg.get("first_p1"))
                         ),
+                        # last two-node line (trim lock / live tip)
+                        "last_p0": list(side["p0"]) if "p0" in side else None,
+                        "last_p1": list(side["p1"]) if "p1" in side else None,
                         # Legacy 4-gon (first + both last ends)
                         "polygon": poly4,
                         "fixed_reason": seg.get("fixed_reason"),
                         "folding_angle": seg.get("folding_angle"),
                     }
                     closed_polygons.append(entry)
+                    shaded_areas.append({
+                        "panel": entry["panel"],
+                        "unit": entry["unit"],
+                        "side": side_key,
+                        "layer_idx": entry["layer_idx"],
+                        "layer_h": entry["layer_h"],
+                        "kind": paint_kind,
+                        "area": float(paint_area),
+                        "coordinates": coordinates,
+                        "n_vertices": len(coordinates),
+                        "sweep_n_samples": len(sweep_samples),
+                        # Full sample list for complete export / logging
+                        "sweep_samples": sweep_samples,
+                        "first_p0": entry.get("first_p0"),
+                        "first_p1": entry.get("first_p1"),
+                        "last_p0": entry.get("last_p0"),
+                        "last_p1": entry.get("last_p1"),
+                        "fixed_reason": entry.get("fixed_reason"),
+                        "folding_angle": entry.get("folding_angle"),
+                        "intruder_panel": entry["intruder_panel"],
+                        "other_panel": entry["other_panel"],
+                        "unit_a": entry.get("unit_a"),
+                        "unit_b": entry.get("unit_b"),
+                        "tri_a": entry.get("tri_a"),
+                        "tri_b": entry.get("tri_b"),
+                    })
             for ent in g["points"]:
                 points_out.append(ent)
         return {
@@ -5240,18 +5571,61 @@ class PD_Origami_Simulator:
             "n_closed_polygons": len(closed_polygons),
             "n_closed_triangles": len(closed_polygons),
             "n_sweep_paints": n_sweep,
+            "n_shaded_areas": len(shaded_areas),
             "groups": groups,
             "segments": segments_out,
             "points": points_out,
             "closed_polygons": closed_polygons,
+            # Flat list of shaded regions = primary exported coordinates
+            "shaded_areas": shaded_areas,
             "folding_angle": float(getattr(self, "folding_angle", 0.0)),
             # Live frame raw counts (what the GUI draws this frame)
             "gui_contact_points": int(getattr(self, "_collision_contact_count", 0)),
             "gui_contact_segments": int(getattr(self, "_collision_segment_count", 0)),
         }
 
+    @staticmethod
+    def _fmt_xy(q, prec=6):
+        return f"({float(q[0]):.{prec}f}, {float(q[1]):.{prec}f})"
+
+    @classmethod
+    def _log_xy_ring(cls, pts, indent="        ", label="coordinates", prec=6):
+        """Print every ring vertex (no truncation). One point per line for clarity."""
+        if not pts:
+            print(f"{indent}{label}: (empty)")
+            return
+        print(f"{indent}{label}  n={len(pts)}  (closed ring):")
+        for i, q in enumerate(pts):
+            print(f"{indent}  [{i:4d}] {cls._fmt_xy(q, prec)}")
+        # close marker repeats first vertex for readability
+        print(f"{indent}  [close] {cls._fmt_xy(pts[0], prec)}")
+
+    @classmethod
+    def _log_sweep_samples(cls, samples, indent="        ", prec=6):
+        """Print every two-node sweep sample (no omission)."""
+        if not samples:
+            print(f"{indent}sweep_samples: (none)")
+            return
+        print(f"{indent}sweep_samples  n={len(samples)}:")
+        for si, s in enumerate(samples):
+            if not s or "p0" not in s or "p1" not in s:
+                print(f"{indent}  sample[{si}]: (invalid)")
+                continue
+            a, b = s["p0"], s["p1"]
+            ang = float(s.get("angle", 0.0))
+            print(
+                f"{indent}  sample[{si:4d}] @θ={ang:.6f}: "
+                f"{cls._fmt_xy(a, prec)} -- {cls._fmt_xy(b, prec)}"
+            )
+
     def _export_all_fixed_flat_contacts(self):
-        """Print locked flat trim coords, grouped by colliding panel pair."""
+        """
+        Complete log of locked flat trim coords.
+
+        Primary payload = shaded sweep polygon coordinates (every vertex) and
+        every sweep sample stroke. Nothing is truncated or omitted.
+        Also writes a full text dump next to descriptionData for offline review.
+        """
         groups = self.get_collision_groups(include_live=False)
         n_segs = sum(len(g["segments"]) for g in groups)
         n_pts = sum(len(g["points"]) for g in groups)
@@ -5264,17 +5638,76 @@ class PD_Origami_Simulator:
         })
         n_sweep = int(stats.get("n_sweep_paints", 0) or 0)
         n_paint = int(stats.get("n_closed_polygons", 0) or 0)
-        print(
-            f"[Contact] Exported flat coords: first=on-crease paper, "
-            f"last=locked trim (off-crease), 2D line sweep paint, "
-            f"ALL triangle-pair contacts "
-            f"(fold angle={float(self.folding_angle):.4f}, "
+        n_shaded = int(stats.get("n_shaded_areas", n_paint) or 0)
+
+        lines_out = []
+
+        def _p(msg=""):
+            print(msg)
+            lines_out.append(str(msg))
+
+        _p(
+            f"[Contact] Exported SHADED areas (sweep ribbons) as coordinates: "
+            f"fold angle={float(self.folding_angle):.6f}, "
             f"groups={len(groups)}, lines={n_segs}, lone_pts={n_pts}, "
-            f"unit_pairs={n_unit_pairs}, 2d_paints={n_paint} "
+            f"unit_pairs={n_unit_pairs}, shaded={n_shaded} "
             f"(sweep={n_sweep}); "
             f"GUI last frame segs={self._collision_segment_count} "
-            f"pts={self._collision_contact_count}):"
+            f"pts={self._collision_contact_count}"
         )
+        _p(
+            f"[Contact] Full dump: every shaded vertex + every sweep sample "
+            f"(no truncation)."
+        )
+
+        # ---- 1) Every shaded region (primary export) ----
+        for si, sh in enumerate(stats.get("shaded_areas") or []):
+            coords = sh.get("coordinates") or []
+            samples = sh.get("sweep_samples") or []
+            _p(
+                f"  shaded[{si}] panel={sh.get('panel')} unit={sh.get('unit')} "
+                f"side={sh.get('side')} L={sh.get('layer_idx')} "
+                f"h={sh.get('layer_h')!s} kind={sh.get('kind')} "
+                f"A={float(sh.get('area', 0)):.6f} "
+                f"n_verts={len(coords)} n_samples={len(samples)} "
+                f"units={sh.get('unit_a')}-{sh.get('unit_b')} "
+                f"tris={sh.get('tri_a')}-{sh.get('tri_b')} "
+                f"intr={sh.get('intruder_panel')} host={sh.get('other_panel')} "
+                f"lock={sh.get('fixed_reason')} @θ={sh.get('folding_angle')}"
+            )
+            if sh.get("first_p0") is not None and sh.get("first_p1") is not None:
+                _p(
+                    f"    first: {self._fmt_xy(sh['first_p0'])} -- "
+                    f"{self._fmt_xy(sh['first_p1'])}"
+                )
+            if sh.get("last_p0") is not None and sh.get("last_p1") is not None:
+                _p(
+                    f"    last:  {self._fmt_xy(sh['last_p0'])} -- "
+                    f"{self._fmt_xy(sh['last_p1'])}"
+                )
+            # Capture ring + samples into lines_out via temporary print capture
+            # Use direct helpers that also append
+            if coords:
+                _p(f"    coordinates  n={len(coords)}  (closed ring):")
+                for i, q in enumerate(coords):
+                    _p(f"      [{i:4d}] {self._fmt_xy(q)}")
+                _p(f"      [close] {self._fmt_xy(coords[0])}")
+            else:
+                _p("    coordinates: (empty)")
+            if samples:
+                _p(f"    sweep_samples  n={len(samples)}:")
+                for j, s in enumerate(samples):
+                    if not s or "p0" not in s or "p1" not in s:
+                        _p(f"      sample[{j:4d}]: (invalid)")
+                        continue
+                    _p(
+                        f"      sample[{j:4d}] @θ={float(s.get('angle', 0)):.6f}: "
+                        f"{self._fmt_xy(s['p0'])} -- {self._fmt_xy(s['p1'])}"
+                    )
+            else:
+                _p("    sweep_samples: (none)")
+
+        # ---- 2) Per-group / per-line detail (complete) ----
         for gi, g in enumerate(groups):
             intr_p = g.get("intruder_panel")
             oth_p = g.get("other_panel")
@@ -5285,7 +5718,7 @@ class PD_Origami_Simulator:
                 )
             else:
                 who = "INTRUDER: unknown (no classification)"
-            print(
+            _p(
                 f"  === group {gi}: panels {g['panel_a']}-{g['panel_b']} | {who} "
                 f"({len(g['segments'])} lines, {len(g['points'])} pts) ==="
             )
@@ -5296,24 +5729,24 @@ class PD_Origami_Simulator:
                 tri_tag = ""
                 if seg.get("tri_a") is not None and seg.get("tri_b") is not None:
                     tri_tag = f" tris={seg['tri_a']}-{seg['tri_b']}"
-                print(
+                _p(
                     f"    line {i}  INTRUDER panel {s_intr} / host panel {s_oth}  "
                     f"units {seg['unit_a']}-{seg['unit_b']} "
                     f"L{seg['layer_idx']} h={seg['layer_h']:+.6g}{tri_tag}  "
-                    f"lock={reason} @θ={seg.get('folding_angle', 0):.3f}"
+                    f"lock={reason} @θ={float(seg.get('folding_angle', 0)):.6f}"
                 )
                 if seg.get("d_AtoB") is not None:
-                    print(
-                        f"      dAB={seg['d_AtoB']:+.4f} dBA={seg['d_BtoA']:+.4f}  "
+                    _p(
+                        f"      dAB={seg['d_AtoB']:+.6f} dBA={seg['d_BtoA']:+.6f}  "
                         f"intr_unit={seg.get('intruder_sim_unit')} "
                         f"host_unit={seg.get('other_sim_unit')}"
                     )
                 if seg.get("p0_3d") is not None and seg.get("p1_3d") is not None:
                     a3, b3 = seg["p0_3d"], seg["p1_3d"]
-                    print(
+                    _p(
                         f"      3d (GUI red segment): "
-                        f"({a3[0]:.4f},{a3[1]:.4f},{a3[2]:.4f}) -- "
-                        f"({b3[0]:.4f},{b3[1]:.4f},{b3[2]:.4f})"
+                        f"({float(a3[0]):.6f},{float(a3[1]):.6f},{float(a3[2]):.6f}) -- "
+                        f"({float(b3[0]):.6f},{float(b3[1]):.6f},{float(b3[2]):.6f})"
                     )
                 n_sides_printed = 0
                 for side_key, label in (("side_a", "panel-A"), ("side_b", "panel-B")):
@@ -5329,43 +5762,72 @@ class PD_Origami_Simulator:
                         role = " [INTRUDER]"
                     elif side.get("panel") == s_oth:
                         role = " [HOST]"
-                    print(
+                    _p(
                         f"      {label} p{side.get('panel')} u{side.get('unit')}{role}"
                     )
                     kp0 = seg.get("first_kp0")
                     kp1 = seg.get("first_kp1")
                     kp_tag = f" kps={kp0}-{kp1}" if kp0 is not None else ""
-                    print(
+                    _p(
                         f"        first(JSON crease verts){kp_tag} @θ="
-                        f"{side.get('first_folding_angle', seg.get('first_folding_angle', 0)):.3f}: "
-                        f"({f0[0]:.6f}, {f0[1]:.6f}) -- ({f1[0]:.6f}, {f1[1]:.6f})"
+                        f"{float(side.get('first_folding_angle', seg.get('first_folding_angle', 0))):.6f}: "
+                        f"{self._fmt_xy(f0)} -- {self._fmt_xy(f1)}"
                     )
-                    print(
-                        f"        last (trim lock) @θ={seg.get('folding_angle', 0):.3f}: "
-                        f"({p0[0]:.6f}, {p0[1]:.6f}) -- ({p1[0]:.6f}, {p1[1]:.6f})"
+                    _p(
+                        f"        last (trim lock) @θ={float(seg.get('folding_angle', 0)):.6f}: "
+                        f"{self._fmt_xy(p0)} -- {self._fmt_xy(p1)}"
                     )
-                    tri_info = self.closed_triangle_max_area_from_first_last(
-                        seg, side_key
-                    )
-                    if tri_info is not None:
-                        tri = tri_info["triangle"]
-                        print(
-                            f"        closed tri (max-area, last_idx="
-                            f"{tri_info['last_index']}, A={tri_info['area']:.4f}): "
-                            + " → ".join(f"({q[0]:.3f},{q[1]:.3f})" for q in tri)
-                            + " → (close)"
+                    samples = side.get("sweep_samples") or []
+                    shaded = self.sweep_paint_polygon_2d(samples)
+                    n_samp = len(samples)
+                    if shaded is not None:
+                        area = self._polygon_area_2d(shaded)
+                        _p(
+                            f"        SHADED area (export coords, kind=sweep, "
+                            f"n_samples={n_samp}, n_verts={len(shaded)}, "
+                            f"A={area:.6f}):"
                         )
-                    poly = self.closed_polygon_from_first_last(seg, side_key)
-                    if poly is not None:
-                        print(
-                            f"        closed poly (legacy 4-gon): "
-                            + " → ".join(f"({q[0]:.3f},{q[1]:.3f})" for q in poly)
-                            + " → (close)"
+                        _p(f"        coordinates  n={len(shaded)}  (closed ring):")
+                        for vi, q in enumerate(shaded):
+                            _p(f"          [{vi:4d}] {self._fmt_xy(q)}")
+                        _p(f"          [close] {self._fmt_xy(shaded[0])}")
+                    else:
+                        tri_info = self.closed_triangle_max_area_from_first_last(
+                            seg, side_key
                         )
+                        if tri_info is not None:
+                            tri = tri_info["triangle"]
+                            _p(
+                                f"        SHADED area (fallback tri, "
+                                f"n_samples={n_samp}, A={float(tri_info['area']):.6f}):"
+                            )
+                            _p(f"        coordinates  n={len(tri)}  (closed ring):")
+                            for vi, q in enumerate(tri):
+                                _p(f"          [{vi:4d}] {self._fmt_xy(q)}")
+                            _p(f"          [close] {self._fmt_xy(tri[0])}")
+                        else:
+                            _p(
+                                f"        SHADED area: none "
+                                f"(n_samples={n_samp})"
+                            )
+                    # Always log full sample list (never omit)
+                    if samples:
+                        _p(f"        sweep_samples  n={n_samp}:")
+                        for j, s in enumerate(samples):
+                            if not s or "p0" not in s or "p1" not in s:
+                                _p(f"          sample[{j:4d}]: (invalid)")
+                                continue
+                            _p(
+                                f"          sample[{j:4d}] @θ="
+                                f"{float(s.get('angle', 0)):.6f}: "
+                                f"{self._fmt_xy(s['p0'])} -- {self._fmt_xy(s['p1'])}"
+                            )
+                    else:
+                        _p("        sweep_samples: (none)")
                 if n_sides_printed == 0:
-                    print("      (no flat map for this segment — 3d only)")
+                    _p("      (no flat map for this segment — 3d only)")
             for i, ent in enumerate(g["points"]):
-                print(
+                _p(
                     f"    pt {i}  INTRUDER panel {ent.get('intruder_panel', '?')} / "
                     f"host panel {ent.get('other_panel', '?')}  "
                     f"units {ent['unit_a']}-{ent['unit_b']} "
@@ -5376,10 +5838,37 @@ class PD_Origami_Simulator:
                     if "p" not in side:
                         continue
                     p = side["p"]
-                    print(
+                    _p(
                         f"      {label} p{side.get('panel')} u{side.get('unit')}: "
-                        f"({p[0]:.6f}, {p[1]:.6f})"
+                        f"{self._fmt_xy(p)}"
                     )
+
+        # ---- 3) Write complete log file (console may scroll away) ----
+        try:
+            out_dir = os.path.join(".", "descriptionData")
+            os.makedirs(out_dir, exist_ok=True)
+            name = getattr(self, "origami_name", "origami") or "origami"
+            log_path = os.path.join(out_dir, f"{name}-contact-export.log")
+            with open(log_path, "w", encoding="utf-8") as fw:
+                fw.write("\n".join(lines_out))
+                fw.write("\n")
+            _p(f"[Contact] Complete log written to {log_path}")
+            # Also dump structured JSON of shaded areas (full coordinates + samples)
+            json_path = os.path.join(out_dir, f"{name}-shaded-areas.json")
+            payload = {
+                "origami_name": name,
+                "folding_angle": float(self.folding_angle),
+                "n_shaded_areas": n_shaded,
+                "n_segments": n_segs,
+                "n_points": n_pts,
+                "shaded_areas": stats.get("shaded_areas") or [],
+                "closed_polygons": stats.get("closed_polygons") or [],
+            }
+            with open(json_path, "w", encoding="utf-8") as fw:
+                json.dump(payload, fw, indent=2)
+            _p(f"[Contact] Shaded-area JSON written to {json_path}")
+        except Exception as exc:
+            _p(f"[Contact] Failed to write export log/json: {exc}")
 
     def get_fixed_flat_segments(self):
         """All finalized segment cut lines (sorted by panel group, layer, units)."""
@@ -5550,9 +6039,10 @@ class PD_Origami_Simulator:
                 yield side, is_intr, ent
 
     def _paint_min_move_dist(self):
+        # Match export sweep density so the on-panel locus is not sparse
         if self._paint_min_move is None:
             self._paint_min_move = max(
-                float(getattr(self, "max_size", 100.0)) * 0.003, 0.12
+                float(getattr(self, "max_size", 100.0)) * 3e-4, 0.012
             )
         return float(self._paint_min_move)
 
@@ -5634,6 +6124,34 @@ class PD_Origami_Simulator:
             return None
         return [float(p[0]), float(p[1]), float(p[2])]
 
+    @staticmethod
+    def _eval_bary_batch(locs, positions, lift=0.0):
+        """
+        Vectorized bary eval: locs is list/array of (i0,i1,i2,u,v,w).
+        Returns (N, 3) float64; rows with bad locs are NaN.
+        """
+        n = len(locs)
+        if n == 0:
+            return np.zeros((0, 3), dtype=np.float64)
+        L = np.asarray(locs, dtype=np.float64).reshape(n, -1)
+        i0 = L[:, 0].astype(np.intp)
+        i1 = L[:, 1].astype(np.intp)
+        i2 = L[:, 2].astype(np.intp)
+        u = L[:, 3:4]
+        v = L[:, 4:5]
+        w = L[:, 5:6]
+        pos = np.asarray(positions)
+        a = pos[i0, :3]
+        b = pos[i1, :3]
+        c = pos[i2, :3]
+        p = u * a + v * b + w * c
+        if lift != 0.0:
+            nrm = np.cross(b - a, c - a)
+            nn = np.linalg.norm(nrm, axis=1, keepdims=True)
+            nn = np.maximum(nn, 1e-12)
+            p = p + (float(lift) / nn) * nrm
+        return p
+
     def _stamp_paint_canvas_from_contacts(self):
         """
         Record locus using **barycentric locs from the collision hit triangle**
@@ -5641,6 +6159,11 @@ class PD_Origami_Simulator:
         already on the panel mesh; redraw just re-evaluates them on current x.
         """
         if not getattr(self, "collision_shading", False):
+            return
+        # Fold sealed at π → no more locus stamps
+        if getattr(self, "_sweep_draw_stopped", False) or getattr(
+            self, "_collision_coords_exported", False
+        ):
             return
         if not hasattr(self, "_paint_canvas") or self._paint_canvas is None:
             self._paint_canvas = {}
@@ -5650,8 +6173,10 @@ class PD_Origami_Simulator:
             return
 
         min_move = self._paint_min_move_dist()
-        max_n = int(getattr(self, "_paint_max_samples", 48))
         dirty = False
+        copy_loc = self._copy_loc
+        order2 = self._order_segment_endpoints_2d
+        mid_dist = self._segment_mid_dist_2d
 
         for ent in active.values():
             # Stamp BOTH sides (each panel gets its own material locus)
@@ -5659,8 +6184,8 @@ class PD_Origami_Simulator:
                 side = ent.get(sk)
                 if not side or "p0" not in side:
                     continue
-                loc0 = self._copy_loc(side.get("loc0"))
-                loc1 = self._copy_loc(side.get("loc1"))
+                loc0 = copy_loc(side.get("loc0"))
+                loc1 = copy_loc(side.get("loc1"))
                 if loc0 is None or loc1 is None:
                     continue
                 uid = side.get("unit")
@@ -5673,18 +6198,12 @@ class PD_Origami_Simulator:
                 trail = self._paint_canvas.setdefault(uid, [])
                 if trail:
                     last = trail[-1]
-                    p0o, p1o = self._order_segment_endpoints_2d(
-                        p0, p1, last["p0"], last["p1"]
-                    )
+                    p0o, p1o = order2(p0, p1, last["p0"], last["p1"])
                     # If endpoints swapped for trail order, swap locs too
                     if p0o[0] != p0[0] or p0o[1] != p0[1]:
                         loc0, loc1 = loc1, loc0
-                        p0, p1 = p0o, p1o
-                    else:
-                        p0, p1 = p0o, p1o
-                    moved = self._segment_mid_dist_2d(
-                        last["p0"], last["p1"], p0, p1
-                    )
+                    p0, p1 = p0o, p1o
+                    moved = mid_dist(last["p0"], last["p1"], p0, p1)
                     if moved < min_move:
                         # refresh tip locs so last sample tracks live contact
                         trail[-1] = {
@@ -5698,25 +6217,46 @@ class PD_Origami_Simulator:
                     "loc0": loc0, "loc1": loc1,
                 })
                 dirty = True
-                if len(trail) > max_n:
-                    self._paint_canvas[uid] = [trail[0]] + trail[-(max_n - 1):]
+                # No max sample cap — keep full trail
         if dirty:
             self._paint_dirty = True
+
+    def _ensure_paint_line_capacity(self, n_verts):
+        """Grow Taichi paint line field if needed (no hard cap on stroke count)."""
+        n_verts = int(max(0, n_verts))
+        cur = int(getattr(self, "_paint_max_line_verts", 0) or 0)
+        if hasattr(self, "paint_line_vertices") and n_verts <= cur and cur > 0:
+            return
+        need = max(n_verts, 8192)
+        if cur > 0:
+            while need < n_verts:
+                need *= 2
+            if need < cur * 2 and n_verts > cur:
+                need = cur * 2
+        # round up to multiple of 1024 for fewer reallocs
+        need = max(need, n_verts)
+        need = ((need + 1023) // 1024) * 1024
+        self._paint_max_line_verts = need
+        self.paint_line_vertices = ti.Vector.field(3, dtype=ti.f32, shape=need)
 
     def _update_surface_sweep_paint(self):
         """
         Draw locus glued to panels: evaluate stored barycentrics on current x.
         Paths move with the paper — not free-floating 3D polylines.
+
+        Fast path: when sim is paused and the canvas was not restamped, reuse
+        the last GPU line buffer (camera-only motion still works).
         """
-        if not hasattr(self, "paint_line_vertices"):
+        if not hasattr(self, "paint_line_vertices") and not getattr(
+            self, "collision_shading", False
+        ):
             self._paint_line_vert_count = 0
             self._paint_n_strokes = 0
             return
 
-        try:
-            self._stamp_paint_canvas_from_contacts()
-        except Exception:
-            pass
+        # At π: keep the last uploaded strokes; do not grow or reproject
+        if getattr(self, "_sweep_draw_stopped", False):
+            return
 
         canvas = getattr(self, "_paint_canvas", None) or {}
         if not canvas:
@@ -5725,150 +6265,220 @@ class PD_Origami_Simulator:
                 self._paint_n_strokes = 0
             return
 
-        # Always re-eval bary on current vertices so locus sticks to the panel
-        # (cheap: ~48 samples × 2 endpoints).
-        max_lv = int(self._paint_max_line_verts)
-        ln_buf = np.zeros((max_lv, 3), dtype=np.float32)
-        li = 0
+        # Reuse previous line verts when mesh is frozen and canvas unchanged
+        paused = bool(getattr(self, "paused", False)) and not bool(
+            getattr(self, "step_once", False)
+        )
+        if (
+            paused
+            and not getattr(self, "_paint_dirty", False)
+            and int(getattr(self, "_paint_line_vert_count", 0) or 0) >= 2
+        ):
+            return
 
-        positions = self.x.to_numpy()[: self.kp_num]
+        positions = self._cache_frame_positions()
         # tiny offset so lines win depth buffer without looking off-surface
         lift = max(float(getattr(self, "max_size", 100.0)) * 5e-5, 0.005)
 
-        def add_line3(a, b):
-            nonlocal li
-            if a is None or b is None or li + 2 > max_lv:
-                return
-            ln_buf[li] = a
-            li += 1
-            ln_buf[li] = b
-            li += 1
-
-        for uid, strokes in canvas.items():
+        # Batch all bary evals, then pack line segments
+        all_loc0 = []
+        all_loc1 = []
+        unit_ranges = []  # (start, count) into all_loc*
+        for _uid, strokes in canvas.items():
             if not strokes:
                 continue
-            pts0, pts1 = [], []
+            start = len(all_loc0)
             for s in strokes:
                 loc0 = s.get("loc0")
                 loc1 = s.get("loc1")
                 if loc0 is None or loc1 is None:
                     continue
-                a3 = self._eval_bary_on_positions(loc0, positions, lift=lift)
-                b3 = self._eval_bary_on_positions(loc1, positions, lift=lift)
-                if a3 is not None:
-                    pts0.append(a3)
-                if b3 is not None:
-                    pts1.append(b3)
+                all_loc0.append(loc0)
+                all_loc1.append(loc1)
+            n = len(all_loc0) - start
+            if n > 0:
+                unit_ranges.append((start, n))
 
+        if not all_loc0:
+            self._paint_line_vert_count = 0
+            self._paint_n_strokes = 0
+            self._paint_dirty = False
+            return
+
+        pts0_all = self._eval_bary_batch(all_loc0, positions, lift=lift)
+        pts1_all = self._eval_bary_batch(all_loc1, positions, lift=lift)
+
+        # Upper bound: 2 chains of (n-1) segs + n cross bars → ~ (4n-2) verts/unit
+        n_total = len(all_loc0)
+        est_verts = max(4 * n_total * 2, 64)
+        self._ensure_paint_line_capacity(est_verts)
+        max_lv = int(self._paint_max_line_verts)
+        ln_buf = np.zeros((max_lv, 3), dtype=np.float32)
+        li = 0
+
+        for start, n in unit_ranges:
+            pts0 = pts0_all[start : start + n]
+            pts1 = pts1_all[start : start + n]
+            # drop non-finite rows
+            good0 = np.isfinite(pts0).all(axis=1)
+            good1 = np.isfinite(pts1).all(axis=1)
             # locus of each contact node (on surface)
-            for pts in (pts0, pts1):
-                for i in range(len(pts) - 1):
-                    add_line3(pts[i], pts[i + 1])
-            # contact line samples (every few to show the line itself on the panel)
-            step = max(1, len(pts0) // 12)
-            for i in range(0, min(len(pts0), len(pts1)), step):
-                add_line3(pts0[i], pts1[i])
-            if pts0 and pts1:
-                add_line3(pts0[-1], pts1[-1])
+            for pts, good in ((pts0, good0), (pts1, good1)):
+                prev = None
+                for i in range(n):
+                    if not good[i]:
+                        prev = None
+                        continue
+                    cur = pts[i]
+                    if prev is not None:
+                        if li + 2 > max_lv:
+                            self._ensure_paint_line_capacity(li + 2 + 4096)
+                            max_lv = int(self._paint_max_line_verts)
+                            new_buf = np.zeros((max_lv, 3), dtype=np.float32)
+                            new_buf[:li] = ln_buf[:li]
+                            ln_buf = new_buf
+                        ln_buf[li] = prev
+                        li += 1
+                        ln_buf[li] = cur
+                        li += 1
+                    prev = cur
+            # Contact line samples on the panel (every sample)
+            for i in range(n):
+                if not (good0[i] and good1[i]):
+                    continue
+                if li + 2 > max_lv:
+                    self._ensure_paint_line_capacity(li + 2 + 4096)
+                    max_lv = int(self._paint_max_line_verts)
+                    new_buf = np.zeros((max_lv, 3), dtype=np.float32)
+                    new_buf[:li] = ln_buf[:li]
+                    ln_buf = new_buf
+                ln_buf[li] = pts0[i]
+                li += 1
+                ln_buf[li] = pts1[i]
+                li += 1
 
         self._paint_line_vert_count = li
         self._paint_n_strokes = li // 2
         self._paint_dirty = False
         if li > 0:
+            self._ensure_paint_line_capacity(li)
+            # from_numpy needs full field shape
+            max_lv = int(self._paint_max_line_verts)
+            if ln_buf.shape[0] != max_lv:
+                full = np.zeros((max_lv, 3), dtype=np.float32)
+                full[:li] = ln_buf[:li]
+                ln_buf = full
             self.paint_line_vertices.from_numpy(ln_buf)
 
-    def _render_collision_debug_window(self):
-        """
-        Separate ImGui sub-window for collision / cut-node debug text.
-        Grouped by the two JSON panels that collide; intruder marked clearly.
-        """
+    def _build_collision_debug_lines(self):
+        """Build debug text lines (can be cached; window must still draw every frame)."""
         groups = self.get_collision_groups(include_live=True)
         n_fixed = len(self._collision_fixed_segments) + len(self._collision_fixed_points)
         n_live = len(self._collision_active_segments) + len(self._collision_active_points)
         n_intr = len(self._intruder_classifications)
         n_paint = int(sum(len(v) for v in (getattr(self, "_paint_canvas", None) or {}).values()))
         n_strokes = int(getattr(self, "_paint_n_strokes", 0) or 0)
+        lines = [
+            f"GUI red: {self._collision_contact_count} pts, "
+            f"{self._collision_segment_count} segs",
+            f"Locus: {n_paint} samples → {n_strokes} segs "
+            f"(hit-tri bary → panel)",
+            f"Tracked: {n_fixed} fixed + {n_live} live "
+            f"(all tri-pairs) | groups={len(groups)}"
+            + ("  [SEALED@π]" if self._collision_coords_exported else ""),
+            "Paper canvas stamps → affine map onto 3D panel (not mesh tris)",
+        ]
+        shown_groups = 0
+        max_groups = 5
+        for g in groups:
+            if shown_groups >= max_groups:
+                break
+            ip, op = g.get("intruder_panel"), g.get("other_panel")
+            if ip is not None and op is not None:
+                lines.append(
+                    f"-- panels {g['panel_a']}-{g['panel_b']} [{g['status']}]"
+                )
+                lines.append(f"   INTRUDER p{ip} into HOST p{op}")
+            else:
+                lines.append(
+                    f"-- panels {g['panel_a']}-{g['panel_b']} [{g['status']}] "
+                    f"INTRUDER=?"
+                )
+            for seg in g["segments"][:1]:
+                key = self._contact_pair_key(seg)
+                tag = "live" if key in self._collision_active_segments else "done"
+                reason = seg.get("fixed_reason") or ""
+                lock_tag = f" {reason}" if reason else ""
+                lines.append(
+                    f"  [{tag}{lock_tag}] L{seg['layer_idx']} "
+                    f"h={seg['layer_h']:+.4g} "
+                    f"u{seg['unit_a']}-{seg['unit_b']}"
+                )
+                for side_key in ("side_a", "side_b"):
+                    side = seg.get(side_key) or {}
+                    if "p0" not in side:
+                        continue
+                    p0, p1 = side["p0"], side["p1"]
+                    f0 = side.get("first_p0", p0)
+                    f1 = side.get("first_p1", p1)
+                    role = "INTR" if side.get("panel") == ip else (
+                        "HOST" if side.get("panel") == op else "?"
+                    )
+                    lines.append(f"   p{side.get('panel')} [{role}]:")
+                    lines.append(
+                        f"    1st JSON ({f0[0]:.1f},{f0[1]:.1f})--"
+                        f"({f1[0]:.1f},{f1[1]:.1f})"
+                    )
+                    lines.append(
+                        f"    last ({p0[0]:.1f},{p0[1]:.1f})--"
+                        f"({p1[0]:.1f},{p1[1]:.1f})"
+                    )
+            extra_segs = len(g["segments"]) - min(1, len(g["segments"]))
+            if extra_segs > 0:
+                lines.append(f"  ... +{extra_segs} more lines (console)")
+            shown_groups += 1
+        if len(groups) > max_groups:
+            lines.append(f"... +{len(groups) - max_groups} more groups (console)")
+
+        lines.append(f"Live intruders: {n_intr}")
+        for cls in self._intruder_classifications[:4]:
+            lines.append(
+                f"  INTR u{cls['intruder_sim_unit']} -> "
+                f"HOST u{cls['other_sim_unit']}  "
+                f"(dAB={cls['d_AtoB']:+.3f})"
+            )
+        return lines
+
+    def _render_collision_debug_window(self):
+        """
+        Separate ImGui sub-window for collision / cut-node debug text.
+
+        The sub_window is drawn *every* frame (skipping frames causes flicker).
+        Text content is rebuilt only when collision/paint state changes.
+        """
+        cache_key = (
+            int(getattr(self, "_collision_frame_i", 0)),
+            int(self._collision_contact_count),
+            int(self._collision_segment_count),
+            int(getattr(self, "_paint_n_strokes", 0) or 0),
+            len(self._collision_active_segments),
+            len(self._collision_fixed_segments),
+            bool(self._collision_coords_exported),
+            len(self._intruder_classifications),
+        )
+        if (
+            getattr(self, "_debug_lines_key", None) != cache_key
+            or not getattr(self, "_debug_lines", None)
+        ):
+            self._debug_lines = self._build_collision_debug_lines()
+            self._debug_lines_key = cache_key
 
         # Right side of the main window (normalized 0–1 coords)
         with self.gui.sub_window(
             "Collision debug", x=0.62, y=0.02, width=0.36, height=0.70
         ) as dbg:
-            dbg.text(
-                f"GUI red: {self._collision_contact_count} pts, "
-                f"{self._collision_segment_count} segs"
-            )
-            dbg.text(
-                f"Locus: {n_paint} samples → {n_strokes} segs "
-                f"(hit-tri bary → panel)"
-            )
-            dbg.text(
-                f"Tracked: {n_fixed} fixed + {n_live} live "
-                f"(all tri-pairs) | groups={len(groups)}"
-                + ("  [EXPORTED]" if self._collision_coords_exported else "")
-            )
-            dbg.text("Paper canvas stamps → affine map onto 3D panel (not mesh tris)")
-
-            shown_groups = 0
-            max_groups = 5
-            for g in groups:
-                if shown_groups >= max_groups:
-                    break
-                ip, op = g.get("intruder_panel"), g.get("other_panel")
-                if ip is not None and op is not None:
-                    dbg.text(
-                        f"-- panels {g['panel_a']}-{g['panel_b']} [{g['status']}]"
-                    )
-                    dbg.text(
-                        f"   INTRUDER p{ip} into HOST p{op}"
-                    )
-                else:
-                    dbg.text(
-                        f"-- panels {g['panel_a']}-{g['panel_b']} [{g['status']}] "
-                        f"INTRUDER=?"
-                    )
-                for seg in g["segments"][:1]:
-                    key = self._contact_pair_key(seg)
-                    tag = "live" if key in self._collision_active_segments else "done"
-                    reason = seg.get("fixed_reason") or ""
-                    lock_tag = f" {reason}" if reason else ""
-                    dbg.text(
-                        f"  [{tag}{lock_tag}] L{seg['layer_idx']} "
-                        f"h={seg['layer_h']:+.4g} "
-                        f"u{seg['unit_a']}-{seg['unit_b']}"
-                    )
-                    for side_key in ("side_a", "side_b"):
-                        side = seg.get(side_key) or {}
-                        if "p0" not in side:
-                            continue
-                        p0, p1 = side["p0"], side["p1"]
-                        f0 = side.get("first_p0", p0)
-                        f1 = side.get("first_p1", p1)
-                        role = "INTR" if side.get("panel") == ip else (
-                            "HOST" if side.get("panel") == op else "?"
-                        )
-                        dbg.text(f"   p{side.get('panel')} [{role}]:")
-                        dbg.text(
-                            f"    1st JSON ({f0[0]:.1f},{f0[1]:.1f})--"
-                            f"({f1[0]:.1f},{f1[1]:.1f})"
-                        )
-                        dbg.text(
-                            f"    last ({p0[0]:.1f},{p0[1]:.1f})--"
-                            f"({p1[0]:.1f},{p1[1]:.1f})"
-                        )
-                extra_segs = len(g["segments"]) - min(1, len(g["segments"]))
-                if extra_segs > 0:
-                    dbg.text(f"  ... +{extra_segs} more lines (console)")
-                shown_groups += 1
-            if len(groups) > max_groups:
-                dbg.text(f"... +{len(groups) - max_groups} more groups (console)")
-
-            dbg.text(f"Live intruders: {n_intr}")
-            for cls in self._intruder_classifications[:4]:
-                dbg.text(
-                    f"  INTR u{cls['intruder_sim_unit']} -> "
-                    f"HOST u{cls['other_sim_unit']}  "
-                    f"(dAB={cls['d_AtoB']:+.3f})"
-                )
+            for line in self._debug_lines:
+                dbg.text(line)
 
     def _update_intruder_classification(self, positions=None, colliding_unit_pairs=None):
         """
@@ -5885,7 +6495,7 @@ class PD_Origami_Simulator:
             self._upload_intruder_panel_indices(set())
             return
         if positions is None:
-            positions = self.x.to_numpy()[:self.kp_num]
+            positions = self._cache_frame_positions()
         # Hard gate: no red-line collision pairs → no orange panels
         if not colliding_unit_pairs:
             self._intruder_classifications = []
@@ -6021,8 +6631,10 @@ class PD_Origami_Simulator:
             print("[Trimmer] Simulator not initialized; cannot trim.")
             return None
 
-        x_np = self.x.to_numpy()[:self.kp_num]
+        self._render_gen = int(getattr(self, "_render_gen", 0)) + 1
+        x_np = self._cache_frame_positions(force=True)
         initial_kps_np = np.asarray(self.kps, dtype=float)
+        self._flat_kps_np = initial_kps_np
         if initial_kps_np.ndim != 2 or initial_kps_np.shape[1] < 3:
             if initial_kps_np.ndim == 2 and initial_kps_np.shape[1] == 2:
                 z = np.zeros((initial_kps_np.shape[0], 1), dtype=float)
