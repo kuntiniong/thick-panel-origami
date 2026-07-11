@@ -1,0 +1,13 @@
+
+simulations:
+  - name: mountain-thick
+
+    # true  = no GUI (phys run() drives 0→π, then export trimmed JSON)
+    # false = GUI
+    headless: false
+
+    fast: true
+    material_type: 1
+    ref_target: false
+    thick_mode: true
+    unit_edge_max: 4

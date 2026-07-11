@@ -1,0 +1,15 @@
+# Panel-trimming visualizer — closed first+last polygons
+#
+# Shaded region = closed 4-gon:
+#   first_p0 → first_p1 → last_p1 → last_p0
+#   first = JSON mountain/valley crease (green)
+#   last  = cut / contact lock (red)
+
+simulations:
+  - name: mountain-thick-trimmed
+    show_lines: true
+    show_cut_lines: false
+    show_panel_ids: true
+    show_closed_polys: true
+    show_first_last_edges: true
+    show_host_polys: false
