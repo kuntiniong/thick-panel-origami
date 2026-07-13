@@ -4,224 +4,29 @@ import json
 import time, os
 import yaml
 import gc
-from collections import defaultdict
 from spatialhash import SpatialHash
 from ori_sim_sys import *
-from utils import triangle_intersection_contacts_3d, _triangle_aabb_overlap, _triangles_coplanar
+# Triangle contact narrowphase is Taichi (_kernel_detect_panel_contacts);
+# utils.triangle_intersection_contacts_3d kept only for non-sim tooling.
 
 data_type = ti.f64
 numpy_data_type = np.float64
 use_gpu = 0
+
+# Contact locus / paint sampling: one stroke per discrete fold-angle bin.
+# Bins are fixed at 2° so density does not depend on frame rate or fold speed.
+SWEEP_SAMPLE_STEP_DEG = 2.0
+SWEEP_SAMPLE_STEP_RAD = SWEEP_SAMPLE_STEP_DEG * np.pi / 180.0  # float64
 
 if use_gpu:
     ti.init(arch=ti.gpu, default_fp=data_type, fast_math=False, advanced_optimization=False, kernel_profiler=True)
 else:
     ti.init(arch=ti.cpu, default_fp=data_type, fast_math=False, advanced_optimization=False, cpu_max_num_threads=1) #, kernel_profiler=False, verbose=True, debug=True, gdb_trigger=True)
 
+
 # ---------------------------------------------------------------------------
-# Intruder classification + trim helpers (signed-distance slide test)
+# 3D contact → design-plane map (needed by collision flat coords / locus paint)
 # ---------------------------------------------------------------------------
-
-def _trim_panel_normal_3d(verts_3d):
-    """Unit normal of a planar polygon (Newell method)."""
-    n = len(verts_3d)
-    normal = np.zeros(3)
-    for i in range(n):
-        a = verts_3d[i]
-        b = verts_3d[(i + 1) % n]
-        normal[0] += (a[1] - b[1]) * (a[2] + b[2])
-        normal[1] += (a[2] - b[2]) * (a[0] + b[0])
-        normal[2] += (a[0] - b[0]) * (a[1] + b[1])
-    mag = np.linalg.norm(normal)
-    if mag < 1e-10:
-        return np.array([0.0, 0.0, 1.0])
-    return normal / mag
-
-
-def _trim_orient_normals_toward_mid(n_A, C_A, n_B, C_B):
-    """
-    Flip Newell normals so each points toward the pair midpoint.
-
-    Vertex winding is arbitrary after thick expand / PD, so raw normals can
-    make the same physical dig-in look like "separation" on one face of a
-    thick stack and "penetration" on the other.  Facing both toward the mid
-    makes signed distances comparable across layers.
-    """
-    n_A = np.asarray(n_A, dtype=float).reshape(3).copy()
-    n_B = np.asarray(n_B, dtype=float).reshape(3).copy()
-    C_A = np.asarray(C_A, dtype=float).reshape(3)
-    C_B = np.asarray(C_B, dtype=float).reshape(3)
-    mid = 0.5 * (C_A + C_B)
-    if float(np.dot(n_A, mid - C_A)) < 0.0:
-        n_A = -n_A
-    if float(np.dot(n_B, mid - C_B)) < 0.0:
-        n_B = -n_B
-    return n_A, n_B
-
-
-def _trim_is_outer_face(panel_rec):
-    """True for outer faces of a multi-layer thick panel (or any single layer)."""
-    li = panel_rec.get("layer_idx")
-    n = panel_rec.get("num_layers")
-    if li is not None and n is not None:
-        n = int(n)
-        li = int(li)
-        if n <= 1:
-            return True
-        return min(li, n - 1 - li) == 0
-    # Fallback: far from design midplane
-    return abs(float(panel_rec.get("layer_h", 0.0))) > 1e-9
-
-
-def _trim_polygon_area_3d(verts_3d):
-    n = len(verts_3d)
-    if n < 3:
-        return 0.0
-    total = np.zeros(3)
-    o = np.asarray(verts_3d[0], dtype=float)
-    for i in range(1, n - 1):
-        total += np.cross(
-            np.asarray(verts_3d[i], dtype=float) - o,
-            np.asarray(verts_3d[i + 1], dtype=float) - o,
-        )
-    return float(np.linalg.norm(total) * 0.5)
-
-
-def _trim_outer_score(layer_h=None, layer_idx=None, num_layers=None):
-    """
-    Higher = more outer / thicker-face priority for intruder selection.
-
-    - |layer_h|: distance from design midplane (outer faces sit farther out)
-    - stack extremity: layer 0 and last layer of a multi-layer thick panel
-      are outer; middle layers are inner
-    """
-    score = 0.0
-    if layer_h is not None:
-        score += abs(float(layer_h))
-    if layer_idx is not None and num_layers is not None:
-        n = int(num_layers)
-        li = int(layer_idx)
-        if n > 1:
-            # 0 at both outer faces; grows toward the stack interior
-            extremity = min(li, n - 1 - li)
-            is_outer_face = extremity == 0
-            # Strong preference for outer faces of a thick stack
-            score += 1.0e6 if is_outer_face else 0.0
-            # Mild preference for panels that sit farther from the stack mid
-            score += float(n - 1 - extremity) * 1.0e-3
-        elif n == 1:
-            # Single-layer panel is its own outer surface
-            score += 1.0e6
-    return score
-
-
-def _trim_prefer_outer(layer_h_A=None, layer_h_B=None,
-                       layer_idx_A=None, layer_idx_B=None,
-                       num_layers_A=None, num_layers_B=None,
-                       eps=1e-9):
-    """
-    Always prioritize the outer (thicker-face) panel when outerness differs.
-    Returns 'A', 'B', or None if no preference.
-    """
-    sA = _trim_outer_score(layer_h_A, layer_idx_A, num_layers_A)
-    sB = _trim_outer_score(layer_h_B, layer_idx_B, num_layers_B)
-    if sA > sB + eps:
-        return "A"
-    if sB > sA + eps:
-        return "B"
-    return None
-
-
-def _trim_classify_intruder(
-    n_A, C_A, p_A, n_B, C_B, p_B,
-    area_A=None, area_B=None, threshold=0.0,
-    layer_h_A=None, layer_h_B=None,
-    layer_idx_A=None, layer_idx_B=None,
-    num_layers_A=None, num_layers_B=None,
-    orient_normals=True,
-):
-    """
-    Signed distance test (slide):
-      d_A->B = n_B · (C_A - p_B)
-      d_B->A = n_A · (C_B - p_A)
-
-    Returns 'A', 'B', or None.
-    Requires at least one-sided penetration (d < -T). Outer / thicker-face
-    preference only applies once penetration is detected (does not invent
-    intruders from layer meta alone). Callers that already saw a geometric
-    collision may force-pick via ``_trim_pick_intruder_for_pair(..., force=True)``.
-
-    orient_normals: flip both normals toward the pair midpoint so thick-stack
-    winding polarity does not systematically zero out one face of the stack.
-    """
-    n_A = np.asarray(n_A, dtype=float).reshape(3)
-    n_B = np.asarray(n_B, dtype=float).reshape(3)
-    C_A = np.asarray(C_A, dtype=float).reshape(3)
-    C_B = np.asarray(C_B, dtype=float).reshape(3)
-    p_A = np.asarray(p_A, dtype=float).reshape(3)
-    p_B = np.asarray(p_B, dtype=float).reshape(3)
-    if orient_normals:
-        n_A, n_B = _trim_orient_normals_toward_mid(n_A, C_A, n_B, C_B)
-
-    d_AtoB = float(np.dot(n_B, C_A - p_B))
-    d_BtoA = float(np.dot(n_A, C_B - p_A))
-    T = float(threshold)
-
-    A_in_B = d_AtoB < -T
-    B_in_A = d_BtoA < -T
-
-    # No penetration → no intruder
-    if not A_in_B and not B_in_A:
-        return None, d_AtoB, d_BtoA
-
-    # Penetration exists → outer / thicker face wins when outerness differs
-    outer = _trim_prefer_outer(
-        layer_h_A, layer_h_B, layer_idx_A, layer_idx_B, num_layers_A, num_layers_B,
-    )
-    if outer is not None:
-        return outer, d_AtoB, d_BtoA
-
-    if A_in_B and not B_in_A:
-        return "A", d_AtoB, d_BtoA
-    if B_in_A and not A_in_B:
-        return "B", d_AtoB, d_BtoA
-    # Both penetrate, outerness equal → smaller area
-    aA = 0.0 if area_A is None else area_A
-    aB = 0.0 if area_B is None else area_B
-    return ("A" if aA < aB else "B"), d_AtoB, d_BtoA
-
-
-def _trim_plane_plane_intersection(n1, p1, n2, p2):
-    direction = np.cross(n1, n2)
-    mag = np.linalg.norm(direction)
-    if mag < 1e-10:
-        return None
-    direction = direction / mag
-    d1 = float(np.dot(n1, p1))
-    d2 = float(np.dot(n2, p2))
-    A = np.array([n1, n2, direction], dtype=float)
-    b = np.array([d1, d2, 0.0], dtype=float)
-    try:
-        point = np.linalg.solve(A, b)
-    except np.linalg.LinAlgError:
-        return None
-    return point, direction
-
-
-def _trim_closest_pt_on_seg_to_line(seg_a, seg_b, line_p, line_d):
-    u = np.asarray(seg_b, dtype=float) - np.asarray(seg_a, dtype=float)
-    v = np.asarray(line_d, dtype=float)
-    w = np.asarray(seg_a, dtype=float) - np.asarray(line_p, dtype=float)
-    a = float(np.dot(u, u))
-    b = float(np.dot(u, v))
-    c = float(np.dot(v, v))
-    d = float(np.dot(u, w))
-    e = float(np.dot(v, w))
-    denom = a * c - b * b
-    t = 0.0 if abs(denom) < 1e-12 else (b * e - c * d) / denom
-    t = float(np.clip(t, 0.0, 1.0))
-    return t, (np.asarray(seg_a, dtype=float) + t * u)
-
 
 def _closest_point_on_triangle_3d(p, a, b, c):
     """
@@ -299,38 +104,6 @@ def _barycentric_2d(p, a, b, c):
     return float(u), float(v), float(w)
 
 
-def _map_point_flat_2d_to_3d(p_xy, verts_3d, verts_flat_xy, eps=1e-7):
-    """
-    Inverse of ``_map_point_3d_to_flat_2d`` for one triangle:
-    design-plane point → 3D point on the deformed triangle (material map).
-
-    Returns [x,y,z] if p_xy lies in the flat triangle (with small eps), else None.
-    """
-    f0 = np.asarray(verts_flat_xy[0], dtype=float).reshape(-1)[:2]
-    f1 = np.asarray(verts_flat_xy[1], dtype=float).reshape(-1)[:2]
-    f2 = np.asarray(verts_flat_xy[2], dtype=float).reshape(-1)[:2]
-    bary = _barycentric_2d(p_xy, f0, f1, f2)
-    if bary is None:
-        return None
-    u, v, w = bary
-    if u < -eps or v < -eps or w < -eps:
-        return None
-    a = np.asarray(verts_3d[0], dtype=float).reshape(-1)[:3]
-    b = np.asarray(verts_3d[1], dtype=float).reshape(-1)[:3]
-    c = np.asarray(verts_3d[2], dtype=float).reshape(-1)[:3]
-    if a.size < 3:
-        def _pad3(x):
-            x = np.asarray(x, dtype=float).reshape(-1)
-            out = np.zeros(3, dtype=float)
-            out[: min(3, x.size)] = x[: min(3, x.size)]
-            return out
-        a, b, c = _pad3(a), _pad3(b), _pad3(c)
-    p = u * a + v * b + w * c
-    if not np.all(np.isfinite(p)):
-        return None
-    return [float(p[0]), float(p[1]), float(p[2])]
-
-
 def _map_point_3d_to_flat_2d(p3d, verts_3d, verts_flat_xy, return_bary=False):
     """
     Map a 3D point on (or near) a triangle to flat design 2D coords.
@@ -338,12 +111,6 @@ def _map_point_3d_to_flat_2d(p3d, verts_3d, verts_flat_xy, return_bary=False):
     Exact for any point on the triangle under the standard piecewise-linear
     mesh assumption: the unique affine map sending the deformed triangle
     (verts_3d) to the rest/design triangle (verts_flat_xy).
-
-    Steps:
-      1. Closest point of p3d on the 3D triangle (handles slight off-plane /
-         off-edge numerical noise from intersection tests).
-      2. Barycentric (u,v,w) of that closest point.
-      3. flat_xy = u*f0 + v*f1 + w*f2  (same vertex order as verts_3d).
 
     Returns [x, y], or None if the triangle is degenerate.
     If return_bary=True, returns ([x,y], (u,v,w)) or (None, None).
@@ -353,7 +120,6 @@ def _map_point_3d_to_flat_2d(p3d, verts_3d, verts_flat_xy, return_bary=False):
     c = np.asarray(verts_3d[2], dtype=float).reshape(3)[:3]
     p = np.asarray(p3d, dtype=float).reshape(-1)[:3]
     if a.shape[0] < 3 or p.shape[0] < 3:
-        # pad 2d → 3d
         def _pad3(v):
             v = np.asarray(v, dtype=float).reshape(-1)
             if v.size >= 3:
@@ -363,7 +129,6 @@ def _map_point_3d_to_flat_2d(p3d, verts_3d, verts_flat_xy, return_bary=False):
             return out
         a, b, c, p = _pad3(a), _pad3(b), _pad3(c), _pad3(p)
 
-    # Degenerate if edges are parallel / zero area
     n = np.cross(b - a, c - a)
     n_mag = float(np.linalg.norm(n))
     if n_mag < 1e-14:
@@ -391,546 +156,6 @@ def _map_point_3d_to_flat_2d(p3d, verts_3d, verts_flat_xy, return_bary=False):
     return out
 
 
-def _verify_map_point_3d_to_flat_2d(tol=1e-9):
-    """
-    Self-check for 3D→flat mapping. Returns (ok: bool, messages: list[str]).
-    Used by tests / debug; does not touch simulation state.
-    """
-    msgs = []
-    ok = True
-
-    def _check(name, got, expected):
-        nonlocal ok
-        g = np.asarray(got, dtype=float)
-        e = np.asarray(expected, dtype=float)
-        err = float(np.linalg.norm(g - e))
-        if err > tol:
-            ok = False
-            msgs.append(f"FAIL {name}: err={err:g} got={g.tolist()} exp={e.tolist()}")
-        else:
-            msgs.append(f"ok   {name}: err={err:g}")
-
-    verts3 = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
-    flat = np.array([[10.0, 20.0], [30.0, 20.0], [10.0, 40.0]])
-    for i, lab in enumerate("ABC"):
-        out = _map_point_3d_to_flat_2d(verts3[i], verts3, flat)
-        _check(f"vertex {lab}", out, flat[i])
-
-    mid = 0.5 * (verts3[0] + verts3[1])
-    _check("mid AB", _map_point_3d_to_flat_2d(mid, verts3, flat), 0.5 * (flat[0] + flat[1]))
-    _check("centroid", _map_point_3d_to_flat_2d(verts3.mean(0), verts3, flat), flat.mean(0))
-
-    # Rigid motion of the 3D triangle must not change material (flat) coords
-    R = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
-    t = np.array([5.0, -3.0, 1.0])
-    verts3r = verts3 @ R.T + t
-    mid_r = 0.5 * (verts3r[0] + verts3r[1])
-    _check("rigid mid AB", _map_point_3d_to_flat_2d(mid_r, verts3r, flat), 0.5 * (flat[0] + flat[1]))
-
-    # Off-plane → same as on-plane projection / closest point
-    mid_off = mid + np.array([0.0, 0.0, 0.7])
-    _check("off-plane mid AB", _map_point_3d_to_flat_2d(mid_off, verts3, flat), 0.5 * (flat[0] + flat[1]))
-
-    # Known barycentric (0.2, 0.3, 0.5)
-    p3 = 0.2 * verts3[0] + 0.3 * verts3[1] + 0.5 * verts3[2]
-    exp = 0.2 * flat[0] + 0.3 * flat[1] + 0.5 * flat[2]
-    out, bary = _map_point_3d_to_flat_2d(p3, verts3, flat, return_bary=True)
-    _check("bary 0.2/0.3/0.5", out, exp)
-    if abs(bary[0] - 0.2) > 1e-9 or abs(bary[1] - 0.3) > 1e-9:
-        ok = False
-        msgs.append(f"FAIL bary weights: {bary}")
-
-    # Outside → clamped to closest on triangle (vertex C for far point near C side)
-    outside = np.array([-1.0, -1.0, 0.0])
-    out_o, bary_o = _map_point_3d_to_flat_2d(outside, verts3, flat, return_bary=True)
-    if out_o is None or min(bary_o) < -1e-9:
-        ok = False
-        msgs.append(f"FAIL outside clamp bary={bary_o}")
-    else:
-        msgs.append(f"ok   outside→closest bary={bary_o}")
-
-    # Degenerate triangle
-    degen = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
-    if _map_point_3d_to_flat_2d([0.5, 0.0, 0.0], degen, flat) is not None:
-        ok = False
-        msgs.append("FAIL degenerate should return None")
-    else:
-        msgs.append("ok   degenerate → None")
-
-    return ok, msgs
-
-
-def _trim_clip_polygon_by_line_2d(poly_2d, pt1_2d, pt2_2d, keep_point_2d):
-    pt1 = np.array(pt1_2d[:2], dtype=float)
-    pt2 = np.array(pt2_2d[:2], dtype=float)
-    cut_dir = pt2 - pt1
-    cut_len = float(np.linalg.norm(cut_dir))
-    if cut_len < 1e-10:
-        return poly_2d
-    normal_2d = np.array([-cut_dir[1], cut_dir[0]]) / cut_len
-    keep_raw = float(np.dot(normal_2d, np.array(keep_point_2d[:2], dtype=float) - pt1))
-    keep_sign = 1.0 if keep_raw >= 0 else -1.0
-    n = len(poly_2d)
-    verts = [np.array([float(v[0]), float(v[1])], dtype=float) for v in poly_2d]
-    dists = [float(np.dot(normal_2d, v - pt1) * keep_sign) for v in verts]
-    new_poly = []
-    for i in range(n):
-        j = (i + 1) % n
-        vi, vj = verts[i], verts[j]
-        di, dj = dists[i], dists[j]
-        if di >= 0:
-            new_poly.append([float(vi[0]), float(vi[1]), 0.0])
-        if (di > 0 and dj < 0) or (di < 0 and dj > 0):
-            t = di / (di - dj)
-            xi = vi + t * (vj - vi)
-            new_poly.append([float(xi[0]), float(xi[1]), 0.0])
-    return new_poly if len(new_poly) >= 3 else poly_2d
-
-
-def _trim_xy_key(pt):
-    return (round(float(pt[0]), 3), round(float(pt[1]), 3))
-
-
-def _trim_h_str(h):
-    return str(round(float(h), 6))
-
-
-def _trim_find_orig_unit(flat_xy_np, units_list):
-    target = set(_trim_xy_key(pt) for pt in flat_xy_np)
-    for u_idx, unit in enumerate(units_list):
-        if set(_trim_xy_key(pt) for pt in unit) == target:
-            return u_idx
-    return -1
-
-
-def _trim_build_panels(
-    x_np, panel_indices_list, panel_crease_types_list,
-    initial_kps_np=None, unit_layer_meta=None,
-):
-    panels = []
-    x_np = np.asarray(x_np, dtype=float)
-    init = None if initial_kps_np is None else np.asarray(initial_kps_np, dtype=float)
-    meta = unit_layer_meta or {}
-    for i, raw_idx in enumerate(panel_indices_list):
-        idx = [j for j in raw_idx if j >= 0]
-        if len(idx) < 3:
-            continue
-        ct = list(panel_crease_types_list[i])[: len(idx)]
-        verts_3d = x_np[idx]
-        m = meta.get(i, {})
-        if init is not None:
-            flat_xy = init[idx][:, :2]
-            layer_h = float(init[idx][0][2]) if init.shape[1] > 2 else 0.0
-        else:
-            flat_xy = verts_3d[:, :2]
-            layer_h = float(m.get("layer_h", m.get("height_z", 0.0)))
-        if "layer_h" in m or "height_z" in m:
-            layer_h = float(m.get("layer_h", m.get("height_z", layer_h)))
-        centroid = verts_3d.mean(axis=0)
-        panels.append({
-            "sim_unit": i,
-            "vertex_idx": idx,
-            "verts_3d": verts_3d,
-            "flat_xy": flat_xy,
-            "layer_h": layer_h,
-            "layer_idx": m.get("layer_idx"),
-            "num_layers": m.get("num_layers"),
-            "centroid": centroid,
-            # Plane reference = centroid (more stable than verts[0])
-            "plane_point": centroid,
-            "normal": _trim_panel_normal_3d(verts_3d),
-            "crease_types": ct,
-            "area": _trim_polygon_area_3d(verts_3d),
-        })
-    return panels
-
-
-def _trim_fold_edge_map(panels):
-    fold_edge_map = {}
-    for pi, p in enumerate(panels):
-        n = len(p["vertex_idx"])
-        for j in range(n):
-            if p["crease_types"][j] not in (MOUNTAIN, VALLEY):
-                continue
-            v1 = p["vertex_idx"][j]
-            v2 = p["vertex_idx"][(j + 1) % n]
-            key = (min(v1, v2), max(v1, v2))
-            fold_edge_map.setdefault(key, []).append(pi)
-    return fold_edge_map
-
-
-def _trim_panels_by_sim_unit(panels):
-    """sim_unit id -> panel record (panels list is 1:1 with sim units that have >=3 verts)."""
-    return {int(p["sim_unit"]): p for p in panels}
-
-
-def _trim_pick_intruder_for_pair(pA, pB, threshold=0.0, force=False):
-    """
-    Pick exactly one intruder between two panel records.
-    force=True: always choose one (used for real geometric collisions / outer faces).
-    Always prioritizes the outer (thicker-face) panel when outerness differs.
-    Normals are re-oriented toward the pair midpoint before the slide test.
-    """
-    pA_pt = pA.get("plane_point", pA["centroid"])
-    pB_pt = pB.get("plane_point", pB["centroid"])
-    who, d_AtoB, d_BtoA = _trim_classify_intruder(
-        pA["normal"], pA["centroid"], pA_pt,
-        pB["normal"], pB["centroid"], pB_pt,
-        area_A=pA["area"], area_B=pB["area"], threshold=threshold,
-        layer_h_A=pA.get("layer_h"), layer_h_B=pB.get("layer_h"),
-        layer_idx_A=pA.get("layer_idx"), layer_idx_B=pB.get("layer_idx"),
-        num_layers_A=pA.get("num_layers"), num_layers_B=pB.get("num_layers"),
-        orient_normals=True,
-    )
-    if who is None and force:
-        # Outer still preferred if classify returned None without layer meta
-        outer = _trim_prefer_outer(
-            pA.get("layer_h"), pB.get("layer_h"),
-            pA.get("layer_idx"), pB.get("layer_idx"),
-            pA.get("num_layers"), pB.get("num_layers"),
-        )
-        if outer is not None:
-            who = outer
-        # Geometric contact / outer-face pair: deeper intrusion (more negative) wins
-        elif d_AtoB < d_BtoA:
-            who = "A"
-        elif d_BtoA < d_AtoB:
-            who = "B"
-        else:
-            who = "A" if pA["area"] <= pB["area"] else "B"
-    return who, d_AtoB, d_BtoA
-
-
-def _trim_oriented_normals_for_pair(pA, pB):
-    """Return (nA, nB) flipped to face the pair midpoint."""
-    return _trim_orient_normals_toward_mid(
-        pA["normal"], pA["centroid"], pB["normal"], pB["centroid"],
-    )
-
-
-def _trim_apply_cut_for_pair(
-    intruder, other, input_json, units_by_layer,
-    min_cut_len=0.5, interior_t=(0.05, 0.95),
-):
-    """
-    Plane–plane cut of ``intruder`` by ``other``; clip design polygon.
-    Returns dict with cut metadata, or None if the cut could not be placed.
-    """
-    n_I, n_O = _trim_oriented_normals_for_pair(intruder, other)
-    p_I = intruder.get("plane_point", intruder["centroid"])
-    p_O = other.get("plane_point", other["centroid"])
-    res = _trim_plane_plane_intersection(n_I, p_I, n_O, p_O)
-    if res is None:
-        return None
-    line_pt, line_dir = res
-
-    nI = len(intruder["vertex_idx"])
-    edge_dists = []
-    for j in range(nI):
-        seg_a = intruder["verts_3d"][j]
-        seg_b = intruder["verts_3d"][(j + 1) % nI]
-        t, closest = _trim_closest_pt_on_seg_to_line(seg_a, seg_b, line_pt, line_dir)
-        dist = float(np.linalg.norm(np.cross(closest - line_pt, line_dir)))
-        edge_dists.append((dist, t, j))
-    edge_dists.sort(key=lambda x: x[0])
-    if len(edge_dists) < 2:
-        return None
-
-    t_lo, t_hi = interior_t
-    good = [(d, t, j) for d, t, j in edge_dists if t_lo < t < t_hi]
-    best_two = good[:2] if len(good) >= 2 else edge_dists[:2]
-    if best_two[0][2] == best_two[1][2]:
-        candidates = [e for e in edge_dists if e[2] != best_two[0][2]]
-        if not candidates:
-            return None
-        best_two = [best_two[0], candidates[0]]
-
-    flat_pts = []
-    for _, t, j in best_two:
-        v1f = np.asarray(intruder["flat_xy"][j], dtype=float)[:2]
-        v2f = np.asarray(intruder["flat_xy"][(j + 1) % nI], dtype=float)[:2]
-        flat_pts.append(v1f + t * (v2f - v1f))
-    pt1_2d, pt2_2d = flat_pts[0], flat_pts[1]
-    if float(np.linalg.norm(pt2_2d - pt1_2d)) < float(min_cut_len):
-        return None
-
-    orig_unit_idx = _trim_find_orig_unit(intruder["flat_xy"], input_json["units"])
-    if orig_unit_idx < 0:
-        return None
-
-    layer_h = float(intruder["layer_h"])
-    hs = _trim_h_str(layer_h)
-    if hs not in units_by_layer:
-        units_by_layer[hs] = deepcopy(input_json["units"])
-    orig_poly = units_by_layer[hs][orig_unit_idx]
-    centroid_2d = np.array([v[:2] for v in orig_poly], dtype=float).mean(axis=0)
-    units_by_layer[hs][orig_unit_idx] = _trim_clip_polygon_by_line_2d(
-        orig_poly, pt1_2d, pt2_2d, centroid_2d
-    )
-    return {
-        "trimmed_unit": orig_unit_idx,
-        "trimmed_layer_h": layer_h,
-        "pt1_2d": pt1_2d,
-        "pt2_2d": pt2_2d,
-        "layer_h": layer_h,
-        "hs": hs,
-    }
-
-
-def classify_colliding_panel_pairs(
-    x_np, panel_indices_list, colliding_unit_pairs, threshold=0.0,
-    unit_layer_meta=None,
-):
-    """
-    Signed-distance classification on unit pairs that *actually collide*
-    (triangle intersection). Exactly one intruder per pair.
-    Always prioritizes outer (thicker-face) panels when outerness differs.
-
-    colliding_unit_pairs: iterable of (sim_unit_a, sim_unit_b).
-    unit_layer_meta: optional dict sim_unit_id -> {layer_h, layer_idx, num_layers}.
-    """
-    x_np = np.asarray(x_np, dtype=float)
-    # Cache polygon data per sim unit
-    cache = {}
-    meta = unit_layer_meta or {}
-
-    def panel_of(uid):
-        if uid in cache:
-            return cache[uid]
-        if uid < 0 or uid >= len(panel_indices_list):
-            cache[uid] = None
-            return None
-        idx = [j for j in panel_indices_list[uid] if j >= 0]
-        if len(idx) < 3:
-            cache[uid] = None
-            return None
-        verts = x_np[idx]
-        m = meta.get(uid, {})
-        centroid = verts.mean(axis=0)
-        rec = {
-            "sim_unit": uid,
-            "verts_3d": verts,
-            "centroid": centroid,
-            "plane_point": centroid,
-            "normal": _trim_panel_normal_3d(verts),
-            "area": _trim_polygon_area_3d(verts),
-            "layer_h": m.get("layer_h", m.get("height_z", 0.0)),
-            "layer_idx": m.get("layer_idx"),
-            "num_layers": m.get("num_layers"),
-        }
-        cache[uid] = rec
-        return rec
-
-    out = []
-    processed = set()
-    for ua, ub in colliding_unit_pairs:
-        pair_key = (min(ua, ub), max(ua, ub))
-        if pair_key in processed:
-            continue
-        processed.add(pair_key)
-        pA, pB = panel_of(ua), panel_of(ub)
-        if pA is None or pB is None:
-            continue
-        who, d_AtoB, d_BtoA = _trim_pick_intruder_for_pair(pA, pB, threshold=threshold, force=True)
-        if who is None:
-            continue
-        # Exactly one of the two colliding panels
-        if who == "A":
-            intruder_u, other_u = pA["sim_unit"], pB["sim_unit"]
-        else:
-            intruder_u, other_u = pB["sim_unit"], pA["sim_unit"]
-        out.append({
-            "sim_unit_A": pA["sim_unit"],
-            "sim_unit_B": pB["sim_unit"],
-            "intruder_sim_unit": intruder_u,
-            "other_sim_unit": other_u,
-            "d_AtoB": d_AtoB,
-            "d_BtoA": d_BtoA,
-        })
-    return out
-
-
-def classify_adjacent_panel_pairs(
-    x_np, panel_indices_list, panel_crease_types_list, threshold=0.0, unit_layer_meta=None,
-    force_outer_faces=True,
-):
-    """Signed-distance classification on fold-adjacent panel pairs (trim pipeline)."""
-    panels = _trim_build_panels(
-        x_np, panel_indices_list, panel_crease_types_list, unit_layer_meta=unit_layer_meta,
-    )
-    fold_edge_map = _trim_fold_edge_map(panels)
-    out = []
-    processed = set()
-    for adj in fold_edge_map.values():
-        if len(adj) != 2:
-            continue
-        pi_A, pi_B = adj[0], adj[1]
-        pair_key = (min(pi_A, pi_B), max(pi_A, pi_B))
-        if pair_key in processed:
-            continue
-        processed.add(pair_key)
-        pA, pB = panels[pi_A], panels[pi_B]
-        force = bool(
-            force_outer_faces
-            and (_trim_is_outer_face(pA) or _trim_is_outer_face(pB))
-        )
-        who, d_AtoB, d_BtoA = _trim_pick_intruder_for_pair(
-            pA, pB, threshold=threshold, force=force,
-        )
-        if who is None:
-            continue
-        intruder_pi = pi_A if who == "A" else pi_B
-        other_pi = pi_B if who == "A" else pi_A
-        out.append({
-            "sim_unit_A": pA["sim_unit"],
-            "sim_unit_B": pB["sim_unit"],
-            "intruder_sim_unit": panels[intruder_pi]["sim_unit"],
-            "other_sim_unit": panels[other_pi]["sim_unit"],
-            "d_AtoB": d_AtoB,
-            "d_BtoA": d_BtoA,
-        })
-    return out
-
-
-def compute_trimmed_design_from_sim(
-    input_json, x_np, initial_kps_np, panel_indices_list, panel_crease_types_list,
-    threshold=0.0, unit_layer_meta=None,
-    colliding_unit_pairs=None,
-    force_outer_fold_pairs=True,
-):
-    """
-    Classify intruders and clip intruder polygons; returns augmented JSON dict.
-
-    Pair sources (union, each sim-unit pair processed once):
-      1) ``colliding_unit_pairs`` — real triangle-intersection contacts
-         (force=True, same as GUI red markers)
-      2) fold-adjacent mountain/valley edges
-         (force=True on outer thick faces so −h / +h polarity does not
-         zero out a whole face of the stack; force=False for interior)
-
-    Normals are oriented toward each pair midpoint before the slide test.
-    """
-    result = deepcopy(input_json)
-    panels = _trim_build_panels(
-        x_np, panel_indices_list, panel_crease_types_list,
-        initial_kps_np=initial_kps_np, unit_layer_meta=unit_layer_meta,
-    )
-    by_unit = _trim_panels_by_sim_unit(panels)
-    fold_edge_map = _trim_fold_edge_map(panels)
-
-    all_hs = sorted(set(_trim_h_str(p["layer_h"]) for p in panels))
-    units_by_layer = {h: deepcopy(input_json["units"]) for h in all_hs}
-    new_lines, new_features = [], []
-    processed = set()
-    classifications = []
-    n_cuts = 0
-    n_from_collision = 0
-    n_from_fold = 0
-
-    def _process_pair(pA, pB, *, force, source):
-        nonlocal n_cuts, n_from_collision, n_from_fold
-        ua, ub = int(pA["sim_unit"]), int(pB["sim_unit"])
-        pair_key = (min(ua, ub), max(ua, ub))
-        if pair_key in processed:
-            return
-        processed.add(pair_key)
-
-        who, d_AtoB, d_BtoA = _trim_pick_intruder_for_pair(
-            pA, pB, threshold=threshold, force=force,
-        )
-        entry = {
-            "sim_unit_A": ua,
-            "sim_unit_B": ub,
-            "d_AtoB": d_AtoB,
-            "d_BtoA": d_BtoA,
-            "intruder": who,
-            "layer_h_A": pA["layer_h"],
-            "layer_h_B": pB["layer_h"],
-            "source": source,
-            "force": bool(force),
-        }
-        classifications.append(entry)
-        if who is None:
-            return
-
-        if who == "A":
-            intruder, other = pA, pB
-        else:
-            intruder, other = pB, pA
-        entry["intruder_sim_unit"] = int(intruder["sim_unit"])
-        entry["other_sim_unit"] = int(other["sim_unit"])
-
-        cut = _trim_apply_cut_for_pair(
-            intruder, other, input_json, units_by_layer,
-        )
-        if cut is None:
-            entry["cut_failed"] = True
-            return
-
-        layer_h = cut["layer_h"]
-        pt1_2d, pt2_2d = cut["pt1_2d"], cut["pt2_2d"]
-        new_lines.append([
-            [float(pt1_2d[0]), float(pt1_2d[1]), layer_h],
-            [float(pt2_2d[0]), float(pt2_2d[1]), layer_h],
-        ])
-        new_features.append({
-            "type": BORDER,
-            "level": 0,
-            "coeff": 1.0,
-            "recover_level": [],
-            "recover_angle": [],
-            "hard": False,
-            "hard_angle": math.pi,
-            "hard_angle_down": -math.pi,
-            "thick_panel_height": layer_h,
-        })
-        n_cuts += 1
-        if source == "collision":
-            n_from_collision += 1
-        else:
-            n_from_fold += 1
-        entry["trimmed_unit"] = cut["trimmed_unit"]
-        entry["trimmed_layer_h"] = cut["trimmed_layer_h"]
-
-    # --- 1) Real geometric collisions (GUI red markers) ---
-    for ua, ub in (colliding_unit_pairs or []):
-        pA = by_unit.get(int(ua))
-        pB = by_unit.get(int(ub))
-        if pA is None or pB is None:
-            continue
-        _process_pair(pA, pB, force=True, source="collision")
-
-    # --- 2) Fold-adjacent mountain/valley pairs ---
-    for adj in fold_edge_map.values():
-        if len(adj) != 2:
-            continue
-        pA, pB = panels[adj[0]], panels[adj[1]]
-        force = bool(
-            force_outer_fold_pairs
-            and (_trim_is_outer_face(pA) or _trim_is_outer_face(pB))
-        )
-        _process_pair(pA, pB, force=force, source="fold_adjacent")
-
-    result["units_by_layer"] = units_by_layer
-    result["lines"] = result["lines"] + new_lines
-    result["line_features"] = result["line_features"] + new_features
-    result["trim_3d_metadata"] = {
-        "n_panels": len(panels),
-        "n_pairs_checked": len(processed),
-        "n_cuts": n_cuts,
-        "n_cuts_from_collision": n_from_collision,
-        "n_cuts_from_fold_adjacent": n_from_fold,
-        "n_colliding_pairs_in": len(list(colliding_unit_pairs or [])),
-        "force_outer_fold_pairs": bool(force_outer_fold_pairs),
-    }
-    result["intruder_classifications"] = classifications
-    print(
-        f"[Trimmer-3D] panels={len(panels)}, pairs checked={len(processed)}, "
-        f"cuts={n_cuts} (collision={n_from_collision}, fold={n_from_fold})"
-    )
-    return result
-
-
 @ti.data_oriented
 class PD_Origami_Simulator:
     def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.975, material_type=1, ref_target=False, verbose=False, collision_shading=False):
@@ -952,23 +177,21 @@ class PD_Origami_Simulator:
         self._collision_active_points = {}
         self._collision_fixed_segments = {}    # finalized when that pair's contact ended
         self._collision_fixed_points = {}
-        self._collision_coords_exported = False  # one-shot export at π done
+        self._collision_coords_exported = False  # sealed at π (no more trail growth)
         self._sweep_draw_stopped = False  # True once θ hits π — no more paint growth
-        self._intruder_classifications = []
-        self._intruder_by_unit_pair = {}  # (min_u, max_u) -> classification dict
-        self._intruder_indice_count = 0
         # Locus paint: path of two contact nodes + the line (design xy → panel).
         self._paint_canvas = {}          # unit_id -> list[{p0,p1}]
         self._paint_line_vert_count = 0
         self._paint_n_strokes = 0
-        # Starting GPU buffer size only — grows as needed (no sample/line cap)
+        # Starting buffer size only — grows as needed (no line cap)
         self._paint_max_line_verts = 8192
-        self._paint_min_move = None
+        # Angle step for paint strokes (radians); default 2°
+        self._paint_angle_step_rad = float(SWEEP_SAMPLE_STEP_RAD)
         # Collision / paint are expensive in pure Python — throttle hard
         self._collision_frame_i = 0
         self._collision_every_n = 4      # run broadphase every N render frames
         self._paint_dirty = False
-        # Per-frame host cache of x (shared by collision / paint / intruder)
+        # Per-frame host cache of x (shared by collision / paint)
         self._frame_positions = None
         self._frame_positions_gen = -1
         self._render_gen = 0
@@ -1309,12 +532,30 @@ class PD_Origami_Simulator:
             # Contact markers for refined collision shading (points + segments)
             self.collision_contact_points = ti.Vector.field(3, dtype=ti.f32, shape=self._collision_contact_max)
             self.collision_contact_lines = ti.Vector.field(3, dtype=ti.f32, shape=self._collision_contact_max * 2)
-            # Intruder panel triangle indices (same mesh verts, painted pass)
-            self.intruder_indices = ti.field(int, shape=self.maximum_indice_num)
             # Paint strokes reprojected to panel surfaces (lines only — canvas model)
             if self.collision_shading:
                 n_pl = int(self._paint_max_line_verts)
                 self.paint_line_vertices = ti.Vector.field(3, dtype=ti.f32, shape=n_pl)
+                # Taichi kernel buffers for inter-panel triangle contact detection
+                max_tris = max(int(self.maximum_indice_num) // 3, 1)
+                max_hits = int(self._collision_contact_max)
+                self._coll_max_tris = max_tris
+                self.coll_n_tris = ti.field(dtype=ti.i32, shape=())
+                self.coll_tri_kp = ti.field(dtype=ti.i32, shape=(max_tris, 3))
+                self.coll_tri_unit = ti.field(dtype=ti.i32, shape=max_tris)
+                self.coll_tri_panel = ti.field(dtype=ti.i32, shape=max_tris)
+                self.coll_tri_layer = ti.field(dtype=ti.i32, shape=max_tris)
+                self.coll_hit_count = ti.field(dtype=ti.i32, shape=())
+                self.coll_hit_kind = ti.field(dtype=ti.i32, shape=max_hits)  # 1=point, 2=segment
+                self.coll_hit_p0 = ti.Vector.field(3, dtype=data_type, shape=max_hits)
+                self.coll_hit_p1 = ti.Vector.field(3, dtype=data_type, shape=max_hits)
+                self.coll_hit_tri_a = ti.field(dtype=ti.i32, shape=max_hits)
+                self.coll_hit_tri_b = ti.field(dtype=ti.i32, shape=max_hits)
+                self.coll_hit_unit_a = ti.field(dtype=ti.i32, shape=max_hits)
+                self.coll_hit_unit_b = ti.field(dtype=ti.i32, shape=max_hits)
+                self.coll_hit_panel_a = ti.field(dtype=ti.i32, shape=max_hits)
+                self.coll_hit_panel_b = ti.field(dtype=ti.i32, shape=max_hits)
+                self.coll_hit_layer = ti.field(dtype=ti.i32, shape=max_hits)
 
             self.indices = ti.field(int, shape=self.maximum_indice_num) #三角面索引信息
 
@@ -2339,10 +1580,6 @@ class PD_Origami_Simulator:
         self._collision_contact_segments_list = []
         self._collision_contact_points_flat = []
         self._collision_contact_segments_flat = []
-        self._collision_stats = None
-        self._intruder_classifications = []
-        self._intruder_by_unit_pair = {}
-        self._intruder_indice_count = 0
         self._collision_ran_once = False
         self._collision_frame_i = 0
         # Surface sweep paint (red locus on panels)
@@ -2351,8 +1588,6 @@ class PD_Origami_Simulator:
         self._paint_n_strokes = 0
         self._paint_dirty = True
         self._stamp_paint_needed = False
-        self._debug_lines = None
-        self._debug_lines_key = None
         if hasattr(self, "paint_line_vertices"):
             try:
                 self.paint_line_vertices.fill(0)
@@ -2362,11 +1597,6 @@ class PD_Origami_Simulator:
             try:
                 self.collision_contact_points.fill(0)
                 self.collision_contact_lines.fill(0)
-            except Exception:
-                pass
-        if hasattr(self, "intruder_indices"):
-            try:
-                self.intruder_indices.fill(0)
             except Exception:
                 pass
 
@@ -3438,7 +2668,7 @@ class PD_Origami_Simulator:
         self.folding_angle += self.enable_add_folding_angle
         if self.folding_angle >= 3.1415:
             self.folding_angle = 3.1415
-            # Hit π this step → freeze paint/export immediately (not next render)
+            # Hit π this step → freeze paint immediately (not next render)
             if self.collision_shading:
                 self._stop_sweep_drawing_at_pi()
             # Stop auto-fold so θ does not keep “driving” past clamp
@@ -3502,7 +2732,8 @@ class PD_Origami_Simulator:
             and int(getattr(self, "_frame_positions_gen", -1)) == gen
         ):
             return self._frame_positions
-        pos = self.x.to_numpy()[: self.kp_num]
+        # Keep float64 host cache (sim fields are ti.f64 / numpy_data_type)
+        pos = np.asarray(self.x.to_numpy()[: self.kp_num], dtype=numpy_data_type)
         self._frame_positions = pos
         self._frame_positions_gen = gen
         return pos
@@ -3549,9 +2780,9 @@ class PD_Origami_Simulator:
         # self.backup_energy[None] = self.energy[None]
         angle_sum = self.calculateCreaseAngleSum()
         if abs(angle_sum - self.backup_crease_angle_sum[None]) < 1e-3 * angle_sum and self.folding_angle > 3.14:
-            # Seal every pair's final coords (including still-active) and export once
+            # Seal every pair's final coords (including still-active)
             if self.collision_shading and not self._collision_coords_exported:
-                self._seal_and_export_fixed_flat_contacts()
+                self._seal_fixed_flat_contacts()
             return True
         self.backup_crease_angle_sum[None] = angle_sum
         return False
@@ -3648,10 +2879,6 @@ class PD_Origami_Simulator:
 
         self.gui.text("If the above stiffnesses are modified, press 'r' to restart. ")
 
-        # Must draw every frame — skipping frames makes ImGui sub_window flicker
-        if self.collision_shading:
-            self._render_collision_debug_window()
-
         self.canvas.scene(scene)
         if not self.fast_simulation_mode:
             try:
@@ -3676,10 +2903,14 @@ class PD_Origami_Simulator:
         self.initializeRunning()
         # GUI: hold angle (use slider / i=start, k=stop, m=reverse).
         # Headless: auto-drive fold target each step (same as phy_sim_target).
+        # With collision shading, step by 2° so locus lines align with angle samples.
         if self.use_gui:
             self.enable_add_folding_angle = 0.0
         else:
-            self.enable_add_folding_angle = 0.105
+            if getattr(self, "collision_shading", False):
+                self.enable_add_folding_angle = float(SWEEP_SAMPLE_STEP_RAD)  # 2°
+            else:
+                self.enable_add_folding_angle = 0.105
         while self.window.running:
             self.step()
             # ti.profiler.print_kernel_profiler_info()  # 看每个kernel的执行时间、线程数
@@ -3697,9 +2928,7 @@ class PD_Origami_Simulator:
     core idea of PANEL TRIMMING:
     1. map each panel in each layer as a uniquely identifiable object
     2. apply AABB collision detection to each panel object
-    3. classify intruders based on penetration depth and prioritize thicker panels
     4. sweeping visualization
-    5. coordinates export
     """
 
     # 1. panel mapping
@@ -3729,7 +2958,7 @@ class PD_Origami_Simulator:
     def _build_unit_layer_meta(self):
         """
         sim_unit_id -> {layer_h, layer_idx, num_layers} for outer/thicker
-        intruder prioritization.
+        layer metadata for collision paint.
         """
         meta = {}
         try:
@@ -3831,7 +3060,6 @@ class PD_Origami_Simulator:
     #   1) triangle intersection → red contact points/segments (3D GUI)
     #   2) map contact line to design xy → stamp paper canvas (sparse strokes)
     #   3) each frame: affine-map canvas strokes onto current panel pose → 3D lines
-    #   4) classify intruders → light orange panel tint
     # Paint is a design-space canvas reprojected onto panels (not mesh-triangle paint).
     # =========================================================================
 
@@ -3872,12 +3100,328 @@ class PD_Origami_Simulator:
         self._collision_spatial_cell_size = max(self.max_size / 20.0, 1.0)
         # Particle radius scales with model size for visibility without covering panels
         self._collision_point_radius = max(self.max_size * 0.008, 0.15)
-        # Per-unit outer/thickness meta for intruder prioritization
+        # Per-unit layer meta for collision paint
         self._collision_unit_layer_meta = self._build_unit_layer_meta()
+
+        # Upload topology into Taichi fields for the contact kernel
+        if hasattr(self, "coll_tri_kp"):
+            max_tris = int(self._coll_max_tris)
+            if num_tris > max_tris:
+                print(
+                    f"[Contact] num_tris={num_tris} exceeds coll buffer {max_tris}; "
+                    "clamping (rebuild with larger mesh budget)."
+                )
+                num_tris = max_tris
+                self._collision_num_tris = num_tris
+            tri_panel = np.full(num_tris, -1, dtype=np.int32)
+            tri_layer = np.full(num_tris, -1, dtype=np.int32)
+            for t in range(num_tris):
+                u = int(tri_unit_ids[t])
+                if 0 <= u < len(unit_panel_idx):
+                    tri_panel[t] = int(unit_panel_idx[u])
+                    tri_layer[t] = int(unit_layer_idx[u])
+            kp_buf = np.zeros((max_tris, 3), dtype=np.int32)
+            unit_buf = np.zeros(max_tris, dtype=np.int32)
+            panel_buf = np.full(max_tris, -1, dtype=np.int32)
+            layer_buf = np.full(max_tris, -1, dtype=np.int32)
+            kp_buf[:num_tris] = tri_kp_indices[:num_tris]
+            unit_buf[:num_tris] = tri_unit_ids[:num_tris]
+            panel_buf[:num_tris] = tri_panel
+            layer_buf[:num_tris] = tri_layer
+            self.coll_n_tris[None] = int(num_tris)
+            self.coll_tri_kp.from_numpy(kp_buf)
+            self.coll_tri_unit.from_numpy(unit_buf)
+            self.coll_tri_panel.from_numpy(panel_buf)
+            self.coll_tri_layer.from_numpy(layer_buf)
+
+    # ------------------------------------------------------------------
+    # Taichi triangle–triangle contact detection (float64)
+    # ------------------------------------------------------------------
+
+    @ti.func
+    def _ti_v3(self, x, y, z):
+        return ti.Vector([x, y, z], dt=data_type)
+
+    @ti.func
+    def _ti_point_in_triangle(
+        self, p: ti.template(), a: ti.template(), b: ti.template(), c: ti.template(),
+        eps: data_type,
+    ) -> ti.i32:
+        n = (b - a).cross(c - a)
+        nn = n.norm()
+        ok = 0
+        if nn >= 1e-12:
+            n = n / nn
+            if ti.abs((p - a).dot(n)) <= eps:
+                v0 = b - a
+                v1 = c - a
+                v2 = p - a
+                d00 = v0.dot(v0)
+                d01 = v0.dot(v1)
+                d11 = v1.dot(v1)
+                d20 = v2.dot(v0)
+                d21 = v2.dot(v1)
+                denom = d00 * d11 - d01 * d01
+                if ti.abs(denom) >= 1e-18:
+                    v = (d11 * d20 - d01 * d21) / denom
+                    w = (d00 * d21 - d01 * d20) / denom
+                    u = data_type(1.0) - v - w
+                    tol = eps * data_type(10.0)
+                    if u >= -tol and v >= -tol and w >= -tol:
+                        ok = 1
+        return ok
+
+    @ti.func
+    def _ti_seg_tri_intersect(
+        self, s0: ti.template(), s1: ti.template(),
+        a: ti.template(), b: ti.template(), c: ti.template(),
+        eps: data_type,
+    ):
+        n = (b - a).cross(c - a)
+        nn = n.norm()
+        hit = 0
+        p = self._ti_v3(0.0, 0.0, 0.0)
+        if nn >= 1e-12:
+            n = n / nn
+            d = s1 - s0
+            denom = n.dot(d)
+            if ti.abs(denom) >= eps:
+                t = n.dot(a - s0) / denom
+                if t >= -eps and t <= data_type(1.0) + eps:
+                    cand = s0 + t * d
+                    if self._ti_point_in_triangle(cand, a, b, c, eps * data_type(10.0)) == 1:
+                        hit = 1
+                        p = cand
+        return hit, p
+
+    @ti.func
+    def _ti_tris_coplanar(
+        self, a0: ti.template(), a1: ti.template(), a2: ti.template(),
+        b0: ti.template(), b1: ti.template(), b2: ti.template(),
+        eps: data_type,
+    ) -> ti.i32:
+        n = (a1 - a0).cross(a2 - a0)
+        nn = n.norm()
+        coplanar = 0
+        if nn < 1e-12:
+            coplanar = 1
+        else:
+            n = n / nn
+            coplanar = 1
+            if ti.abs((b0 - a0).dot(n)) > eps:
+                coplanar = 0
+            if ti.abs((b1 - a0).dot(n)) > eps:
+                coplanar = 0
+            if ti.abs((b2 - a0).dot(n)) > eps:
+                coplanar = 0
+        return coplanar
+
+    @ti.func
+    def _ti_aabb_overlap_tris(
+        self, a0: ti.template(), a1: ti.template(), a2: ti.template(),
+        b0: ti.template(), b1: ti.template(), b2: ti.template(),
+        eps: data_type,
+    ) -> ti.i32:
+        ok = 1
+        for k in ti.static(range(3)):
+            amin = ti.min(a0[k], ti.min(a1[k], a2[k]))
+            amax = ti.max(a0[k], ti.max(a1[k], a2[k]))
+            bmin = ti.min(b0[k], ti.min(b1[k], b2[k]))
+            bmax = ti.max(b0[k], ti.max(b1[k], b2[k]))
+            if amax < bmin - eps or bmax < amin - eps:
+                ok = 0
+        return ok
+
+    @ti.func
+    def _ti_share_vert(
+        self, i0: ti.i32, i1: ti.i32, i2: ti.i32,
+        j0: ti.i32, j1: ti.i32, j2: ti.i32,
+    ) -> ti.i32:
+        shared = 0
+        if (
+            i0 == j0 or i0 == j1 or i0 == j2
+            or i1 == j0 or i1 == j1 or i1 == j2
+            or i2 == j0 or i2 == j1 or i2 == j2
+        ):
+            shared = 1
+        return shared
+
+    @ti.func
+    def _ti_push_contact_pt(
+        self, n_hits: ti.i32,
+        q0: ti.template(), q1: ti.template(),
+        p: ti.template(), dedupe: data_type,
+    ):
+        """
+        Maintain contact set as 0/1/2 points (segment endpoints).
+        Returns updated (n_hits, q0, q1).
+        """
+        out_n = n_hits
+        out0 = q0
+        out1 = q1
+        if n_hits == 0:
+            out0 = p
+            out_n = 1
+        elif n_hits == 1:
+            if (p - q0).norm() > dedupe:
+                out1 = p
+                out_n = 2
+        else:
+            d = q1 - q0
+            dn = d.norm()
+            if dn < 1e-14:
+                if (p - q0).norm() > dedupe:
+                    out1 = p
+            else:
+                dirv = d / dn
+                t0 = q0.dot(dirv)
+                t1 = q1.dot(dirv)
+                tp = p.dot(dirv)
+                # Keep extreme projections (contact line endpoints)
+                if tp < t0:
+                    out0 = p
+                elif tp > t1:
+                    out1 = p
+                # else interior of current segment — ignore
+        return out_n, out0, out1
+
+    @ti.func
+    def _ti_tri_tri_contact(
+        self, a0: ti.template(), a1: ti.template(), a2: ti.template(),
+        b0: ti.template(), b1: ti.template(), b2: ti.template(),
+        eps: data_type,
+    ):
+        """
+        Returns (kind, p0, p1): kind 0=none, 1=point, 2=segment.
+        """
+        kind = 0
+        p0 = self._ti_v3(0.0, 0.0, 0.0)
+        p1 = self._ti_v3(0.0, 0.0, 0.0)
+        do_test = 1
+        if self._ti_aabb_overlap_tris(a0, a1, a2, b0, b1, b2, data_type(1e-9)) == 0:
+            do_test = 0
+        if do_test == 1 and self._ti_tris_coplanar(
+            a0, a1, a2, b0, b1, b2, data_type(1e-2)
+        ) == 1:
+            do_test = 0
+
+        if do_test == 1:
+            n_hits = 0
+            q0 = self._ti_v3(0.0, 0.0, 0.0)
+            q1 = self._ti_v3(0.0, 0.0, 0.0)
+            dedupe = ti.max(eps * data_type(10.0), data_type(1e-6))
+
+            # Edges of A vs triangle B
+            h, p = self._ti_seg_tri_intersect(a0, a1, b0, b1, b2, eps)
+            if h == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, p, dedupe)
+            h, p = self._ti_seg_tri_intersect(a1, a2, b0, b1, b2, eps)
+            if h == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, p, dedupe)
+            h, p = self._ti_seg_tri_intersect(a2, a0, b0, b1, b2, eps)
+            if h == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, p, dedupe)
+            # Edges of B vs triangle A
+            h, p = self._ti_seg_tri_intersect(b0, b1, a0, a1, a2, eps)
+            if h == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, p, dedupe)
+            h, p = self._ti_seg_tri_intersect(b1, b2, a0, a1, a2, eps)
+            if h == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, p, dedupe)
+            h, p = self._ti_seg_tri_intersect(b2, b0, a0, a1, a2, eps)
+            if h == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, p, dedupe)
+
+            # Vertex-in-triangle (touching cases)
+            if self._ti_point_in_triangle(a0, b0, b1, b2, eps) == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, a0, dedupe)
+            if self._ti_point_in_triangle(a1, b0, b1, b2, eps) == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, a1, dedupe)
+            if self._ti_point_in_triangle(a2, b0, b1, b2, eps) == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, a2, dedupe)
+            if self._ti_point_in_triangle(b0, a0, a1, a2, eps) == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, b0, dedupe)
+            if self._ti_point_in_triangle(b1, a0, a1, a2, eps) == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, b1, dedupe)
+            if self._ti_point_in_triangle(b2, a0, a1, a2, eps) == 1:
+                n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, b2, dedupe)
+
+            if n_hits == 1:
+                kind = 1
+                p0 = q0
+                p1 = q0
+            elif n_hits >= 2:
+                kind = 2
+                p0 = q0
+                p1 = q1
+        return kind, p0, p1
+
+    @ti.kernel
+    def _kernel_detect_panel_contacts(self, hit_eps: data_type):
+        """
+        All triangle pairs: different panels, same layer, no shared verts.
+        Writes contact hits into coll_hit_* (float64).
+        """
+        self.coll_hit_count[None] = 0
+        n = self.coll_n_tris[None]
+        max_hits = self.coll_hit_kind.shape[0]
+        for ta, tb in ti.ndrange(n, n):
+            if tb <= ta:
+                continue
+            panel_a = self.coll_tri_panel[ta]
+            layer_a = self.coll_tri_layer[ta]
+            panel_b = self.coll_tri_panel[tb]
+            layer_b = self.coll_tri_layer[tb]
+            if panel_a < 0 or panel_b < 0 or panel_a == panel_b or layer_a != layer_b:
+                continue
+            unit_a = self.coll_tri_unit[ta]
+            unit_b = self.coll_tri_unit[tb]
+            if unit_a == unit_b:
+                continue
+            i0 = self.coll_tri_kp[ta, 0]
+            i1 = self.coll_tri_kp[ta, 1]
+            i2 = self.coll_tri_kp[ta, 2]
+            j0 = self.coll_tri_kp[tb, 0]
+            j1 = self.coll_tri_kp[tb, 1]
+            j2 = self.coll_tri_kp[tb, 2]
+            if self._ti_share_vert(i0, i1, i2, j0, j1, j2) == 1:
+                continue
+            a0 = self.x[i0]
+            a1 = self.x[i1]
+            a2 = self.x[i2]
+            b0 = self.x[j0]
+            b1 = self.x[j1]
+            b2 = self.x[j2]
+            kind, p0, p1 = self._ti_tri_tri_contact(
+                a0, a1, a2, b0, b1, b2, hit_eps
+            )
+            if kind == 0:
+                continue
+            idx = ti.atomic_add(self.coll_hit_count[None], 1)
+            if idx < max_hits:
+                self.coll_hit_kind[idx] = kind
+                self.coll_hit_p0[idx] = p0
+                self.coll_hit_p1[idx] = p1
+                # ordered tri / unit for stable keys
+                if unit_a < unit_b:
+                    self.coll_hit_tri_a[idx] = ta
+                    self.coll_hit_tri_b[idx] = tb
+                    self.coll_hit_unit_a[idx] = unit_a
+                    self.coll_hit_unit_b[idx] = unit_b
+                    self.coll_hit_panel_a[idx] = panel_a
+                    self.coll_hit_panel_b[idx] = panel_b
+                else:
+                    self.coll_hit_tri_a[idx] = tb
+                    self.coll_hit_tri_b[idx] = ta
+                    self.coll_hit_unit_a[idx] = unit_b
+                    self.coll_hit_unit_b[idx] = unit_a
+                    self.coll_hit_panel_a[idx] = panel_b
+                    self.coll_hit_panel_b[idx] = panel_a
+                self.coll_hit_layer[idx] = layer_a
 
     def _stop_sweep_drawing_at_pi(self):
         """
-        Immediately freeze locus paint and seal export when θ hits π.
+        Immediately freeze locus paint when θ hits π.
 
         Called from update_folding_target / slider / 'u' so drawing stops on the
         same step the clamp happens — not delayed until the next collision frame.
@@ -3903,11 +3447,11 @@ class PD_Origami_Simulator:
                 side = ent.get(sk)
                 if side is not None and "p0" in side:
                     try:
-                        self._append_sweep_sample_2d(side, angle, min_move=0.0)
+                        self._append_sweep_sample_2d(side, angle, force=True)
                     except Exception:
                         pass
         try:
-            self._seal_and_export_fixed_flat_contacts(reason="fold_pi")
+            self._seal_fixed_flat_contacts(reason="fold_pi")
         except Exception as exc:
             if getattr(self, "verbose", False):
                 print(f"[Contact] seal@π failed: {exc}")
@@ -3948,62 +3492,73 @@ class PD_Origami_Simulator:
         self.detect_panel_collisions()
 
     def detect_panel_collisions(self):
-        """Find inter-panel contact geometry and classify intruder panels."""
+        """Find inter-panel contact geometry.
+
+        Narrowphase triangle–triangle tests run in a Taichi kernel (float64)
+        reading live ``self.x``. Python only maps hits to design-xy + tracking.
+        """
         if not hasattr(self, "_collision_tri_kp_indices"):
             return
         if not hasattr(self, "collision_contact_points"):
             return
+        if not hasattr(self, "coll_tri_kp"):
+            # Kernel buffers not allocated (collision_shading off at field create)
+            return
 
         positions = self._cache_frame_positions()
         tri_kp_indices = self._collision_tri_kp_indices
-        tri_unit_ids = self._collision_tri_unit_ids
-        unit_panel_idx = self._collision_unit_panel_idx
         unit_layer_idx = self._collision_unit_layer_idx
-        num_tris = self._collision_num_tris
 
         # Flat design keypoints (JSON unfolded layout) for 2D coordinate readout
         flat_kps = getattr(self, "_flat_kps_np", None)
         if flat_kps is None:
-            flat_kps = np.asarray(self.kps, dtype=float)
+            flat_kps = np.asarray(self.kps, dtype=numpy_data_type)
             self._flat_kps_np = flat_kps
         if flat_kps.ndim != 2 or flat_kps.shape[0] < self.kp_num:
             flat_kps = positions  # fallback (should not happen after init)
 
         unit_layer_meta = getattr(self, "_collision_unit_layer_meta", None) or {}
 
-        tri_coords = positions[tri_kp_indices]
-        tri_aabb_min = tri_coords.min(axis=1)
-        tri_aabb_max = tri_coords.max(axis=1)
-        cell_size = self._collision_spatial_cell_size
-        inv_cell = 1.0 / cell_size
-        # Vectorized cell ranges (one floor per tri, not per axis call)
-        min_cells = np.floor(tri_aabb_min * inv_cell).astype(np.int32)
-        max_cells = np.floor(tri_aabb_max * inv_cell).astype(np.int32)
-        grid = defaultdict(list)
-        for tri_idx in range(num_tris):
-            mnx, mny, mnz = int(min_cells[tri_idx, 0]), int(min_cells[tri_idx, 1]), int(min_cells[tri_idx, 2])
-            mxx, mxy, mxz = int(max_cells[tri_idx, 0]), int(max_cells[tri_idx, 1]), int(max_cells[tri_idx, 2])
-            for ix in range(mnx, mxx + 1):
-                for iy in range(mny, mxy + 1):
-                    for iz in range(mnz, mxz + 1):
-                        grid[(ix, iy, iz)].append(tri_idx)
+        # --- Taichi kernel: all qualifying triangle pairs → contact hits ---
+        self._kernel_detect_panel_contacts(1e-4)
+        n_hits_raw = int(self.coll_hit_count[None])
+        max_hits = int(self._collision_contact_max)
+        n_hits = min(n_hits_raw, max_hits)
 
-        checked_pairs = set()
+        if n_hits > 0:
+            kinds = np.asarray(self.coll_hit_kind.to_numpy()[:n_hits], dtype=np.int32)
+            p0s = np.asarray(self.coll_hit_p0.to_numpy()[:n_hits], dtype=numpy_data_type)
+            p1s = np.asarray(self.coll_hit_p1.to_numpy()[:n_hits], dtype=numpy_data_type)
+            tri_as = np.asarray(self.coll_hit_tri_a.to_numpy()[:n_hits], dtype=np.int32)
+            tri_bs = np.asarray(self.coll_hit_tri_b.to_numpy()[:n_hits], dtype=np.int32)
+            unit_as = np.asarray(self.coll_hit_unit_a.to_numpy()[:n_hits], dtype=np.int32)
+            unit_bs = np.asarray(self.coll_hit_unit_b.to_numpy()[:n_hits], dtype=np.int32)
+            panel_as = np.asarray(self.coll_hit_panel_a.to_numpy()[:n_hits], dtype=np.int32)
+            panel_bs = np.asarray(self.coll_hit_panel_b.to_numpy()[:n_hits], dtype=np.int32)
+            layers = np.asarray(self.coll_hit_layer.to_numpy()[:n_hits], dtype=np.int32)
+        else:
+            kinds = np.zeros(0, np.int32)
+            p0s = np.zeros((0, 3), numpy_data_type)
+            p1s = np.zeros((0, 3), numpy_data_type)
+            tri_as = np.zeros(0, np.int32)
+            tri_bs = np.zeros(0, np.int32)
+            unit_as = np.zeros(0, np.int32)
+            unit_bs = np.zeros(0, np.int32)
+            panel_as = np.zeros(0, np.int32)
+            panel_bs = np.zeros(0, np.int32)
+            layers = np.zeros(0, np.int32)
+
         contact_points = []
-        contact_segments = []  # list of (p0, p1) in 3D
+        contact_segments = []
         contact_points_flat = []
-        contact_segments_flat = []  # flat JSON 2D + layer
-        colliding_unit_pairs = set()  # (sim_unit_a, sim_unit_b) with real intersection
+        contact_segments_flat = []
+        colliding_unit_pairs = set()
         max_pts = self._collision_contact_max
         max_segs = self._collision_contact_max
-        aabb_eps = 1e-9
 
         def _flat_of(p3d, tri_idx):
-            """
-            Map 3D contact → design xy + material barycentric on that triangle.
-            loc = (i0,i1,i2,u,v,w) re-evaluates on current mesh to stay on panel.
-            """
-            kp = tri_kp_indices[tri_idx]
+            """Map 3D contact → design xy + material barycentric on that triangle."""
+            kp = tri_kp_indices[int(tri_idx)]
             i0, i1, i2 = int(kp[0]), int(kp[1]), int(kp[2])
             xy, bary = _map_point_3d_to_flat_2d(
                 p3d, positions[kp], flat_kps[kp][:, :2], return_bary=True
@@ -4019,248 +3574,139 @@ class PD_Origami_Simulator:
             }
 
         def _layer_of(unit_id, tri_idx):
-            """Layer index + design height (JSON thick_panel_height / units z)."""
             meta = unit_layer_meta.get(int(unit_id), {})
             layer_idx = meta.get("layer_idx")
             if layer_idx is None:
                 layer_idx = int(unit_layer_idx[unit_id]) if unit_id < len(unit_layer_idx) else -1
             layer_h = meta.get("layer_h", meta.get("height_z"))
             if layer_h is None:
-                kp = tri_kp_indices[tri_idx]
+                kp = tri_kp_indices[int(tri_idx)]
                 if flat_kps.shape[1] > 2:
                     layer_h = float(flat_kps[kp[0]][2])
                 else:
                     layer_h = 0.0
             return int(layer_idx), float(layer_h)
 
-        def _share_vert(ta, tb):
-            """True if triangles share any keypoint (no set/list alloc)."""
-            a0 = int(tri_kp_indices[ta, 0])
-            a1 = int(tri_kp_indices[ta, 1])
-            a2 = int(tri_kp_indices[ta, 2])
-            b0 = int(tri_kp_indices[tb, 0])
-            b1 = int(tri_kp_indices[tb, 1])
-            b2 = int(tri_kp_indices[tb, 2])
-            return (
-                a0 == b0 or a0 == b1 or a0 == b2
-                or a1 == b0 or a1 == b1 or a1 == b2
-                or a2 == b0 or a2 == b1 or a2 == b2
-            )
-
-        def _aabb_overlap_idx(ta, tb):
-            """Precomputed AABB overlap (avoids min/max over coord lists)."""
-            if tri_aabb_max[ta, 0] < tri_aabb_min[tb, 0] - aabb_eps:
-                return False
-            if tri_aabb_max[tb, 0] < tri_aabb_min[ta, 0] - aabb_eps:
-                return False
-            if tri_aabb_max[ta, 1] < tri_aabb_min[tb, 1] - aabb_eps:
-                return False
-            if tri_aabb_max[tb, 1] < tri_aabb_min[ta, 1] - aabb_eps:
-                return False
-            if tri_aabb_max[ta, 2] < tri_aabb_min[tb, 2] - aabb_eps:
-                return False
-            if tri_aabb_max[tb, 2] < tri_aabb_min[ta, 2] - aabb_eps:
-                return False
-            return True
-
-        for tri_list in grid.values():
-            n_cell = len(tri_list)
-            if n_cell < 2:
+        for hi in range(n_hits):
+            kind = int(kinds[hi])
+            if kind <= 0:
                 continue
-            for i in range(n_cell):
-                tri_a = tri_list[i]
-                unit_a = int(tri_unit_ids[tri_a])
-                panel_a = int(unit_panel_idx[unit_a])
-                layer_a = int(unit_layer_idx[unit_a])
-                if panel_a < 0:
-                    continue
-                coords_a = tri_coords[tri_a]  # ndarray view; no .tolist()
+            u_lo = int(unit_as[hi])
+            u_hi = int(unit_bs[hi])
+            p_of_ulo = int(panel_as[hi])
+            p_of_uhi = int(panel_bs[hi])
+            tri_lo = int(tri_as[hi])
+            tri_hi = int(tri_bs[hi])
+            layer_idx_hit = int(layers[hi])
+            _, layer_h = _layer_of(u_lo, tri_lo)
+            # Prefer meta layer_idx when present
+            meta_li, meta_h = _layer_of(u_lo, tri_lo)
+            if meta_li >= 0:
+                layer_idx_hit = meta_li
+            layer_h = meta_h
 
-                for j in range(i + 1, n_cell):
-                    if len(contact_points) >= max_pts and len(contact_segments) >= max_segs:
-                        break
+            p_lo = p_of_ulo if p_of_ulo <= p_of_uhi else p_of_uhi
+            p_hi = p_of_uhi if p_of_ulo <= p_of_uhi else p_of_ulo
+            pair_meta = {
+                "unit_a": u_lo,
+                "unit_b": u_hi,
+                "panel_of_unit_a": p_of_ulo,
+                "panel_of_unit_b": p_of_uhi,
+                "panel_a": p_lo,
+                "panel_b": p_hi,
+                "layer_idx": layer_idx_hit,
+                "layer_h": layer_h,
+                "tri_a": tri_lo,
+                "tri_b": tri_hi,
+                "tri_lo": tri_lo,
+                "tri_hi": tri_hi,
+            }
 
-                    tri_b = tri_list[j]
-                    pair_key = (tri_a, tri_b) if tri_a < tri_b else (tri_b, tri_a)
-                    if pair_key in checked_pairs:
-                        continue
-                    checked_pairs.add(pair_key)
-
-                    unit_b = int(tri_unit_ids[tri_b])
-                    panel_b = int(unit_panel_idx[unit_b])
-                    layer_b = int(unit_layer_idx[unit_b])
-                    # Only different panels on the same thickness layer; skip shared verts
-                    if panel_b < 0 or panel_a == panel_b or layer_a != layer_b:
-                        continue
-                    if unit_a == unit_b:
-                        continue
-                    if _share_vert(tri_a, tri_b):
-                        continue
-                    if not _aabb_overlap_idx(tri_a, tri_b):
-                        continue
-
-                    coords_b = tri_coords[tri_b]
-                    # Coplanar pairs are treated as non-colliding (stacked/adjacent faces)
-                    if _triangles_coplanar(coords_a, coords_b, eps=1e-2):
-                        continue
-
-                    pts = triangle_intersection_contacts_3d(coords_a, coords_b)
-                    if not pts:
-                        continue
-
-                    # Record contact geometry first (red markers). Only then count the
-                    # unit pair for intruder classification / orange paint.
-                    # Flat 2D: map the same 3D endpoints onto BOTH panels' design xy
-                    # → one segment (two nodes) per panel; locked when off-crease.
-                    # layer_a == layer_b by the same-layer filter above.
-                    recorded = False
-                    layer_idx, layer_h = _layer_of(unit_a, tri_a)
-                    # Keep unit↔panel correspondence when sorting unit ids
-                    if unit_a < unit_b:
-                        u_lo, u_hi = int(unit_a), int(unit_b)
-                        p_of_ulo, p_of_uhi = int(panel_a), int(panel_b)
-                        tri_lo, tri_hi = tri_a, tri_b
-                    else:
-                        u_lo, u_hi = int(unit_b), int(unit_a)
-                        p_of_ulo, p_of_uhi = int(panel_b), int(panel_a)
-                        tri_lo, tri_hi = tri_b, tri_a
-                    p_lo, p_hi = (p_of_ulo, p_of_uhi) if p_of_ulo <= p_of_uhi else (p_of_uhi, p_of_ulo)
-                    pair_meta = {
-                        "unit_a": u_lo,
-                        "unit_b": u_hi,
-                        "panel_of_unit_a": p_of_ulo,
-                        "panel_of_unit_b": p_of_uhi,
-                        # Group id: the two JSON panels that collide together
-                        "panel_a": p_lo,
-                        "panel_b": p_hi,
-                        "layer_idx": layer_idx,
-                        "layer_h": layer_h,
-                        # Triangle identity → one log slot per red contact line/point
-                        "tri_a": int(tri_lo),
-                        "tri_b": int(tri_hi),
-                        "tri_lo": int(tri_lo),
-                        "tri_hi": int(tri_hi),
+            def _side_flat(p3d0, p3d1=None, _tri_lo=tri_lo, _tri_hi=tri_hi,
+                           _u_lo=u_lo, _u_hi=u_hi, _pulo=p_of_ulo, _puhi=p_of_uhi):
+                a0 = _flat_of(p3d0, _tri_lo)
+                b0 = _flat_of(p3d0, _tri_hi)
+                if p3d1 is None:
+                    if a0 is None and b0 is None:
+                        return None
+                    out = {}
+                    if a0 is not None:
+                        out["side_a"] = {
+                            "unit": _u_lo, "panel": _pulo,
+                            "p": a0["p"], "loc": a0["loc"],
+                        }
+                        out["p"] = a0["p"]
+                    if b0 is not None:
+                        out["side_b"] = {
+                            "unit": _u_hi, "panel": _puhi,
+                            "p": b0["p"], "loc": b0["loc"],
+                        }
+                        if "p" not in out:
+                            out["p"] = b0["p"]
+                    return out
+                a1 = _flat_of(p3d1, _tri_lo)
+                b1 = _flat_of(p3d1, _tri_hi)
+                out = {}
+                if a0 is not None and a1 is not None:
+                    out["side_a"] = {
+                        "unit": _u_lo, "panel": _pulo,
+                        "p0": a0["p"], "p1": a1["p"],
+                        "loc0": a0["loc"], "loc1": a1["loc"],
                     }
+                    out["p0"], out["p1"] = a0["p"], a1["p"]
+                if b0 is not None and b1 is not None:
+                    out["side_b"] = {
+                        "unit": _u_hi, "panel": _puhi,
+                        "p0": b0["p"], "p1": b1["p"],
+                        "loc0": b0["loc"], "loc1": b1["loc"],
+                    }
+                    if "p0" not in out:
+                        out["p0"], out["p1"] = b0["p"], b1["p"]
+                return out if out else None
 
-                    def _side_flat(p3d0, p3d1=None):
-                        """
-                        Map 3D endpoint(s) onto both panels' design xy + bary loc.
-                        loc sticks the point to the hit triangle for on-panel redraw.
-                        """
-                        a0 = _flat_of(p3d0, tri_lo)
-                        b0 = _flat_of(p3d0, tri_hi)
-                        if p3d1 is None:
-                            if a0 is None and b0 is None:
-                                return None
-                            out = {}
-                            if a0 is not None:
-                                out["side_a"] = {
-                                    "unit": u_lo, "panel": p_of_ulo,
-                                    "p": a0["p"], "loc": a0["loc"],
-                                }
-                                out["p"] = a0["p"]
-                            if b0 is not None:
-                                out["side_b"] = {
-                                    "unit": u_hi, "panel": p_of_uhi,
-                                    "p": b0["p"], "loc": b0["loc"],
-                                }
-                                if "p" not in out:
-                                    out["p"] = b0["p"]
-                            return out
-                        a1 = _flat_of(p3d1, tri_lo)
-                        b1 = _flat_of(p3d1, tri_hi)
-                        out = {}
-                        if a0 is not None and a1 is not None:
-                            out["side_a"] = {
-                                "unit": u_lo, "panel": p_of_ulo,
-                                "p0": a0["p"], "p1": a1["p"],
-                                "loc0": a0["loc"], "loc1": a1["loc"],
-                            }
-                            out["p0"], out["p1"] = a0["p"], a1["p"]
-                        if b0 is not None and b1 is not None:
-                            out["side_b"] = {
-                                "unit": u_hi, "panel": p_of_uhi,
-                                "p0": b0["p"], "p1": b1["p"],
-                                "loc0": b0["loc"], "loc1": b1["loc"],
-                            }
-                            if "p0" not in out:
-                                out["p0"], out["p1"] = b0["p"], b1["p"]
-                        return out if out else None
+            recorded = False
+            if kind == 1:
+                p0 = [float(p0s[hi, 0]), float(p0s[hi, 1]), float(p0s[hi, 2])]
+                if len(contact_points) < max_pts:
+                    contact_points.append(p0)
+                    ent = dict(pair_meta)
+                    both = _side_flat(p0)
+                    if both is not None:
+                        ent.update(both)
+                    ent["p_3d"] = p0
+                    contact_points_flat.append(ent)
+                    recorded = True
+            else:
+                p0 = [float(p0s[hi, 0]), float(p0s[hi, 1]), float(p0s[hi, 2])]
+                p1 = [float(p1s[hi, 0]), float(p1s[hi, 1]), float(p1s[hi, 2])]
+                if len(contact_segments) < max_segs:
+                    contact_segments.append((p0, p1))
+                    ent = dict(pair_meta)
+                    both = _side_flat(p0, p1)
+                    if both is not None:
+                        ent.update(both)
+                    ent["p0_3d"] = p0
+                    ent["p1_3d"] = p1
+                    contact_segments_flat.append(ent)
+                    recorded = True
+                if len(contact_points) < max_pts:
+                    contact_points.append(p0)
+                    recorded = True
+                if len(contact_points) < max_pts:
+                    contact_points.append(p1)
+                    recorded = True
 
-                    if len(pts) == 1:
-                        if len(contact_points) < max_pts:
-                            contact_points.append(pts[0])
-                            ent = dict(pair_meta)
-                            both = _side_flat(pts[0])
-                            if both is not None:
-                                ent.update(both)
-                            p0 = pts[0]
-                            ent["p_3d"] = [float(p0[0]), float(p0[1]), float(p0[2])]
-                            # Always log (match every red particle)
-                            contact_points_flat.append(ent)
-                            recorded = True
-                    else:
-                        # Sort along principal direction → one contact segment (endpoints)
-                        arr = np.asarray(pts, dtype=float)
-                        direction = arr[-1] - arr[0]
-                        if np.linalg.norm(direction) < 1e-12:
-                            direction = arr.max(axis=0) - arr.min(axis=0)
-                        if np.linalg.norm(direction) < 1e-12:
-                            if len(contact_points) < max_pts:
-                                contact_points.append(arr[0].tolist())
-                                ent = dict(pair_meta)
-                                both = _side_flat(arr[0])
-                                if both is not None:
-                                    ent.update(both)
-                                p0 = arr[0]
-                                ent["p_3d"] = [
-                                    float(p0[0]), float(p0[1]), float(p0[2])
-                                ]
-                                contact_points_flat.append(ent)
-                                recorded = True
-                        else:
-                            direction = direction / np.linalg.norm(direction)
-                            order = np.argsort(arr @ direction)
-                            p0 = arr[order[0]].tolist()
-                            p1 = arr[order[-1]].tolist()
-                            if len(contact_segments) < max_segs:
-                                contact_segments.append((p0, p1))
-                                ent = dict(pair_meta)
-                                both = _side_flat(p0, p1)
-                                if both is not None:
-                                    ent.update(both)
-                                # 3D endpoints for crease-proximity tests + logging
-                                ent["p0_3d"] = [float(p0[0]), float(p0[1]), float(p0[2])]
-                                ent["p1_3d"] = [float(p1[0]), float(p1[1]), float(p1[2])]
-                                # Always log (match every red segment in the GUI)
-                                contact_segments_flat.append(ent)
-                                recorded = True
-                            # Also mark endpoints as points for visibility (3D only)
-                            if len(contact_points) < max_pts:
-                                contact_points.append(p0)
-                                recorded = True
-                            if len(contact_points) < max_pts:
-                                contact_points.append(p1)
-                                recorded = True
-
-                    # Gate: orange paint only for pairs that produced red markers
-                    if recorded:
-                        colliding_unit_pairs.add(
-                            (min(unit_a, unit_b), max(unit_a, unit_b))
-                        )
+            if recorded:
+                colliding_unit_pairs.add((min(u_lo, u_hi), max(u_lo, u_hi)))
 
         self._collision_contact_count = len(contact_points)
         self._collision_segment_count = len(contact_segments)
-        # Keep Python-side copies so the GUI can print node coordinates
         self._collision_contact_points_list = list(contact_points)
         self._collision_contact_segments_list = list(contact_segments)
         self._collision_contact_points_flat = list(contact_points_flat)
         self._collision_contact_segments_flat = list(contact_segments_flat)
 
-        # Per-pair: update last-seen; finalize each pair when its contact ends;
-        # export the full accumulated set once π fold is done.
         self._track_per_pair_flat_contacts()
-        # Stamp locus canvas only when contacts refreshed and fold not sealed
         if not getattr(self, "_collision_coords_exported", False):
             try:
                 self._stamp_paint_canvas_from_contacts()
@@ -4268,7 +3714,7 @@ class PD_Origami_Simulator:
             except Exception:
                 pass
 
-        # Upload to Taichi fields (zero unused slots)
+        # Upload red markers for GUI (f32 renderer buffers)
         pt_buf = np.zeros((max_pts, 3), dtype=np.float32)
         if contact_points:
             pt_buf[: len(contact_points)] = np.asarray(contact_points, dtype=np.float32)
@@ -4280,18 +3726,7 @@ class PD_Origami_Simulator:
             ln_buf[: seg_arr.shape[0]] = seg_arr
         self.collision_contact_lines.from_numpy(ln_buf)
 
-        # Intruder logic starts only when red contact geometry exists.
-        # No red points/segments → clear orange paint.
-        has_red_markers = (
-            self._collision_contact_count > 0 or self._collision_segment_count > 0
-        )
-        if has_red_markers and colliding_unit_pairs:
-            self._update_intruder_classification(positions, colliding_unit_pairs)
-        else:
-            self._update_intruder_classification(positions, set())
         self._collision_ran_once = True
-
-    # 3. intruder classification
 
     @staticmethod
     def _contact_pair_key(entry):
@@ -4415,10 +3850,6 @@ class PD_Origami_Simulator:
             "panel_of_unit_a": int(s.get("panel_of_unit_a", s.get("panel_a", -1))),
             "panel_of_unit_b": int(s.get("panel_of_unit_b", s.get("panel_b", -1))),
             "folding_angle": float(s.get("folding_angle", 0.0)),
-            "intruder_sim_unit": s.get("intruder_sim_unit"),
-            "other_sim_unit": s.get("other_sim_unit"),
-            "intruder_panel": s.get("intruder_panel"),
-            "other_panel": s.get("other_panel"),
             "d_AtoB": s.get("d_AtoB"),
             "d_BtoA": s.get("d_BtoA"),
             "side_a": cls._copy_side_seg(side_a),
@@ -4534,39 +3965,39 @@ class PD_Origami_Simulator:
 
     @classmethod
     def _maybe_seed_sweep_with_first(cls, side):
-        """Prepend crease-snapped first line if trail exists but was not seeded yet."""
-        if side is None or "first_p0" not in side or "first_p1" not in side:
-            return
-        samples = side.get("sweep_samples")
-        if not samples:
-            return
-        f0 = [float(side["first_p0"][0]), float(side["first_p0"][1])]
-        f1 = [float(side["first_p1"][0]), float(side["first_p1"][1])]
-        if float(np.hypot(f1[0] - f0[0], f1[1] - f0[1])) < 1e-12:
-            return
-        s0 = samples[0]
-        # Already starts at first (or very near)
-        d = cls._segment_mid_dist_2d(s0["p0"], s0["p1"], f0, f1)
-        if d < 1e-6:
-            return
-        samples.insert(0, {
-            "angle": float(side.get("first_folding_angle", s0.get("angle", 0.0))),
-            "p0": f0,
-            "p1": f1,
-        })
+        """No-op: sweep strokes stay on strict 2° bins only (no extra crease seed)."""
+        return
+
+    @staticmethod
+    def _sweep_angle_bin(angle_rad, step_rad=None):
+        """Discrete fold-angle bin index (0,1,2,…); each bin is ``step_rad`` wide (default 2°)."""
+        step = float(SWEEP_SAMPLE_STEP_RAD if step_rad is None else step_rad)
+        if step <= 0.0:
+            return 0
+        a = float(angle_rad)
+        if a < 0.0:
+            a = 0.0
+        return int(np.floor(a / step + 1e-12))
 
     @classmethod
-    def _append_sweep_sample_2d(cls, side, angle, min_move=0.15, max_samples=None):
+    def _append_sweep_sample_2d(
+        cls, side, angle, force=False, min_move=None, max_samples=None,
+        angle_step=None,
+    ):
         """
-        Append current side p0–p1 to a 2D sweep trail (paint stroke on the design panel).
+        Append current side p0–p1 to a 2D sweep trail.
 
-        - Seeds the trail with crease-snapped first_* when present (so paint starts on hinge).
-        - Skips samples that barely moved (min_move) to avoid pure duplicates.
-        - Endpoint order is stabilized against the previous sample (no twist).
-        - **No sample count cap** (max_samples ignored; kept for call-site compat).
+        **Strict 2° bins** (independent of fold speed / frame rate):
+          at most one sample per floor(θ / 2°) bucket.
+        ``force=True`` only refreshes the tip if the bin is already recorded;
+        it does not invent extra intermediate angles.
         """
         if side is None or "p0" not in side or "p1" not in side:
             return
+        # Legacy: min_move=0 meant “accept tip”
+        if min_move is not None and float(min_move) <= 0.0:
+            force = True
+
         p0 = [float(side["p0"][0]), float(side["p0"][1])]
         p1 = [float(side["p1"][0]), float(side["p1"][1])]
         dx = p1[0] - p0[0]
@@ -4579,39 +4010,24 @@ class PD_Origami_Simulator:
             samples = []
             side["sweep_samples"] = samples
 
-        # Seed with crease first line once, before the live contact stroke
-        if not samples and "first_p0" in side and "first_p1" in side:
-            f0 = [float(side["first_p0"][0]), float(side["first_p0"][1])]
-            f1 = [float(side["first_p1"][0]), float(side["first_p1"][1])]
-            fdx = f1[0] - f0[0]
-            fdy = f1[1] - f0[1]
-            if (fdx * fdx + fdy * fdy) >= 1e-24:
-                samples.append({
-                    "angle": float(side.get("first_folding_angle", angle)),
-                    "p0": f0,
-                    "p1": f1,
-                })
+        step = float(
+            angle_step if angle_step is not None else SWEEP_SAMPLE_STEP_RAD
+        )
+        ang = float(angle)
+        bin_i = cls._sweep_angle_bin(ang, step)
+        store_ang = float(bin_i) * step  # quantized angle for this stroke
 
         if samples:
             last = samples[-1]
             p0, p1 = cls._order_segment_endpoints_2d(p0, p1, last["p0"], last["p1"])
-            moved = cls._segment_mid_dist_2d(last["p0"], last["p1"], p0, p1)
-            e0x = p0[0] - last["p0"][0]
-            e0y = p0[1] - last["p0"][1]
-            e1x = p1[0] - last["p1"][0]
-            e1y = p1[1] - last["p1"][1]
-            end_move = max((e0x * e0x + e0y * e0y) ** 0.5, (e1x * e1x + e1y * e1y) ** 0.5)
-            # Same pose → skip (but allow last lock rewrite via force path elsewhere)
-            mm = float(min_move)
-            if moved < mm and end_move < mm:
-                # Still refresh last sample angle/position lightly if tiny drift
-                if moved < 1e-9:
-                    return
-                samples[-1] = {"angle": float(angle), "p0": p0, "p1": p1}
+            last_bin = cls._sweep_angle_bin(last.get("angle", 0.0), step)
+            if bin_i == last_bin:
+                if force:
+                    # Same 2° bucket: refresh tip geometry only (no denser trail)
+                    samples[-1] = {"angle": store_ang, "p0": p0, "p1": p1}
                 return
 
-        samples.append({"angle": float(angle), "p0": p0, "p1": p1})
-        # No thinning / max_samples cap — keep every sample
+        samples.append({"angle": store_ang, "p0": p0, "p1": p1})
 
     @classmethod
     def sweep_paint_polygon_2d(cls, samples):
@@ -4695,7 +4111,7 @@ class PD_Origami_Simulator:
     @classmethod
     def closed_triangle_max_area_from_first_last(cls, ent, side_key="side_a"):
         """
-        Closed triangle for trim shading / JSON export.
+        Closed triangle helper (first edge + max-area last apex).
 
         Always uses both first crease endpoints. From the two last endpoints,
         keeps the apex that forms the *larger-area* triangle:
@@ -4763,10 +4179,6 @@ class PD_Origami_Simulator:
             "panel_of_unit_a": int(e.get("panel_of_unit_a", e.get("panel_a", -1))),
             "panel_of_unit_b": int(e.get("panel_of_unit_b", e.get("panel_b", -1))),
             "folding_angle": float(e.get("folding_angle", 0.0)),
-            "intruder_sim_unit": e.get("intruder_sim_unit"),
-            "other_sim_unit": e.get("other_sim_unit"),
-            "intruder_panel": e.get("intruder_panel"),
-            "other_panel": e.get("other_panel"),
             "d_AtoB": e.get("d_AtoB"),
             "d_BtoA": e.get("d_BtoA"),
             "side_a": cls._copy_side_pt(side_a),
@@ -4785,38 +4197,6 @@ class PD_Origami_Simulator:
             out["p"] = [float(e["p"][0]), float(e["p"][1])]
         return out
 
-    def _stamp_intruder_on_entry(self, ent):
-        """
-        Attach classified intruder / host to a contact entry.
-        Uses latest live classification; keeps previous stamp if none this frame.
-        """
-        ua, ub = int(ent["unit_a"]), int(ent["unit_b"])
-        pair = (min(ua, ub), max(ua, ub))
-        cls_map = getattr(self, "_intruder_by_unit_pair", None) or {}
-        cls = cls_map.get(pair)
-        if cls is None:
-            return ent  # keep any prior stamp
-
-        intr_u = int(cls["intruder_sim_unit"])
-        oth_u = int(cls["other_sim_unit"])
-        # Map sim unit → JSON panel using this entry's unit↔panel fields
-        if intr_u == ua:
-            intr_p = int(ent.get("panel_of_unit_a", ent.get("panel_a", -1)))
-            oth_p = int(ent.get("panel_of_unit_b", ent.get("panel_b", -1)))
-        elif intr_u == ub:
-            intr_p = int(ent.get("panel_of_unit_b", ent.get("panel_b", -1)))
-            oth_p = int(ent.get("panel_of_unit_a", ent.get("panel_a", -1)))
-        else:
-            # Classification units don't match entry (shouldn't happen)
-            intr_p = oth_p = -1
-
-        ent["intruder_sim_unit"] = intr_u
-        ent["other_sim_unit"] = oth_u
-        ent["intruder_panel"] = intr_p
-        ent["other_panel"] = oth_p
-        ent["d_AtoB"] = float(cls.get("d_AtoB", 0.0))
-        ent["d_BtoA"] = float(cls.get("d_BtoA", 0.0))
-        return ent
 
     @staticmethod
     def _segment_length_xy(s):
@@ -4888,7 +4268,7 @@ class PD_Origami_Simulator:
             return recs
         flat_kps = getattr(self, "_flat_kps_np", None)
         if flat_kps is None:
-            flat_kps = np.asarray(self.kps, dtype=float)
+            flat_kps = np.asarray(self.kps, dtype=numpy_data_type)
             self._flat_kps_np = flat_kps
         n_pos = len(positions)
         n_flat = len(flat_kps)
@@ -5038,7 +4418,7 @@ class PD_Origami_Simulator:
         - **sweep (2D paint)**: successive p0–p1 samples on the design plane
           while the contact line is live. The ribbon those samples sweep out
           is the 2D panel paint region (no 3D paint geometry) and the
-          **exported shaded-area coordinates**.
+          paint region coordinates.
 
         Multiple concurrent segments between the same unit pair are all kept
         (keyed by tri_a/tri_b), matching the GUI red lines.
@@ -5064,9 +4444,10 @@ class PD_Origami_Simulator:
         crease_recs = self._fold_crease_records(positions)
         crease_segs = [(r["a3d"], r["b3d"]) for r in crease_recs]
         crease_tol = max(float(getattr(self, "max_size", 100.0)) * 0.012, 0.35)
-        # Min mid-point travel (design units) before recording another sweep sample
-        # Dense trail (smaller threshold → less sparse ribbon / locus)
-        sweep_min_move = max(float(getattr(self, "max_size", 100.0)) * 3e-4, 0.012)
+        # One stroke every SWEEP_SAMPLE_STEP_DEG degrees of fold angle (not time/distance)
+        sweep_angle_step = float(
+            getattr(self, "_paint_angle_step_rad", SWEEP_SAMPLE_STEP_RAD)
+        )
 
         # One entry per triangle–triangle contact (same as each red GUI segment/point).
         # Do NOT collapse multiple contacts that share the same unit pair.
@@ -5087,15 +4468,6 @@ class PD_Origami_Simulator:
             e["folding_angle"] = angle
             pts_now[key] = self._copy_point_entry(e)
 
-        def _carry_intruder(ent, prev):
-            if prev is None:
-                return
-            for fld in (
-                "intruder_sim_unit", "other_sim_unit",
-                "intruder_panel", "other_panel", "d_AtoB", "d_BtoA",
-            ):
-                if ent.get(fld) is None and prev.get(fld) is not None:
-                    ent[fld] = prev[fld]
 
         def _carry_sweep(ent, prev):
             """Bring prior 2D sweep trail onto the live entry (fresh copy has none).
@@ -5117,14 +4489,14 @@ class PD_Origami_Simulator:
                     side["sweep_samples"] = samples  # shared mutable trail
 
         def _record_sweep(ent, force_last=False):
-            """Append current 2D contact line to the paint sweep on each panel side."""
-            # force_last: min_move=0 so the terminal pose is always recorded
-            min_move = 0.0 if force_last else sweep_min_move
+            """Append current 2D contact line every angle_step (2°) of fold."""
             for sk in ("side_a", "side_b"):
                 side = ent.get(sk)
                 if side is None:
                     continue
-                self._append_sweep_sample_2d(side, angle, min_move=min_move)
+                self._append_sweep_sample_2d(
+                    side, angle, force=force_last, angle_step=sweep_angle_step,
+                )
 
         def _is_locked(key):
             fin = self._collision_fixed_segments.get(key)
@@ -5211,11 +4583,9 @@ class PD_Origami_Simulator:
 
             if already:
                 locked = self._collision_fixed_segments[key]
-                _carry_intruder(ent, locked)
                 _carry_sweep(ent, locked)
                 # Keep first from locked snapshot on live display entry
                 _apply_first_on_creases(ent, locked, ent.get("p0_3d"), ent.get("p1_3d"))
-                self._stamp_intruder_on_entry(ent)
                 # Locked: paint trail is frozen (no more 2D samples)
                 self._collision_active_segments[key] = ent
                 continue
@@ -5230,9 +4600,7 @@ class PD_Origami_Simulator:
                 if ent.get("p0_3d") is None and prev.get("p0_3d") is not None:
                     ent["p0_3d"] = list(prev["p0_3d"])
                     ent["p1_3d"] = list(prev["p1_3d"])
-            _carry_intruder(ent, prev)
             _carry_sweep(ent, prev)
-            self._stamp_intruder_on_entry(ent)
 
             p0_3d = ent.get("p0_3d")
             p1_3d = ent.get("p1_3d")
@@ -5241,7 +4609,7 @@ class PD_Origami_Simulator:
             # 2D paint: record the mapped two-node line on each panel's design xy
             _record_sweep(ent, force_last=False)
 
-            # Lock last (trim) when BOTH nodes left creases (segment still live)
+            # Lock last when BOTH nodes left creases (segment still live)
             min_len = max(float(getattr(self, "max_size", 100.0)) * 0.002, 0.05)
             long_enough = self._segment_length_xy(ent) >= min_len
             if (
@@ -5299,8 +4667,6 @@ class PD_Origami_Simulator:
             prev = self._collision_active_points.get(key)
             if ent.get("side_a"):
                 ent["p"] = list(ent["side_a"]["p"])
-            _carry_intruder(ent, prev)
-            self._stamp_intruder_on_entry(ent)
             self._collision_active_points[key] = ent
             self._collision_fixed_points.pop(key, None)
 
@@ -5308,7 +4674,6 @@ class PD_Origami_Simulator:
         for key in list(self._collision_active_segments.keys()):
             if key not in segs_now:
                 fin = self._collision_active_segments.pop(key)
-                self._stamp_intruder_on_entry(fin)
                 if not (self._collision_fixed_segments.get(key) or {}).get("coords_locked"):
                     # Seal last paint sample on the final known 2D line
                     for sk in ("side_a", "side_b"):
@@ -5316,7 +4681,7 @@ class PD_Origami_Simulator:
                         if side is not None and "p0" in side:
                             self._append_sweep_sample_2d(
                                 side, float(fin.get("folding_angle", angle)),
-                                min_move=0.0,
+                                force=True,
                             )
                     fin["coords_locked"] = True
                     fin["fixed_reason"] = fin.get("fixed_reason") or "contact_ended"
@@ -5327,7 +4692,6 @@ class PD_Origami_Simulator:
                     self._collision_active_points.pop(key, None)
                 else:
                     fin = self._collision_active_points.pop(key)
-                    self._stamp_intruder_on_entry(fin)
                     fin["coords_locked"] = True
                     fin["fixed_reason"] = "contact_ended"
                     self._collision_fixed_points[key] = fin
@@ -5341,19 +4705,15 @@ class PD_Origami_Simulator:
         if angle >= 3.1415 - 1e-6:
             self._stop_sweep_drawing_at_pi()
 
-    # 5. coordinates export
+    # 5. seal trails at π
 
-    def _seal_and_export_fixed_flat_contacts(self, reason="fold_complete"):
-        """Move any remaining actives into fixed, then export once.
+    def _seal_fixed_flat_contacts(self, reason="fold_complete"):
+        """Move remaining actives into fixed and stop further trail growth.
 
         reason: fixed_reason tag for still-live contacts (e.g. fold_pi).
-        After a successful export, sweep sample recording and paint stamping stop.
-
-        Exported coordinates for each panel side are the **shaded sweep region**
-        (ribbon of successive two-node contact lines in design xy).
+        Does not write JSON / log files.
         """
         if self._collision_coords_exported:
-            # Allow recovery only when previous seal stored nothing
             if self._collision_fixed_segments or self._collision_fixed_points:
                 return
             self._collision_coords_exported = False
@@ -5361,14 +4721,12 @@ class PD_Origami_Simulator:
         for key, ent in list(self._collision_active_segments.items()):
             existing = self._collision_fixed_segments.get(key)
             if existing and existing.get("coords_locked"):
-                # Prefer the longer sweep trail if active has more samples
                 for sk in ("side_a", "side_b"):
                     es = (ent.get(sk) or {}).get("sweep_samples") or []
                     xs = (existing.get(sk) or {}).get("sweep_samples") or []
                     if len(es) > len(xs) and existing.get(sk) is not None:
                         existing[sk]["sweep_samples"] = self._copy_sweep_samples(es)
-                continue  # keep off_crease (or earlier) lock
-            # Snapshot so later shared-list mutations cannot grow sealed trails
+                continue
             ent = self._copy_segment_entry(ent)
             ent["coords_locked"] = True
             ent["fixed_reason"] = ent.get("fixed_reason") or seal_reason
@@ -5386,7 +4744,6 @@ class PD_Origami_Simulator:
             if key in self._collision_fixed_segments:
                 del self._collision_fixed_points[key]
 
-        # Last resort at π: harvest this-frame flat contacts if tracker is empty
         if (
             seal_reason == "fold_pi"
             and not self._collision_fixed_segments
@@ -5404,471 +4761,13 @@ class PD_Origami_Simulator:
                 ent["fixed_reason"] = "fold_pi"
                 self._collision_fixed_segments[key] = ent
 
-        if self._collision_fixed_segments or self._collision_fixed_points:
-            self._export_all_fixed_flat_contacts()
-        elif seal_reason == "fold_pi":
-            # Truly nothing to export this fold — stop thrashing
+        # Mark sealed so paint / tracking stop (no JSON write)
+        if (
+            self._collision_fixed_segments
+            or self._collision_fixed_points
+            or seal_reason == "fold_pi"
+        ):
             self._collision_coords_exported = True
-            self._collision_stats = self.build_collision_stats(include_live=False)
-            print(
-                "[Contact] Seal @π with no fixed contacts "
-                f"(GUI segs={getattr(self, '_collision_segment_count', 0)} "
-                f"pts={getattr(self, '_collision_contact_count', 0)})."
-            )
-        # else: leave open so later frames can still accumulate
-
-    def build_collision_stats(self, include_live=False):
-        """
-        Structured dump of every tracked contact (for JSON / debugging).
-        One entry per red triangle–triangle contact the tracker kept.
-
-        **Exported coordinates** for each panel side = the **shaded area**:
-        the 2D sweep ribbon of the two-node contact line (design xy).
-        Falls back to first/last triangle only when fewer than two samples.
-        """
-        groups = self.get_collision_groups(include_live=include_live)
-        closed_polygons = []
-        shaded_areas = []
-        segments_out = []
-        points_out = []
-        n_sweep = 0
-        for g in groups:
-            for seg in g["segments"]:
-                segments_out.append(seg)
-                for side_key in ("side_a", "side_b"):
-                    side = seg.get(side_key) or {}
-                    if "p0" not in side and "first_p0" not in side:
-                        continue
-                    sweep_samples = self._copy_sweep_samples(
-                        side.get("sweep_samples") or []
-                    )
-                    # Also accept bare [p0,p1] samples if stored as lists
-                    if not sweep_samples and side.get("sweep_samples"):
-                        sweep_samples = side.get("sweep_samples") or []
-                    sweep_poly = self.sweep_paint_polygon_2d(sweep_samples)
-                    tri_info = self.closed_triangle_max_area_from_first_last(
-                        seg, side_key
-                    )
-                    poly4 = self.closed_polygon_from_first_last(seg, side_key)
-
-                    # Primary: swept shaded ribbon (matches viz paint)
-                    paint_poly = sweep_poly
-                    paint_kind = "sweep"
-                    paint_area = (
-                        self._polygon_area_2d(sweep_poly) if sweep_poly else 0.0
-                    )
-                    if paint_poly is None and tri_info is not None:
-                        paint_poly = tri_info["triangle"]
-                        paint_kind = "triangle"
-                        paint_area = float(tri_info["area"])
-                    if paint_poly is None and poly4 is not None:
-                        paint_poly = poly4
-                        paint_kind = "quad"
-                        paint_area = self._polygon_area_2d(poly4)
-                    if paint_poly is None:
-                        continue
-                    if paint_kind == "sweep":
-                        n_sweep += 1
-
-                    # Coordinate list as plain [[x,y], ...] for consumers
-                    coordinates = [
-                        [float(q[0]), float(q[1])] for q in paint_poly
-                    ]
-
-                    entry = {
-                        "panel": side.get("panel", seg.get("panel_a")),
-                        "unit": side.get("unit"),
-                        "side": side_key,
-                        "intruder_panel": seg.get(
-                            "intruder_panel", g.get("intruder_panel")
-                        ),
-                        "other_panel": seg.get(
-                            "other_panel", g.get("other_panel")
-                        ),
-                        "unit_a": seg.get("unit_a"),
-                        "unit_b": seg.get("unit_b"),
-                        "layer_idx": seg.get("layer_idx"),
-                        "layer_h": seg.get("layer_h"),
-                        "tri_a": seg.get("tri_a"),
-                        "tri_b": seg.get("tri_b"),
-                        # === primary export: shaded region coordinates ===
-                        "coordinates": coordinates,
-                        "shaded_polygon": coordinates,
-                        "shaded_area": float(paint_area),
-                        "shaded_kind": paint_kind,
-                        "n_vertices": len(coordinates),
-                        # aliases used by visualizer / older consumers
-                        "paint_kind": paint_kind,
-                        "paint_polygon": coordinates,
-                        "paint_area": float(paint_area),
-                        "sweep_samples": sweep_samples,
-                        "sweep_n_samples": len(sweep_samples),
-                        "sweep_polygon": sweep_poly,
-                        # Max-area triangle fallback (first edge + better last apex)
-                        "closed_triangle": (
-                            tri_info["triangle"] if tri_info else None
-                        ),
-                        "triangle_area": (
-                            float(tri_info["area"]) if tri_info else None
-                        ),
-                        "triangle_last_index": (
-                            tri_info["last_index"] if tri_info else None
-                        ),
-                        "triangle_last_point": (
-                            tri_info["last_point"] if tri_info else None
-                        ),
-                        "first_p0": (
-                            tri_info["first_p0"]
-                            if tri_info
-                            else side.get("first_p0", seg.get("first_p0"))
-                        ),
-                        "first_p1": (
-                            tri_info["first_p1"]
-                            if tri_info
-                            else side.get("first_p1", seg.get("first_p1"))
-                        ),
-                        # last two-node line (trim lock / live tip)
-                        "last_p0": list(side["p0"]) if "p0" in side else None,
-                        "last_p1": list(side["p1"]) if "p1" in side else None,
-                        # Legacy 4-gon (first + both last ends)
-                        "polygon": poly4,
-                        "fixed_reason": seg.get("fixed_reason"),
-                        "folding_angle": seg.get("folding_angle"),
-                    }
-                    closed_polygons.append(entry)
-                    shaded_areas.append({
-                        "panel": entry["panel"],
-                        "unit": entry["unit"],
-                        "side": side_key,
-                        "layer_idx": entry["layer_idx"],
-                        "layer_h": entry["layer_h"],
-                        "kind": paint_kind,
-                        "area": float(paint_area),
-                        "coordinates": coordinates,
-                        "n_vertices": len(coordinates),
-                        "sweep_n_samples": len(sweep_samples),
-                        # Full sample list for complete export / logging
-                        "sweep_samples": sweep_samples,
-                        "first_p0": entry.get("first_p0"),
-                        "first_p1": entry.get("first_p1"),
-                        "last_p0": entry.get("last_p0"),
-                        "last_p1": entry.get("last_p1"),
-                        "fixed_reason": entry.get("fixed_reason"),
-                        "folding_angle": entry.get("folding_angle"),
-                        "intruder_panel": entry["intruder_panel"],
-                        "other_panel": entry["other_panel"],
-                        "unit_a": entry.get("unit_a"),
-                        "unit_b": entry.get("unit_b"),
-                        "tri_a": entry.get("tri_a"),
-                        "tri_b": entry.get("tri_b"),
-                    })
-            for ent in g["points"]:
-                points_out.append(ent)
-        return {
-            "n_groups": len(groups),
-            "n_segments": len(segments_out),
-            "n_points": len(points_out),
-            "n_closed_polygons": len(closed_polygons),
-            "n_closed_triangles": len(closed_polygons),
-            "n_sweep_paints": n_sweep,
-            "n_shaded_areas": len(shaded_areas),
-            "groups": groups,
-            "segments": segments_out,
-            "points": points_out,
-            "closed_polygons": closed_polygons,
-            # Flat list of shaded regions = primary exported coordinates
-            "shaded_areas": shaded_areas,
-            "folding_angle": float(getattr(self, "folding_angle", 0.0)),
-            # Live frame raw counts (what the GUI draws this frame)
-            "gui_contact_points": int(getattr(self, "_collision_contact_count", 0)),
-            "gui_contact_segments": int(getattr(self, "_collision_segment_count", 0)),
-        }
-
-    @staticmethod
-    def _fmt_xy(q, prec=6):
-        return f"({float(q[0]):.{prec}f}, {float(q[1]):.{prec}f})"
-
-    @classmethod
-    def _log_xy_ring(cls, pts, indent="        ", label="coordinates", prec=6):
-        """Print every ring vertex (no truncation). One point per line for clarity."""
-        if not pts:
-            print(f"{indent}{label}: (empty)")
-            return
-        print(f"{indent}{label}  n={len(pts)}  (closed ring):")
-        for i, q in enumerate(pts):
-            print(f"{indent}  [{i:4d}] {cls._fmt_xy(q, prec)}")
-        # close marker repeats first vertex for readability
-        print(f"{indent}  [close] {cls._fmt_xy(pts[0], prec)}")
-
-    @classmethod
-    def _log_sweep_samples(cls, samples, indent="        ", prec=6):
-        """Print every two-node sweep sample (no omission)."""
-        if not samples:
-            print(f"{indent}sweep_samples: (none)")
-            return
-        print(f"{indent}sweep_samples  n={len(samples)}:")
-        for si, s in enumerate(samples):
-            if not s or "p0" not in s or "p1" not in s:
-                print(f"{indent}  sample[{si}]: (invalid)")
-                continue
-            a, b = s["p0"], s["p1"]
-            ang = float(s.get("angle", 0.0))
-            print(
-                f"{indent}  sample[{si:4d}] @θ={ang:.6f}: "
-                f"{cls._fmt_xy(a, prec)} -- {cls._fmt_xy(b, prec)}"
-            )
-
-    def _export_all_fixed_flat_contacts(self):
-        """
-        Complete log of locked flat trim coords.
-
-        Primary payload = shaded sweep polygon coordinates (every vertex) and
-        every sweep sample stroke. Nothing is truncated or omitted.
-        Also writes a full text dump next to descriptionData for offline review.
-        """
-        groups = self.get_collision_groups(include_live=False)
-        n_segs = sum(len(g["segments"]) for g in groups)
-        n_pts = sum(len(g["points"]) for g in groups)
-        stats = self.build_collision_stats(include_live=False)
-        self._collision_stats = stats
-        self._collision_coords_exported = True
-        n_unit_pairs = len({
-            (int(s["unit_a"]), int(s["unit_b"]), int(s["layer_idx"]))
-            for s in stats.get("segments", [])
-        })
-        n_sweep = int(stats.get("n_sweep_paints", 0) or 0)
-        n_paint = int(stats.get("n_closed_polygons", 0) or 0)
-        n_shaded = int(stats.get("n_shaded_areas", n_paint) or 0)
-
-        lines_out = []
-
-        def _p(msg=""):
-            print(msg)
-            lines_out.append(str(msg))
-
-        _p(
-            f"[Contact] Exported SHADED areas (sweep ribbons) as coordinates: "
-            f"fold angle={float(self.folding_angle):.6f}, "
-            f"groups={len(groups)}, lines={n_segs}, lone_pts={n_pts}, "
-            f"unit_pairs={n_unit_pairs}, shaded={n_shaded} "
-            f"(sweep={n_sweep}); "
-            f"GUI last frame segs={self._collision_segment_count} "
-            f"pts={self._collision_contact_count}"
-        )
-        _p(
-            f"[Contact] Full dump: every shaded vertex + every sweep sample "
-            f"(no truncation)."
-        )
-
-        # ---- 1) Every shaded region (primary export) ----
-        for si, sh in enumerate(stats.get("shaded_areas") or []):
-            coords = sh.get("coordinates") or []
-            samples = sh.get("sweep_samples") or []
-            _p(
-                f"  shaded[{si}] panel={sh.get('panel')} unit={sh.get('unit')} "
-                f"side={sh.get('side')} L={sh.get('layer_idx')} "
-                f"h={sh.get('layer_h')!s} kind={sh.get('kind')} "
-                f"A={float(sh.get('area', 0)):.6f} "
-                f"n_verts={len(coords)} n_samples={len(samples)} "
-                f"units={sh.get('unit_a')}-{sh.get('unit_b')} "
-                f"tris={sh.get('tri_a')}-{sh.get('tri_b')} "
-                f"intr={sh.get('intruder_panel')} host={sh.get('other_panel')} "
-                f"lock={sh.get('fixed_reason')} @θ={sh.get('folding_angle')}"
-            )
-            if sh.get("first_p0") is not None and sh.get("first_p1") is not None:
-                _p(
-                    f"    first: {self._fmt_xy(sh['first_p0'])} -- "
-                    f"{self._fmt_xy(sh['first_p1'])}"
-                )
-            if sh.get("last_p0") is not None and sh.get("last_p1") is not None:
-                _p(
-                    f"    last:  {self._fmt_xy(sh['last_p0'])} -- "
-                    f"{self._fmt_xy(sh['last_p1'])}"
-                )
-            # Capture ring + samples into lines_out via temporary print capture
-            # Use direct helpers that also append
-            if coords:
-                _p(f"    coordinates  n={len(coords)}  (closed ring):")
-                for i, q in enumerate(coords):
-                    _p(f"      [{i:4d}] {self._fmt_xy(q)}")
-                _p(f"      [close] {self._fmt_xy(coords[0])}")
-            else:
-                _p("    coordinates: (empty)")
-            if samples:
-                _p(f"    sweep_samples  n={len(samples)}:")
-                for j, s in enumerate(samples):
-                    if not s or "p0" not in s or "p1" not in s:
-                        _p(f"      sample[{j:4d}]: (invalid)")
-                        continue
-                    _p(
-                        f"      sample[{j:4d}] @θ={float(s.get('angle', 0)):.6f}: "
-                        f"{self._fmt_xy(s['p0'])} -- {self._fmt_xy(s['p1'])}"
-                    )
-            else:
-                _p("    sweep_samples: (none)")
-
-        # ---- 2) Per-group / per-line detail (complete) ----
-        for gi, g in enumerate(groups):
-            intr_p = g.get("intruder_panel")
-            oth_p = g.get("other_panel")
-            if intr_p is not None and oth_p is not None:
-                who = (
-                    f"INTRUDER panel {intr_p}  into  host panel {oth_p}  "
-                    f"(units {g.get('intruder_sim_unit')}→{g.get('other_sim_unit')})"
-                )
-            else:
-                who = "INTRUDER: unknown (no classification)"
-            _p(
-                f"  === group {gi}: panels {g['panel_a']}-{g['panel_b']} | {who} "
-                f"({len(g['segments'])} lines, {len(g['points'])} pts) ==="
-            )
-            for i, seg in enumerate(g["segments"]):
-                s_intr = seg.get("intruder_panel", intr_p)
-                s_oth = seg.get("other_panel", oth_p)
-                reason = seg.get("fixed_reason") or "?"
-                tri_tag = ""
-                if seg.get("tri_a") is not None and seg.get("tri_b") is not None:
-                    tri_tag = f" tris={seg['tri_a']}-{seg['tri_b']}"
-                _p(
-                    f"    line {i}  INTRUDER panel {s_intr} / host panel {s_oth}  "
-                    f"units {seg['unit_a']}-{seg['unit_b']} "
-                    f"L{seg['layer_idx']} h={seg['layer_h']:+.6g}{tri_tag}  "
-                    f"lock={reason} @θ={float(seg.get('folding_angle', 0)):.6f}"
-                )
-                if seg.get("d_AtoB") is not None:
-                    _p(
-                        f"      dAB={seg['d_AtoB']:+.6f} dBA={seg['d_BtoA']:+.6f}  "
-                        f"intr_unit={seg.get('intruder_sim_unit')} "
-                        f"host_unit={seg.get('other_sim_unit')}"
-                    )
-                if seg.get("p0_3d") is not None and seg.get("p1_3d") is not None:
-                    a3, b3 = seg["p0_3d"], seg["p1_3d"]
-                    _p(
-                        f"      3d (GUI red segment): "
-                        f"({float(a3[0]):.6f},{float(a3[1]):.6f},{float(a3[2]):.6f}) -- "
-                        f"({float(b3[0]):.6f},{float(b3[1]):.6f},{float(b3[2]):.6f})"
-                    )
-                n_sides_printed = 0
-                for side_key, label in (("side_a", "panel-A"), ("side_b", "panel-B")):
-                    side = seg.get(side_key) or {}
-                    if "p0" not in side:
-                        continue
-                    n_sides_printed += 1
-                    p0, p1 = side["p0"], side["p1"]
-                    f0 = side.get("first_p0", p0)
-                    f1 = side.get("first_p1", p1)
-                    role = ""
-                    if side.get("panel") == s_intr:
-                        role = " [INTRUDER]"
-                    elif side.get("panel") == s_oth:
-                        role = " [HOST]"
-                    _p(
-                        f"      {label} p{side.get('panel')} u{side.get('unit')}{role}"
-                    )
-                    kp0 = seg.get("first_kp0")
-                    kp1 = seg.get("first_kp1")
-                    kp_tag = f" kps={kp0}-{kp1}" if kp0 is not None else ""
-                    _p(
-                        f"        first(JSON crease verts){kp_tag} @θ="
-                        f"{float(side.get('first_folding_angle', seg.get('first_folding_angle', 0))):.6f}: "
-                        f"{self._fmt_xy(f0)} -- {self._fmt_xy(f1)}"
-                    )
-                    _p(
-                        f"        last (trim lock) @θ={float(seg.get('folding_angle', 0)):.6f}: "
-                        f"{self._fmt_xy(p0)} -- {self._fmt_xy(p1)}"
-                    )
-                    samples = side.get("sweep_samples") or []
-                    shaded = self.sweep_paint_polygon_2d(samples)
-                    n_samp = len(samples)
-                    if shaded is not None:
-                        area = self._polygon_area_2d(shaded)
-                        _p(
-                            f"        SHADED area (export coords, kind=sweep, "
-                            f"n_samples={n_samp}, n_verts={len(shaded)}, "
-                            f"A={area:.6f}):"
-                        )
-                        _p(f"        coordinates  n={len(shaded)}  (closed ring):")
-                        for vi, q in enumerate(shaded):
-                            _p(f"          [{vi:4d}] {self._fmt_xy(q)}")
-                        _p(f"          [close] {self._fmt_xy(shaded[0])}")
-                    else:
-                        tri_info = self.closed_triangle_max_area_from_first_last(
-                            seg, side_key
-                        )
-                        if tri_info is not None:
-                            tri = tri_info["triangle"]
-                            _p(
-                                f"        SHADED area (fallback tri, "
-                                f"n_samples={n_samp}, A={float(tri_info['area']):.6f}):"
-                            )
-                            _p(f"        coordinates  n={len(tri)}  (closed ring):")
-                            for vi, q in enumerate(tri):
-                                _p(f"          [{vi:4d}] {self._fmt_xy(q)}")
-                            _p(f"          [close] {self._fmt_xy(tri[0])}")
-                        else:
-                            _p(
-                                f"        SHADED area: none "
-                                f"(n_samples={n_samp})"
-                            )
-                    # Always log full sample list (never omit)
-                    if samples:
-                        _p(f"        sweep_samples  n={n_samp}:")
-                        for j, s in enumerate(samples):
-                            if not s or "p0" not in s or "p1" not in s:
-                                _p(f"          sample[{j:4d}]: (invalid)")
-                                continue
-                            _p(
-                                f"          sample[{j:4d}] @θ="
-                                f"{float(s.get('angle', 0)):.6f}: "
-                                f"{self._fmt_xy(s['p0'])} -- {self._fmt_xy(s['p1'])}"
-                            )
-                    else:
-                        _p("        sweep_samples: (none)")
-                if n_sides_printed == 0:
-                    _p("      (no flat map for this segment — 3d only)")
-            for i, ent in enumerate(g["points"]):
-                _p(
-                    f"    pt {i}  INTRUDER panel {ent.get('intruder_panel', '?')} / "
-                    f"host panel {ent.get('other_panel', '?')}  "
-                    f"units {ent['unit_a']}-{ent['unit_b']} "
-                    f"L{ent['layer_idx']} h={ent['layer_h']:+.6g}"
-                )
-                for side_key, label in (("side_a", "panel-A"), ("side_b", "panel-B")):
-                    side = ent.get(side_key) or {}
-                    if "p" not in side:
-                        continue
-                    p = side["p"]
-                    _p(
-                        f"      {label} p{side.get('panel')} u{side.get('unit')}: "
-                        f"{self._fmt_xy(p)}"
-                    )
-
-        # ---- 3) Write complete log file (console may scroll away) ----
-        try:
-            out_dir = os.path.join(".", "descriptionData")
-            os.makedirs(out_dir, exist_ok=True)
-            name = getattr(self, "origami_name", "origami") or "origami"
-            log_path = os.path.join(out_dir, f"{name}-contact-export.log")
-            with open(log_path, "w", encoding="utf-8") as fw:
-                fw.write("\n".join(lines_out))
-                fw.write("\n")
-            _p(f"[Contact] Complete log written to {log_path}")
-            # Also dump structured JSON of shaded areas (full coordinates + samples)
-            json_path = os.path.join(out_dir, f"{name}-shaded-areas.json")
-            payload = {
-                "origami_name": name,
-                "folding_angle": float(self.folding_angle),
-                "n_shaded_areas": n_shaded,
-                "n_segments": n_segs,
-                "n_points": n_pts,
-                "shaded_areas": stats.get("shaded_areas") or [],
-                "closed_polygons": stats.get("closed_polygons") or [],
-            }
-            with open(json_path, "w", encoding="utf-8") as fw:
-                json.dump(payload, fw, indent=2)
-            _p(f"[Contact] Shaded-area JSON written to {json_path}")
-        except Exception as exc:
-            _p(f"[Contact] Failed to write export log/json: {exc}")
 
     def get_fixed_flat_segments(self):
         """All finalized segment cut lines (sorted by panel group, layer, units)."""
@@ -5895,20 +4794,9 @@ class PD_Origami_Simulator:
         pb = int(entry.get("panel_b", -1))
         return (min(pa, pb), max(pa, pb))
 
-    def get_collision_groups(self, include_live=True):
-        """
-        Group collision entries by the two JSON panels that collide.
 
-        Returns list of:
-          {
-            "panel_a", "panel_b",          # sorted panel indices (group id)
-            "intruder_panel", "other_panel",
-            "intruder_sim_unit", "other_sim_unit",
-            "segments": [...],             # locked flat cut lines (off-crease)
-            "points": [...],               # lone points
-            "status": "done"|"live"|"mixed"
-          }
-        """
+    def get_collision_groups(self, include_live=True):
+        """Group collision entries by the two JSON panels that collide."""
         buckets = {}
 
         def _ensure(pa, pb):
@@ -5921,39 +4809,19 @@ class PD_Origami_Simulator:
                     "points": [],
                     "_has_done": False,
                     "_has_live": False,
-                    "_intr_votes": {},  # panel -> count
-                    "_host_votes": {},
-                    "_intr_u_votes": {},
-                    "_host_u_votes": {},
                 }
             return buckets[key]
-
-        def _vote(g, entry):
-            ip = entry.get("intruder_panel")
-            op = entry.get("other_panel")
-            iu = entry.get("intruder_sim_unit")
-            ou = entry.get("other_sim_unit")
-            if ip is not None and ip >= 0:
-                g["_intr_votes"][ip] = g["_intr_votes"].get(ip, 0) + 1
-            if op is not None and op >= 0:
-                g["_host_votes"][op] = g["_host_votes"].get(op, 0) + 1
-            if iu is not None:
-                g["_intr_u_votes"][iu] = g["_intr_u_votes"].get(iu, 0) + 1
-            if ou is not None:
-                g["_host_u_votes"][ou] = g["_host_u_votes"].get(ou, 0) + 1
 
         for seg in self.get_fixed_flat_segments():
             pa, pb = self._panel_group_key(seg)
             g = _ensure(pa, pb)
             g["segments"].append(seg)
             g["_has_done"] = True
-            _vote(g, seg)
         for ent in self.get_fixed_flat_points():
             pa, pb = self._panel_group_key(ent)
             g = _ensure(pa, pb)
             g["points"].append(ent)
             g["_has_done"] = True
-            _vote(g, ent)
 
         if include_live:
             for seg in self._collision_active_segments.values():
@@ -5961,20 +4829,13 @@ class PD_Origami_Simulator:
                 g = _ensure(pa, pb)
                 g["segments"].append(seg)
                 g["_has_live"] = True
-                _vote(g, seg)
             for ent in self._collision_active_points.values():
                 pa, pb = self._panel_group_key(ent)
                 g = _ensure(pa, pb)
                 g["points"].append(ent)
                 g["_has_live"] = True
-                _vote(g, ent)
 
-        def _winner(votes):
-            if not votes:
-                return None
-            return max(votes.items(), key=lambda kv: kv[1])[0]
-
-        groups = []
+        groups_out = []
         for key in sorted(buckets.keys()):
             g = buckets[key]
             if g["_has_done"] and g["_has_live"]:
@@ -5983,11 +4844,6 @@ class PD_Origami_Simulator:
                 g["status"] = "live"
             else:
                 g["status"] = "done"
-            g["intruder_panel"] = _winner(g["_intr_votes"])
-            g["other_panel"] = _winner(g["_host_votes"])
-            g["intruder_sim_unit"] = _winner(g["_intr_u_votes"])
-            g["other_sim_unit"] = _winner(g["_host_u_votes"])
-            # Sort contacts inside group by layer, units, triangle pair
             g["segments"].sort(key=lambda s: (
                 s["layer_idx"], s["unit_a"], s["unit_b"],
                 int(s.get("tri_a", -1)), int(s.get("tri_b", -1)),
@@ -5996,25 +4852,13 @@ class PD_Origami_Simulator:
                 e["layer_idx"], e["unit_a"], e["unit_b"],
                 int(e.get("tri_a", -1)), int(e.get("tri_b", -1)),
             ))
-            for k in ("_has_done", "_has_live", "_intr_votes", "_host_votes",
-                      "_intr_u_votes", "_host_u_votes"):
-                del g[k]
-            groups.append(g)
-        return groups
-
-    # -----------------------------------------------------------------
-    # Design-space paint canvas → 3D panel (affine paper map, not mesh tris)
-    #
-    # Model:
-    #   • paper is a canvas in flat design xy
-    #   • contact line stamps sparse strokes onto that canvas
-    #   • every frame, strokes are reprojected onto the *current* panel
-    #     pose with a least-squares affine map from panel keypoints
-    #     (planar paper embedding — independent of triangulation density)
-    # -----------------------------------------------------------------
+            del g["_has_done"]
+            del g["_has_live"]
+            groups_out.append(g)
+        return groups_out
 
     def _iter_live_sweep_sides(self):
-        """Yield (side_dict, is_intruder, ent) for active + fixed contacts."""
+        """Yield (side_dict, ent) for active + fixed contacts."""
         pairs = []
         for ent in (getattr(self, "_collision_active_segments", None) or {}).values():
             pairs.append(ent)
@@ -6026,84 +4870,15 @@ class PD_Origami_Simulator:
             if key in seen:
                 continue
             seen.add(key)
-            ip = ent.get("intruder_panel")
             for sk in ("side_a", "side_b"):
                 side = ent.get(sk)
                 if not side or "p0" not in side:
                     continue
-                is_intr = (
-                    ip is not None
-                    and side.get("panel") is not None
-                    and int(side["panel"]) == int(ip)
-                )
-                yield side, is_intr, ent
+                yield side, ent
 
-    def _paint_min_move_dist(self):
-        # Match export sweep density so the on-panel locus is not sparse
-        if self._paint_min_move is None:
-            self._paint_min_move = max(
-                float(getattr(self, "max_size", 100.0)) * 3e-4, 0.012
-            )
-        return float(self._paint_min_move)
-
-    def _unit_mesh_tris_cache(self, positions, flat_kps):
-        """
-        Per-unit list of (i0,i1,i2, flat_tri[3,2]) for material mapping.
-        Built once per paint rebuild.
-        """
-        cache = {}
-        if not hasattr(self, "ori_sim"):
-            return cache
-        refs = self.ori_sim.tri_indices_ref
-        tri_all = self.ori_sim.tri_indices
-        n_tris = len(tri_all) // 3
-        for uid, t0 in enumerate(refs):
-            t1 = int(refs[uid + 1]) if uid + 1 < len(refs) else n_tris
-            tris = []
-            for ti in range(int(t0), t1):
-                base = 3 * ti
-                i0 = int(tri_all[base])
-                i1 = int(tri_all[base + 1])
-                i2 = int(tri_all[base + 2])
-                if max(i0, i1, i2) >= len(positions) or max(i0, i1, i2) >= len(flat_kps):
-                    continue
-                vf = np.asarray(
-                    [flat_kps[i0][:2], flat_kps[i1][:2], flat_kps[i2][:2]],
-                    dtype=float,
-                )
-                tris.append((i0, i1, i2, vf))
-            cache[uid] = tris
-        return cache
-
-    def _locate_xy_on_unit(self, xy, unit_tris, eps=0.02):
-        """
-        Design xy → (i0,i1,i2,u,v,w) on that unit's mesh.
-        Material barycentric so eval on current x sticks to the panel surface.
-        """
-        if not unit_tris:
-            return None
-        p = np.asarray(xy, dtype=float).reshape(-1)[:2]
-        best = None
-        best_pen = float("inf")
-        for i0, i1, i2, vf in unit_tris:
-            bary = _barycentric_2d(p, vf[0], vf[1], vf[2])
-            if bary is None:
-                continue
-            u, v, w = bary
-            # inside (slightly relaxed)
-            if u >= -eps and v >= -eps and w >= -eps:
-                return (i0, i1, i2, u, v, w)
-            # how far outside
-            pen = max(0.0, -u) + max(0.0, -v) + max(0.0, -w)
-            if pen < best_pen:
-                best_pen = pen
-                # clamp to triangle
-                u2, v2, w2 = max(u, 0.0), max(v, 0.0), max(w, 0.0)
-                s = u2 + v2 + w2
-                if s < 1e-14:
-                    continue
-                best = (i0, i1, i2, u2 / s, v2 / s, w2 / s)
-        return best
+    def _paint_angle_step(self):
+        """Fold-angle spacing (radians) between paint strokes (default 2 deg)."""
+        return float(getattr(self, "_paint_angle_step_rad", SWEEP_SAMPLE_STEP_RAD))
 
     @staticmethod
     def _eval_bary_on_positions(loc, positions, lift=0.0):
@@ -6154,13 +4929,12 @@ class PD_Origami_Simulator:
 
     def _stamp_paint_canvas_from_contacts(self):
         """
-        Record locus using **barycentric locs from the collision hit triangle**
-        (attached in detect_panel_collisions). No re-locate — those locs are
-        already on the panel mesh; redraw just re-evaluates them on current x.
+        Record locus using barycentric locs from the collision hit triangle.
+
+        Strict 2° fold-angle bins only — independent of fold speed / frame rate.
         """
         if not getattr(self, "collision_shading", False):
             return
-        # Fold sealed at π → no more locus stamps
         if getattr(self, "_sweep_draw_stopped", False) or getattr(
             self, "_collision_coords_exported", False
         ):
@@ -6172,11 +4946,13 @@ class PD_Origami_Simulator:
         if not active:
             return
 
-        min_move = self._paint_min_move_dist()
+        ang = float(getattr(self, "folding_angle", 0.0))
+        ang_step = self._paint_angle_step()
+        bin_i = self._sweep_angle_bin(ang, ang_step)
+        store_ang = float(bin_i) * ang_step
         dirty = False
         copy_loc = self._copy_loc
         order2 = self._order_segment_endpoints_2d
-        mid_dist = self._segment_mid_dist_2d
 
         for ent in active.values():
             # Stamp BOTH sides (each panel gets its own material locus)
@@ -6203,21 +4979,19 @@ class PD_Origami_Simulator:
                     if p0o[0] != p0[0] or p0o[1] != p0[1]:
                         loc0, loc1 = loc1, loc0
                     p0, p1 = p0o, p1o
-                    moved = mid_dist(last["p0"], last["p1"], p0, p1)
-                    if moved < min_move:
-                        # refresh tip locs so last sample tracks live contact
-                        trail[-1] = {
-                            "p0": p0, "p1": p1, "loc0": loc0, "loc1": loc1,
-                        }
-                        dirty = True
+                    last_bin = self._sweep_angle_bin(
+                        last.get("angle", 0.0), ang_step
+                    )
+                    if bin_i == last_bin:
+                        # Same 2° bucket — do not add another stroke
                         continue
 
                 trail.append({
                     "p0": p0, "p1": p1,
                     "loc0": loc0, "loc1": loc1,
+                    "angle": store_ang,
                 })
                 dirty = True
-                # No max sample cap — keep full trail
         if dirty:
             self._paint_dirty = True
 
@@ -6244,8 +5018,8 @@ class PD_Origami_Simulator:
         Draw locus glued to panels: evaluate stored barycentrics on current x.
         Paths move with the paper — not free-floating 3D polylines.
 
-        Fast path: when sim is paused and the canvas was not restamped, reuse
-        the last GPU line buffer (camera-only motion still works).
+        Matches pre-Taichi packing:
+          per unit trail of node0, trail of node1, then contact-line samples.
         """
         if not hasattr(self, "paint_line_vertices") and not getattr(
             self, "collision_shading", False
@@ -6280,7 +5054,7 @@ class PD_Origami_Simulator:
         # tiny offset so lines win depth buffer without looking off-surface
         lift = max(float(getattr(self, "max_size", 100.0)) * 5e-5, 0.005)
 
-        # Batch all bary evals, then pack line segments
+        # Batch all bary evals, then pack line segments (same as pre-Taichi)
         all_loc0 = []
         all_loc1 = []
         unit_ranges = []  # (start, count) into all_loc*
@@ -6370,345 +5144,9 @@ class PD_Origami_Simulator:
                 ln_buf = full
             self.paint_line_vertices.from_numpy(ln_buf)
 
-    def _build_collision_debug_lines(self):
-        """Build debug text lines (can be cached; window must still draw every frame)."""
-        groups = self.get_collision_groups(include_live=True)
-        n_fixed = len(self._collision_fixed_segments) + len(self._collision_fixed_points)
-        n_live = len(self._collision_active_segments) + len(self._collision_active_points)
-        n_intr = len(self._intruder_classifications)
-        n_paint = int(sum(len(v) for v in (getattr(self, "_paint_canvas", None) or {}).values()))
-        n_strokes = int(getattr(self, "_paint_n_strokes", 0) or 0)
-        lines = [
-            f"GUI red: {self._collision_contact_count} pts, "
-            f"{self._collision_segment_count} segs",
-            f"Locus: {n_paint} samples → {n_strokes} segs "
-            f"(hit-tri bary → panel)",
-            f"Tracked: {n_fixed} fixed + {n_live} live "
-            f"(all tri-pairs) | groups={len(groups)}"
-            + ("  [SEALED@π]" if self._collision_coords_exported else ""),
-            "Paper canvas stamps → affine map onto 3D panel (not mesh tris)",
-        ]
-        shown_groups = 0
-        max_groups = 5
-        for g in groups:
-            if shown_groups >= max_groups:
-                break
-            ip, op = g.get("intruder_panel"), g.get("other_panel")
-            if ip is not None and op is not None:
-                lines.append(
-                    f"-- panels {g['panel_a']}-{g['panel_b']} [{g['status']}]"
-                )
-                lines.append(f"   INTRUDER p{ip} into HOST p{op}")
-            else:
-                lines.append(
-                    f"-- panels {g['panel_a']}-{g['panel_b']} [{g['status']}] "
-                    f"INTRUDER=?"
-                )
-            for seg in g["segments"][:1]:
-                key = self._contact_pair_key(seg)
-                tag = "live" if key in self._collision_active_segments else "done"
-                reason = seg.get("fixed_reason") or ""
-                lock_tag = f" {reason}" if reason else ""
-                lines.append(
-                    f"  [{tag}{lock_tag}] L{seg['layer_idx']} "
-                    f"h={seg['layer_h']:+.4g} "
-                    f"u{seg['unit_a']}-{seg['unit_b']}"
-                )
-                for side_key in ("side_a", "side_b"):
-                    side = seg.get(side_key) or {}
-                    if "p0" not in side:
-                        continue
-                    p0, p1 = side["p0"], side["p1"]
-                    f0 = side.get("first_p0", p0)
-                    f1 = side.get("first_p1", p1)
-                    role = "INTR" if side.get("panel") == ip else (
-                        "HOST" if side.get("panel") == op else "?"
-                    )
-                    lines.append(f"   p{side.get('panel')} [{role}]:")
-                    lines.append(
-                        f"    1st JSON ({f0[0]:.1f},{f0[1]:.1f})--"
-                        f"({f1[0]:.1f},{f1[1]:.1f})"
-                    )
-                    lines.append(
-                        f"    last ({p0[0]:.1f},{p0[1]:.1f})--"
-                        f"({p1[0]:.1f},{p1[1]:.1f})"
-                    )
-            extra_segs = len(g["segments"]) - min(1, len(g["segments"]))
-            if extra_segs > 0:
-                lines.append(f"  ... +{extra_segs} more lines (console)")
-            shown_groups += 1
-        if len(groups) > max_groups:
-            lines.append(f"... +{len(groups) - max_groups} more groups (console)")
 
-        lines.append(f"Live intruders: {n_intr}")
-        for cls in self._intruder_classifications[:4]:
-            lines.append(
-                f"  INTR u{cls['intruder_sim_unit']} -> "
-                f"HOST u{cls['other_sim_unit']}  "
-                f"(dAB={cls['d_AtoB']:+.3f})"
-            )
-        return lines
 
-    def _render_collision_debug_window(self):
-        """
-        Separate ImGui sub-window for collision / cut-node debug text.
 
-        The sub_window is drawn *every* frame (skipping frames causes flicker).
-        Text content is rebuilt only when collision/paint state changes.
-        """
-        cache_key = (
-            int(getattr(self, "_collision_frame_i", 0)),
-            int(self._collision_contact_count),
-            int(self._collision_segment_count),
-            int(getattr(self, "_paint_n_strokes", 0) or 0),
-            len(self._collision_active_segments),
-            len(self._collision_fixed_segments),
-            bool(self._collision_coords_exported),
-            len(self._intruder_classifications),
-        )
-        if (
-            getattr(self, "_debug_lines_key", None) != cache_key
-            or not getattr(self, "_debug_lines", None)
-        ):
-            self._debug_lines = self._build_collision_debug_lines()
-            self._debug_lines_key = cache_key
-
-        # Right side of the main window (normalized 0–1 coords)
-        with self.gui.sub_window(
-            "Collision debug", x=0.62, y=0.02, width=0.36, height=0.70
-        ) as dbg:
-            for line in self._debug_lines:
-                dbg.text(line)
-
-    def _update_intruder_classification(self, positions=None, colliding_unit_pairs=None):
-        """
-        Intruder classification + orange paint — collision-gated.
-
-        Only runs when ``colliding_unit_pairs`` is non-empty (unit pairs that
-        already produced red contact markers in ``detect_panel_collisions``).
-        Empty / None → clear classifications and orange mesh pass.
-        Paints exactly one intruder per colliding pair (never both).
-        """
-        if not hasattr(self, "ori_sim"):
-            self._intruder_classifications = []
-            self._intruder_by_unit_pair = {}
-            self._upload_intruder_panel_indices(set())
-            return
-        if positions is None:
-            positions = self._cache_frame_positions()
-        # Hard gate: no red-line collision pairs → no orange panels
-        if not colliding_unit_pairs:
-            self._intruder_classifications = []
-            self._intruder_by_unit_pair = {}
-            self._upload_intruder_panel_indices(set())
-            return
-        unit_layer_meta = getattr(self, "_collision_unit_layer_meta", None)
-        if not unit_layer_meta:
-            unit_layer_meta = self._build_unit_layer_meta()
-            self._collision_unit_layer_meta = unit_layer_meta
-        try:
-            self._intruder_classifications = classify_colliding_panel_pairs(
-                positions,
-                self.ori_sim.indices,
-                colliding_unit_pairs,
-                unit_layer_meta=unit_layer_meta,
-            )
-        except Exception as exc:
-            if self.verbose:
-                print(f"[Intruder] classification failed: {exc}")
-            self._intruder_classifications = []
-
-        # Fast lookup: (min_unit, max_unit) -> classification (for stamping contacts)
-        pair_map = {}
-        for cls in self._intruder_classifications:
-            ua = int(cls["sim_unit_A"])
-            ub = int(cls["sim_unit_B"])
-            pair_map[(min(ua, ub), max(ua, ub))] = cls
-        self._intruder_by_unit_pair = pair_map
-
-        # Classification runs after contact tracking each frame — re-stamp actives now
-        for ent in self._collision_active_segments.values():
-            self._stamp_intruder_on_entry(ent)
-        for ent in self._collision_active_points.values():
-            self._stamp_intruder_on_entry(ent)
-
-        # Exactly one intruder per colliding pair (union if multiple pairs)
-        intruder_units = {
-            cls["intruder_sim_unit"] for cls in self._intruder_classifications
-        }
-        self._upload_intruder_panel_indices(intruder_units)
-
-    def _upload_intruder_panel_indices(self, intruder_units):
-        """Fill self.intruder_indices with all triangles of intruder sim units."""
-        if not hasattr(self, "intruder_indices"):
-            self._intruder_indice_count = 0
-            return
-        if not intruder_units or not hasattr(self, "ori_sim"):
-            self._intruder_indice_count = 0
-            self.intruder_indices.fill(0)
-            return
-
-        refs = self.ori_sim.tri_indices_ref
-        tri_indices = self.ori_sim.tri_indices
-        num_tris = len(tri_indices) // 3
-        parts = []
-        for uid in sorted(intruder_units):
-            if uid < 0 or uid >= len(refs):
-                continue
-            tri_start = refs[uid]
-            tri_end = refs[uid + 1] if uid + 1 < len(refs) else num_tris
-            if tri_end > tri_start:
-                parts.append(tri_indices[3 * tri_start: 3 * tri_end])
-
-        if not parts:
-            self._intruder_indice_count = 0
-            self.intruder_indices.fill(0)
-            return
-
-        flat = np.concatenate(parts).astype(np.int32)
-        max_n = self.intruder_indices.shape[0]
-        n = min(len(flat), max_n)
-        buf = np.zeros(max_n, dtype=np.int32)
-        buf[:n] = flat[:n]
-        self.intruder_indices.from_numpy(buf)
-        self._intruder_indice_count = n
-
-    def _collect_colliding_unit_pairs_for_trim(self):
-        """
-        Union of unit pairs that produced real triangle contacts during the run
-        (GUI red markers) — used to drive trim cuts beyond fold-adjacent only.
-        """
-        pairs = set()
-
-        def _add(ua, ub):
-            try:
-                ua, ub = int(ua), int(ub)
-            except (TypeError, ValueError):
-                return
-            if ua == ub or ua < 0 or ub < 0:
-                return
-            pairs.add((min(ua, ub), max(ua, ub)))
-
-        # Live / last frame flat contacts
-        for lst_name in (
-            "_collision_contact_segments_flat",
-            "_collision_contact_points_flat",
-        ):
-            for ent in getattr(self, lst_name, None) or []:
-                if "unit_a" in ent and "unit_b" in ent:
-                    _add(ent["unit_a"], ent["unit_b"])
-
-        # Tracked active + fixed (whole fold history)
-        for dct_name in (
-            "_collision_active_segments",
-            "_collision_fixed_segments",
-            "_collision_active_points",
-            "_collision_fixed_points",
-        ):
-            dct = getattr(self, dct_name, None) or {}
-            for ent in dct.values():
-                if "unit_a" in ent and "unit_b" in ent:
-                    _add(ent["unit_a"], ent["unit_b"])
-
-        # Latest orange-paint classifications
-        for cls in getattr(self, "_intruder_classifications", None) or []:
-            if "sim_unit_A" in cls and "sim_unit_B" in cls:
-                _add(cls["sim_unit_A"], cls["sim_unit_B"])
-            if cls.get("intruder_sim_unit") is not None and cls.get("other_sim_unit") is not None:
-                _add(cls["intruder_sim_unit"], cls["other_sim_unit"])
-
-        return pairs
-
-    def save_trimmed_design(self, out_path=None):
-        """
-        Classify intruders from current 3D state, place plane-plane cut lines,
-        and write <origami_name>-trimmed.json (or out_path).
-
-        Uses collision contact pairs (force=True) ∪ fold-adjacent pairs
-        (force on outer thick faces) with oriented normals.
-        """
-        if not hasattr(self, "ori_sim") or not hasattr(self, "input_json"):
-            print("[Trimmer] Simulator not initialized; cannot trim.")
-            return None
-
-        self._render_gen = int(getattr(self, "_render_gen", 0)) + 1
-        x_np = self._cache_frame_positions(force=True)
-        initial_kps_np = np.asarray(self.kps, dtype=float)
-        self._flat_kps_np = initial_kps_np
-        if initial_kps_np.ndim != 2 or initial_kps_np.shape[1] < 3:
-            if initial_kps_np.ndim == 2 and initial_kps_np.shape[1] == 2:
-                z = np.zeros((initial_kps_np.shape[0], 1), dtype=float)
-                initial_kps_np = np.hstack([initial_kps_np, z])
-            else:
-                print("[Trimmer] Invalid initial keypoints; cannot trim.")
-                return None
-
-        unit_layer_meta = getattr(self, "_collision_unit_layer_meta", None)
-        if not unit_layer_meta:
-            unit_layer_meta = self._build_unit_layer_meta()
-            self._collision_unit_layer_meta = unit_layer_meta
-
-        # Refresh contacts at export time when collision shading was enabled
-        if getattr(self, "collision_shading", False):
-            try:
-                if not hasattr(self, "_collision_tri_kp_indices"):
-                    self._build_collision_topology()
-                self.detect_panel_collisions()
-            except Exception as exc:
-                print(f"[Trimmer] detect_panel_collisions at export failed: {exc}")
-
-        colliding_pairs = self._collect_colliding_unit_pairs_for_trim()
-        print(
-            f"[Trimmer] colliding unit pairs for cuts: {len(colliding_pairs)}"
-        )
-
-        result = compute_trimmed_design_from_sim(
-            self.input_json,
-            x_np,
-            initial_kps_np,
-            self.ori_sim.indices,
-            self.ori_sim.indices_crease_type,
-            unit_layer_meta=unit_layer_meta,
-            colliding_unit_pairs=colliding_pairs,
-            force_outer_fold_pairs=True,
-        )
-        # Do NOT repaint orange from fold-adjacent trim classifications.
-        # Orange paint is collision-gated (red markers) and updated only by
-        # detect_panel_collisions → _update_intruder_classification each frame.
-
-        # Attach every tracked contact (matches red GUI contacts over the fold)
-        stats = getattr(self, "_collision_stats", None)
-        try:
-            if not getattr(self, "_collision_coords_exported", False):
-                self._seal_and_export_fixed_flat_contacts()
-            stats = getattr(self, "_collision_stats", None)
-            if stats is None:
-                stats = self.build_collision_stats(include_live=False)
-                self._collision_stats = stats
-        except Exception as exc:
-            print(f"[Trimmer] collision_stats attach skipped: {exc}")
-            stats = None
-        if stats is not None:
-            result["collision_stats"] = stats
-
-        if out_path is None:
-            out_path = os.path.join(
-                "./descriptionData", f"{self.origami_name}-trimmed.json"
-            )
-        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as fw:
-            json.dump(result, fw, indent=4)
-
-        meta = result.get("trim_3d_metadata", {})
-        stats_out = result.get("collision_stats") or {}
-        n_poly = len(stats_out.get("closed_polygons") or [])
-        n_tri = int(stats_out.get("n_closed_triangles", n_poly))
-        print(
-            f"[Trimmer] Saved {out_path}  "
-            f"(pairs={meta.get('n_pairs_checked', '?')}, cuts={meta.get('n_cuts', '?')}, "
-            f"closed_triangles={n_tri})"
-        )
-        return result
 
     def _render_panel_meshes(self, scene):
         """
@@ -6726,7 +5164,6 @@ class PD_Origami_Simulator:
         n_segs = self._collision_segment_count
         has_red_markers = n_pts > 0 or n_segs > 0
 
-        # Skip full-panel orange overlay (extra mesh pass) — locus lines are enough
         # Design-locus strokes on panel surfaces
         if self.collision_shading and hasattr(self, "paint_line_vertices"):
             try:
@@ -6801,7 +5238,7 @@ if __name__ == '__main__':
             pd_global_time=sim.get("pd_global_time", 1),
             pd_iter_time=sim.get("pd_iter_time", 5),
             verbose=sim.get("verbose", False),
-            # Collision / intruder shading is off by default; use panel-trimming/ runner to enable it.
+            # Collision shading is off by default; use panel-trimming/ runner to enable it.
             collision_shading=sim.get("collision_shading", False),
         )
 

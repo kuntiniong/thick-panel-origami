@@ -1,7 +1,7 @@
 """
-Panel-trimming entry point: phys_sim_pd14 with collision_shading ON.
+Collision-shading runner for phys_sim_pd14 (no trimmed-JSON export).
 
-  headless: true  → use_gui=False (run() auto-drives θ 0→π, then export trimmed JSON)
+  headless: true  → use_gui=False (run() auto-drives θ 0→π)
   headless: false → use_gui=True  (interactive GUI)
 
 Usage:
@@ -59,7 +59,7 @@ def run_simulations(
 
         print(f"\n{'=' * 60}")
         print(
-            f"[panel-trimming] Starting: {name}  "
+            f"[collision-shading] Starting: {name}  "
             f"(headless={headless}, collision_shading=True)"
         )
         print(f"{'=' * 60}")
@@ -84,25 +84,16 @@ def run_simulations(
             thick_mode=sim.get("thick_mode", False),
         )
 
-        # Same path as phys_sim_pd14.run():
-        #   use_gui → hold angle; headless → enable_add_folding_angle=0.105 until stop()
+        # use_gui → hold angle; headless → auto-fold until stop()
         ori.run()
-
-        if headless:
-            out = sim.get("trimmed_output")
-            if out and not os.path.isabs(str(out)):
-                out = os.path.join(_ROOT_DIR, str(out))
-            if not out:
-                out = os.path.join(
-                    "./descriptionData", f"{name}-trimmed.json"
-                )
-            print(f"[panel-trimming] Exporting trimmed design → {out}")
-            ori.save_trimmed_design(out_path=out)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Panel trimming. headless=true: no GUI (run auto-folds 0→π) + export."
+        description=(
+            "Run phys_sim_pd14 with collision_shading. "
+            "headless=true: no GUI (auto-folds 0→π)."
+        )
     )
     parser.add_argument(
         "--config",
@@ -136,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
                 "unit_edge_max": 4,
                 "fast": True,
             }]
-            print(f"[panel-trimming] No config entry for '{args.name}'; using defaults.")
+            print(f"[collision-shading] No config entry for '{args.name}'; using defaults.")
 
     run_simulations(simulations, cli_headless=args.headless)
     return 0
