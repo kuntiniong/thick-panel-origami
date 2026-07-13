@@ -13,11 +13,6 @@ data_type = ti.f64
 numpy_data_type = np.float64
 use_gpu = 0
 
-# Contact locus / paint sampling: one stroke per discrete fold-angle bin.
-# Bins are fixed at 2° so density does not depend on frame rate or fold speed.
-SWEEP_SAMPLE_STEP_DEG = 2.0
-SWEEP_SAMPLE_STEP_RAD = SWEEP_SAMPLE_STEP_DEG * np.pi / 180.0  # float64
-
 if use_gpu:
     ti.init(arch=ti.gpu, default_fp=data_type, fast_math=False, advanced_optimization=False, kernel_profiler=True)
 else:
@@ -180,14 +175,14 @@ class PD_Origami_Simulator:
         self._collision_coords_exported = False  # sealed at π (no more trail growth)
         self._sweep_draw_stopped = False  # True once θ hits π — no more paint growth
         # Locus paint: path of two contact nodes + the line (design xy → panel).
-        self._paint_canvas = {}          # unit_id -> list[{p0,p1}]
+        # Host canvas stores bary locs; reprojected onto live x (af0a695 min_move).
+        self._paint_canvas = {}          # unit_id -> list[{p0,p1,loc0,loc1}]
         self._paint_line_vert_count = 0
         self._paint_n_strokes = 0
-        # Starting buffer size only — grows as needed (no line cap)
+        # Starting buffer size only — grows as needed (no hard line cap)
         self._paint_max_line_verts = 8192
-        # Angle step for paint strokes (radians); default 2°
-        self._paint_angle_step_rad = float(SWEEP_SAMPLE_STEP_RAD)
-        # Collision / paint are expensive in pure Python — throttle hard
+        self._paint_min_move = None      # lazy from max_size
+        # Collision postprocess is still host-side — throttle when not folding
         self._collision_frame_i = 0
         self._collision_every_n = 4      # run broadphase every N render frames
         self._paint_dirty = False
@@ -196,7 +191,6 @@ class PD_Origami_Simulator:
         self._frame_positions_gen = -1
         self._render_gen = 0
         self._stamp_paint_needed = False
-        self._crease_pairs_np = None
         self._flat_kps_np = None
         self._mesh_advanced = True
         self._collision_ran_once = False
@@ -2754,7 +2748,6 @@ class PD_Origami_Simulator:
         self.scene.lines(vertices=self.line_vertex,
                     width=2,
                     per_vertex_color=self.line_color)
-
         self.canvas.scene(self.scene)
         try:
             folder = f'./physResult/cdf-' + self.origami_name
@@ -2858,11 +2851,9 @@ class PD_Origami_Simulator:
         self.scene.lines(vertices=self.line_vertex,
                     width=2,
                     per_vertex_color=self.line_color)
-
         # Main control panel (sliders only — collision debug is a separate window)
         self.gui.text(f"System time: {round(self.current_t, 3)}s")
         self.gui.text(f"Energy: {round(self.energy[None], 3)}")
-
         # for i in range(self.split_origami_num):
         #     self.gui.text(f"Sub-energy: {round(self.split_energy[i], 3)}")
 
@@ -2903,14 +2894,10 @@ class PD_Origami_Simulator:
         self.initializeRunning()
         # GUI: hold angle (use slider / i=start, k=stop, m=reverse).
         # Headless: auto-drive fold target each step (same as phy_sim_target).
-        # With collision shading, step by 2° so locus lines align with angle samples.
         if self.use_gui:
             self.enable_add_folding_angle = 0.0
         else:
-            if getattr(self, "collision_shading", False):
-                self.enable_add_folding_angle = float(SWEEP_SAMPLE_STEP_RAD)  # 2°
-            else:
-                self.enable_add_folding_angle = 0.105
+            self.enable_add_folding_angle = 0.105
         while self.window.running:
             self.step()
             # ti.profiler.print_kernel_profiler_info()  # 看每个kernel的执行时间、线程数
@@ -3419,44 +3406,6 @@ class PD_Origami_Simulator:
                     self.coll_hit_panel_b[idx] = panel_a
                 self.coll_hit_layer[idx] = layer_a
 
-    def _stop_sweep_drawing_at_pi(self):
-        """
-        Immediately freeze locus paint when θ hits π.
-
-        Called from update_folding_target / slider / 'u' so drawing stops on the
-        same step the clamp happens — not delayed until the next collision frame.
-        """
-        if getattr(self, "_sweep_draw_stopped", False):
-            return
-        self._sweep_draw_stopped = True
-        # No further canvas stamps or trail growth / reproject
-        self._paint_dirty = False
-        self._stamp_paint_needed = False
-        # Drop live red contact markers (locus strokes stay frozen as last drawn)
-        self._collision_contact_count = 0
-        self._collision_segment_count = 0
-        self._collision_contact_points_list = []
-        self._collision_contact_segments_list = []
-        self._collision_contact_points_flat = []
-        self._collision_contact_segments_flat = []
-        if getattr(self, "_collision_coords_exported", False):
-            return
-        angle = float(getattr(self, "folding_angle", 3.1415))
-        for ent in (getattr(self, "_collision_active_segments", None) or {}).values():
-            for sk in ("side_a", "side_b"):
-                side = ent.get(sk)
-                if side is not None and "p0" in side:
-                    try:
-                        self._append_sweep_sample_2d(side, angle, force=True)
-                    except Exception:
-                        pass
-        try:
-            self._seal_fixed_flat_contacts(reason="fold_pi")
-        except Exception as exc:
-            if getattr(self, "verbose", False):
-                print(f"[Contact] seal@π failed: {exc}")
-            self._collision_coords_exported = True
-
     def _maybe_detect_panel_collisions(self):
         """
         Throttle collision broadphase / paint. Full triangle tests every frame
@@ -3711,8 +3660,10 @@ class PD_Origami_Simulator:
             try:
                 self._stamp_paint_canvas_from_contacts()
                 self._stamp_paint_needed = False
-            except Exception:
-                pass
+            except Exception as exc:
+                if not getattr(self, "_stamp_paint_error_logged", False):
+                    self._stamp_paint_error_logged = True
+                    print(f"[Paint] stamp failed: {exc}")
 
         # Upload red markers for GUI (f32 renderer buffers)
         pt_buf = np.zeros((max_pts, 3), dtype=np.float32)
@@ -3754,176 +3705,8 @@ class PD_Origami_Simulator:
         return (ua, ub, layer, -1, -1)
 
     # 4. sweeping visualization
-
-    @staticmethod
-    def _copy_sweep_samples(samples):
-        """Deep-copy a list of 2D line samples {angle, p0, p1}."""
-        if not samples:
-            return []
-        out = []
-        for s in samples:
-            if s is None or "p0" not in s or "p1" not in s:
-                continue
-            out.append({
-                "angle": float(s.get("angle", 0.0)),
-                "p0": [float(s["p0"][0]), float(s["p0"][1])],
-                "p1": [float(s["p1"][0]), float(s["p1"][1])],
-            })
-        return out
-
-    @staticmethod
-    def _copy_loc(loc):
-        """Copy material barycentric handle (i0,i1,i2,u,v,w)."""
-        if loc is None:
-            return None
-        try:
-            return (
-                int(loc[0]), int(loc[1]), int(loc[2]),
-                float(loc[3]), float(loc[4]), float(loc[5]),
-            )
-        except (TypeError, ValueError, IndexError):
-            return None
-
-    @staticmethod
-    def _copy_side_seg(side):
-        if not side:
-            return None
-        out = {
-            "unit": int(side["unit"]),
-            "panel": int(side["panel"]),
-            "p0": [float(side["p0"][0]), float(side["p0"][1])],
-            "p1": [float(side["p1"][0]), float(side["p1"][1])],
-        }
-        # Material handles from the hit triangle (for on-panel locus redraw)
-        if side.get("loc0") is not None:
-            out["loc0"] = PD_Origami_Simulator._copy_loc(side["loc0"])
-        if side.get("loc1") is not None:
-            out["loc1"] = PD_Origami_Simulator._copy_loc(side["loc1"])
-        # first_* = paper coords snapped onto a real crease (not noisy first contact)
-        if "first_p0" in side and "first_p1" in side:
-            out["first_p0"] = [float(side["first_p0"][0]), float(side["first_p0"][1])]
-            out["first_p1"] = [float(side["first_p1"][0]), float(side["first_p1"][1])]
-            out["first_folding_angle"] = float(side.get("first_folding_angle", 0.0))
-        # 2D sweep trail: successive positions of the two-node contact line
-        if side.get("sweep_samples"):
-            out["sweep_samples"] = PD_Origami_Simulator._copy_sweep_samples(
-                side["sweep_samples"]
-            )
-        return out
-
-    @staticmethod
-    def _copy_side_pt(side):
-        if not side:
-            return None
-        out = {
-            "unit": int(side["unit"]),
-            "panel": int(side["panel"]),
-            "p": [float(side["p"][0]), float(side["p"][1])],
-        }
-        if "first_p" in side:
-            out["first_p"] = [float(side["first_p"][0]), float(side["first_p"][1])]
-            out["first_folding_angle"] = float(side.get("first_folding_angle", 0.0))
-        return out
-
-    @classmethod
-    def _copy_segment_entry(cls, s):
-        """Copy segment: live endpoints + optional crease-snapped first + lock meta."""
-        side_a = s.get("side_a")
-        side_b = s.get("side_b")
-        if side_a is None and "p0" in s:
-            side_a = {
-                "unit": int(s["unit_a"]),
-                "panel": int(s.get("panel_of_unit_a", s.get("panel_a", -1))),
-                "p0": s["p0"], "p1": s["p1"],
-            }
-            if "first_p0" in s:
-                side_a["first_p0"] = s["first_p0"]
-                side_a["first_p1"] = s["first_p1"]
-                side_a["first_folding_angle"] = s.get("first_folding_angle", 0.0)
-        out = {
-            "layer_idx": int(s["layer_idx"]),
-            "layer_h": float(s["layer_h"]),
-            "unit_a": int(s["unit_a"]),
-            "unit_b": int(s["unit_b"]),
-            "panel_a": int(s.get("panel_a", -1)),
-            "panel_b": int(s.get("panel_b", -1)),
-            "panel_of_unit_a": int(s.get("panel_of_unit_a", s.get("panel_a", -1))),
-            "panel_of_unit_b": int(s.get("panel_of_unit_b", s.get("panel_b", -1))),
-            "folding_angle": float(s.get("folding_angle", 0.0)),
-            "d_AtoB": s.get("d_AtoB"),
-            "d_BtoA": s.get("d_BtoA"),
-            "side_a": cls._copy_side_seg(side_a),
-            "side_b": cls._copy_side_seg(side_b),
-            "coords_locked": bool(s.get("coords_locked", False)),
-            "fixed_reason": s.get("fixed_reason"),
-            "first_locked": bool(s.get("first_locked", False)),
-        }
-        for tk in ("tri_a", "tri_b", "tri_lo", "tri_hi"):
-            if s.get(tk) is not None:
-                out[tk] = int(s[tk])
-        if s.get("first_kp0") is not None:
-            out["first_kp0"] = int(s["first_kp0"])
-            out["first_kp1"] = int(s["first_kp1"])
-        if s.get("p0_3d") is not None:
-            out["p0_3d"] = [float(x) for x in s["p0_3d"][:3]]
-        if s.get("p1_3d") is not None:
-            out["p1_3d"] = [float(x) for x in s["p1_3d"][:3]]
-        if out["side_a"] is not None:
-            out["p0"] = list(out["side_a"]["p0"])
-            out["p1"] = list(out["side_a"]["p1"])
-            if "first_p0" in out["side_a"]:
-                out["first_p0"] = list(out["side_a"]["first_p0"])
-                out["first_p1"] = list(out["side_a"]["first_p1"])
-                out["first_folding_angle"] = float(
-                    out["side_a"].get("first_folding_angle", 0.0)
-                )
-        elif out["side_b"] is not None:
-            out["p0"] = list(out["side_b"]["p0"])
-            out["p1"] = list(out["side_b"]["p1"])
-            if "first_p0" in out["side_b"]:
-                out["first_p0"] = list(out["side_b"]["first_p0"])
-                out["first_p1"] = list(out["side_b"]["first_p1"])
-                out["first_folding_angle"] = float(
-                    out["side_b"].get("first_folding_angle", 0.0)
-                )
-        elif "p0" in s:
-            out["p0"] = [float(s["p0"][0]), float(s["p0"][1])]
-            out["p1"] = [float(s["p1"][0]), float(s["p1"][1])]
-        return out
-
-    @staticmethod
-    def _order_last_to_first(ent):
-        """
-        Order live/locked last endpoints so
-          first_p0 → first_p1 → last_p1 → last_p0
-        is a simple quad (no bow-tie): last_p0 near first_p0, last_p1 near first_p1.
-        """
-        f0 = ent.get("first_p0")
-        f1 = ent.get("first_p1")
-        if f0 is None or f1 is None:
-            return ent
-        f0 = np.asarray(f0, dtype=float)
-        f1 = np.asarray(f1, dtype=float)
-
-        def _order_side(side):
-            if side is None or "p0" not in side:
-                return
-            a = np.asarray(side["p0"], dtype=float)
-            b = np.asarray(side["p1"], dtype=float)
-            # pairing A: a↔f0, b↔f1  vs  B: a↔f1, b↔f0
-            cost_a = float(np.linalg.norm(a - f0) + np.linalg.norm(b - f1))
-            cost_b = float(np.linalg.norm(a - f1) + np.linalg.norm(b - f0))
-            if cost_b < cost_a:
-                side["p0"], side["p1"] = list(b), list(a)
-                if side.get("loc0") is not None and side.get("loc1") is not None:
-                    side["loc0"], side["loc1"] = side["loc1"], side["loc0"]
-
-        for sk in ("side_a", "side_b"):
-            _order_side(ent.get(sk))
-        if ent.get("side_a"):
-            ent["p0"] = list(ent["side_a"]["p0"])
-            ent["p1"] = list(ent["side_a"]["p1"])
-        return ent
+    # Contact dicts from collision are adopted by reference (no deep-copy /
+    # export snapshots). Trail lists are carried across frames by reference.
 
     @staticmethod
     def _order_segment_endpoints_2d(p0, p1, ref0=None, ref1=None):
@@ -3965,39 +3748,38 @@ class PD_Origami_Simulator:
 
     @classmethod
     def _maybe_seed_sweep_with_first(cls, side):
-        """No-op: sweep strokes stay on strict 2° bins only (no extra crease seed)."""
-        return
-
-    @staticmethod
-    def _sweep_angle_bin(angle_rad, step_rad=None):
-        """Discrete fold-angle bin index (0,1,2,…); each bin is ``step_rad`` wide (default 2°)."""
-        step = float(SWEEP_SAMPLE_STEP_RAD if step_rad is None else step_rad)
-        if step <= 0.0:
-            return 0
-        a = float(angle_rad)
-        if a < 0.0:
-            a = 0.0
-        return int(np.floor(a / step + 1e-12))
+        """Prepend crease-snapped first line if trail exists but was not seeded yet."""
+        if side is None or "first_p0" not in side or "first_p1" not in side:
+            return
+        samples = side.get("sweep_samples")
+        if not samples:
+            return
+        f0 = [float(side["first_p0"][0]), float(side["first_p0"][1])]
+        f1 = [float(side["first_p1"][0]), float(side["first_p1"][1])]
+        if float(np.hypot(f1[0] - f0[0], f1[1] - f0[1])) < 1e-12:
+            return
+        s0 = samples[0]
+        d = cls._segment_mid_dist_2d(s0["p0"], s0["p1"], f0, f1)
+        if d < 1e-6:
+            return
+        samples.insert(0, {
+            "angle": float(side.get("first_folding_angle", s0.get("angle", 0.0))),
+            "p0": f0,
+            "p1": f1,
+        })
 
     @classmethod
-    def _append_sweep_sample_2d(
-        cls, side, angle, force=False, min_move=None, max_samples=None,
-        angle_step=None,
-    ):
+    def _append_sweep_sample_2d(cls, side, angle, min_move=0.15, max_samples=None):
         """
-        Append current side p0–p1 to a 2D sweep trail.
+        Append current side p0–p1 to a 2D sweep trail (af0a695 non-Taichi).
 
-        **Strict 2° bins** (independent of fold speed / frame rate):
-          at most one sample per floor(θ / 2°) bucket.
-        ``force=True`` only refreshes the tip if the bin is already recorded;
-        it does not invent extra intermediate angles.
+        - Seeds trail with crease-snapped first_* when present
+        - Skips samples that barely moved (min_move)
+        - Endpoint order stabilized against previous sample
+        - No sample count cap
         """
         if side is None or "p0" not in side or "p1" not in side:
             return
-        # Legacy: min_move=0 meant “accept tip”
-        if min_move is not None and float(min_move) <= 0.0:
-            force = True
-
         p0 = [float(side["p0"][0]), float(side["p0"][1])]
         p1 = [float(side["p1"][0]), float(side["p1"][1])]
         dx = p1[0] - p0[0]
@@ -4010,415 +3792,44 @@ class PD_Origami_Simulator:
             samples = []
             side["sweep_samples"] = samples
 
-        step = float(
-            angle_step if angle_step is not None else SWEEP_SAMPLE_STEP_RAD
-        )
-        ang = float(angle)
-        bin_i = cls._sweep_angle_bin(ang, step)
-        store_ang = float(bin_i) * step  # quantized angle for this stroke
+        if not samples and "first_p0" in side and "first_p1" in side:
+            f0 = [float(side["first_p0"][0]), float(side["first_p0"][1])]
+            f1 = [float(side["first_p1"][0]), float(side["first_p1"][1])]
+            fdx = f1[0] - f0[0]
+            fdy = f1[1] - f0[1]
+            if (fdx * fdx + fdy * fdy) >= 1e-24:
+                samples.append({
+                    "angle": float(side.get("first_folding_angle", angle)),
+                    "p0": f0,
+                    "p1": f1,
+                })
 
         if samples:
             last = samples[-1]
             p0, p1 = cls._order_segment_endpoints_2d(p0, p1, last["p0"], last["p1"])
-            last_bin = cls._sweep_angle_bin(last.get("angle", 0.0), step)
-            if bin_i == last_bin:
-                if force:
-                    # Same 2° bucket: refresh tip geometry only (no denser trail)
-                    samples[-1] = {"angle": store_ang, "p0": p0, "p1": p1}
+            moved = cls._segment_mid_dist_2d(last["p0"], last["p1"], p0, p1)
+            e0x = p0[0] - last["p0"][0]
+            e0y = p0[1] - last["p0"][1]
+            e1x = p1[0] - last["p1"][0]
+            e1y = p1[1] - last["p1"][1]
+            end_move = max((e0x * e0x + e0y * e0y) ** 0.5, (e1x * e1x + e1y * e1y) ** 0.5)
+            mm = float(min_move)
+            if moved < mm and end_move < mm:
+                if moved < 1e-9:
+                    return
+                samples[-1] = {"angle": float(angle), "p0": p0, "p1": p1}
                 return
 
-        samples.append({"angle": store_ang, "p0": p0, "p1": p1})
-
-    @classmethod
-    def sweep_paint_polygon_2d(cls, samples):
-        """
-        Build the 2D paint region swept by successive two-node contact lines.
-
-        samples: list of {p0, p1} in design xy.
-        Returns ordered closed ring [p0_0..p0_n, p1_n..p1_0] or None if < 2 samples
-        (or a single-sample degenerate band with zero area).
-        Purely 2D — no 3D geometry.
-        """
-        if not samples:
-            return None
-        # Stabilize endpoint pairing along the whole trail
-        ordered = []
-        prev0 = prev1 = None
-        for s in samples:
-            if s is None or "p0" not in s or "p1" not in s:
-                continue
-            p0, p1 = cls._order_segment_endpoints_2d(s["p0"], s["p1"], prev0, prev1)
-            ordered.append((p0, p1))
-            prev0, prev1 = p0, p1
-        if not ordered:
-            return None
-        if len(ordered) == 1:
-            # Single line: no area yet — return None (caller may use first/last triangle)
-            return None
-        trail0 = [p0 for p0, _ in ordered]
-        trail1 = [p1 for _, p1 in ordered]
-        poly = [[float(p[0]), float(p[1])] for p in trail0]
-        poly += [[float(p[0]), float(p[1])] for p in reversed(trail1)]
-        # Drop near-duplicate consecutive verts
-        cleaned = [poly[0]]
-        for q in poly[1:]:
-            prev = cleaned[-1]
-            if abs(q[0] - prev[0]) > 1e-9 or abs(q[1] - prev[1]) > 1e-9:
-                cleaned.append(q)
-        if len(cleaned) < 3:
-            return None
-        area = cls._polygon_area_2d(cleaned)
-        if area < 1e-12:
-            return None
-        return cleaned
-
-    @staticmethod
-    def _polygon_area_2d(pts):
-        """Absolute shoelace area of a 2D ring (list of [x,y])."""
-        n = len(pts) if pts is not None else 0
-        if n < 3:
-            return 0.0
-        acc = 0.0
-        for i in range(n):
-            x0 = float(pts[i][0])
-            y0 = float(pts[i][1])
-            x1 = float(pts[(i + 1) % n][0])
-            y1 = float(pts[(i + 1) % n][1])
-            acc += x0 * y1 - x1 * y0
-        return abs(acc) * 0.5
-
-    @staticmethod
-    def closed_polygon_from_first_last(ent, side_key="side_a"):
-        """
-        Build a closed 4-gon from JSON crease first + locked last on one side:
-          [first_p0, first_p1, last_p1, last_p0]
-        Returns list of [x,y] or None. (Legacy / debug; shading uses the triangle.)
-        """
-        side = ent.get(side_key) or ent
-        f0 = side.get("first_p0", ent.get("first_p0"))
-        f1 = side.get("first_p1", ent.get("first_p1"))
-        p0 = side.get("p0", ent.get("p0"))
-        p1 = side.get("p1", ent.get("p1"))
-        if f0 is None or f1 is None or p0 is None or p1 is None:
-            return None
-        return [
-            [float(f0[0]), float(f0[1])],
-            [float(f1[0]), float(f1[1])],
-            [float(p1[0]), float(p1[1])],
-            [float(p0[0]), float(p0[1])],
-        ]
-
-    @classmethod
-    def closed_triangle_max_area_from_first_last(cls, ent, side_key="side_a"):
-        """
-        Closed triangle helper (first edge + max-area last apex).
-
-        Always uses both first crease endpoints. From the two last endpoints,
-        keeps the apex that forms the *larger-area* triangle:
-
-          T0 = [first_p0, first_p1, last_p0]
-          T1 = [first_p0, first_p1, last_p1]
-
-        Returns dict:
-          triangle      list of 3 [x,y]
-          area          float
-          last_index    0 or 1 (which last endpoint was chosen)
-          last_point    [x,y] apex
-          first_p0/p1   the fixed first edge
-        or None if inputs are incomplete / both areas ~0.
-        """
-        side = ent.get(side_key) or ent
-        f0 = side.get("first_p0", ent.get("first_p0"))
-        f1 = side.get("first_p1", ent.get("first_p1"))
-        p0 = side.get("p0", ent.get("p0"))
-        p1 = side.get("p1", ent.get("p1"))
-        if f0 is None or f1 is None or p0 is None or p1 is None:
-            return None
-        f0 = [float(f0[0]), float(f0[1])]
-        f1 = [float(f1[0]), float(f1[1])]
-        lasts = [
-            [float(p0[0]), float(p0[1])],
-            [float(p1[0]), float(p1[1])],
-        ]
-        best = None
-        best_area = -1.0
-        for idx, apex in enumerate(lasts):
-            tri = [f0, f1, apex]
-            area = cls._polygon_area_2d(tri)
-            if area > best_area:
-                best_area = area
-                best = {
-                    "triangle": tri,
-                    "area": float(area),
-                    "last_index": int(idx),
-                    "last_point": list(apex),
-                    "first_p0": list(f0),
-                    "first_p1": list(f1),
-                }
-        if best is None or best_area < 1e-18:
-            return None
-        return best
-
-    @classmethod
-    def _copy_point_entry(cls, e):
-        side_a = e.get("side_a")
-        side_b = e.get("side_b")
-        if side_a is None and "p" in e:
-            side_a = {
-                "unit": int(e["unit_a"]),
-                "panel": int(e.get("panel_of_unit_a", e.get("panel_a", -1))),
-                "p": e["p"],
-            }
-        out = {
-            "layer_idx": int(e["layer_idx"]),
-            "layer_h": float(e["layer_h"]),
-            "unit_a": int(e["unit_a"]),
-            "unit_b": int(e["unit_b"]),
-            "panel_a": int(e.get("panel_a", -1)),
-            "panel_b": int(e.get("panel_b", -1)),
-            "panel_of_unit_a": int(e.get("panel_of_unit_a", e.get("panel_a", -1))),
-            "panel_of_unit_b": int(e.get("panel_of_unit_b", e.get("panel_b", -1))),
-            "folding_angle": float(e.get("folding_angle", 0.0)),
-            "d_AtoB": e.get("d_AtoB"),
-            "d_BtoA": e.get("d_BtoA"),
-            "side_a": cls._copy_side_pt(side_a),
-            "side_b": cls._copy_side_pt(side_b),
-        }
-        for tk in ("tri_a", "tri_b", "tri_lo", "tri_hi"):
-            if e.get(tk) is not None:
-                out[tk] = int(e[tk])
-        if e.get("p_3d") is not None:
-            out["p_3d"] = [float(x) for x in e["p_3d"][:3]]
-        if out["side_a"] is not None:
-            out["p"] = list(out["side_a"]["p"])
-        elif out["side_b"] is not None:
-            out["p"] = list(out["side_b"]["p"])
-        elif "p" in e:
-            out["p"] = [float(e["p"][0]), float(e["p"][1])]
-        return out
-
-
-    @staticmethod
-    def _segment_length_xy(s):
-        if "p0" in s and "p1" in s and s["p0"] is not None and s["p1"] is not None:
-            p0, p1 = s["p0"], s["p1"]
-            return float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
-        # Fall back to 3D length when flat map was partial / missing
-        if s.get("p0_3d") is not None and s.get("p1_3d") is not None:
-            a = np.asarray(s["p0_3d"], dtype=float)
-            b = np.asarray(s["p1_3d"], dtype=float)
-            return float(np.linalg.norm(b - a))
-        return 0.0
-
-    @staticmethod
-    def _point_segment_distance_3d(p, a, b):
-        """Distance from point p to segment ab in 3D (pure Python, hot path)."""
-        px, py, pz = float(p[0]), float(p[1]), float(p[2])
-        ax, ay, az = float(a[0]), float(a[1]), float(a[2])
-        bx, by, bz = float(b[0]), float(b[1]), float(b[2])
-        abx, aby, abz = bx - ax, by - ay, bz - az
-        lab2 = abx * abx + aby * aby + abz * abz
-        if lab2 < 1e-18:
-            dx, dy, dz = px - ax, py - ay, pz - az
-            return (dx * dx + dy * dy + dz * dz) ** 0.5
-        t = ((px - ax) * abx + (py - ay) * aby + (pz - az) * abz) / lab2
-        if t < 0.0:
-            t = 0.0
-        elif t > 1.0:
-            t = 1.0
-        dx = px - (ax + t * abx)
-        dy = py - (ay + t * aby)
-        dz = pz - (az + t * abz)
-        return (dx * dx + dy * dy + dz * dz) ** 0.5
-
-    def _get_crease_pairs_np(self):
-        """Cached crease endpoint indices (host array)."""
-        cached = getattr(self, "_crease_pairs_np", None)
-        if cached is not None:
-            return cached
-        n = int(getattr(self, "crease_pairs_num", 0) or 0)
-        if n <= 0 or not hasattr(self, "crease_pairs"):
-            self._crease_pairs_np = np.zeros((0, 2), dtype=np.int32)
-            return self._crease_pairs_np
-        try:
-            pairs = self.crease_pairs.to_numpy() if hasattr(self.crease_pairs, "to_numpy") else None
-        except Exception:
-            pairs = None
-        if pairs is None:
-            pairs = np.array(
-                [[int(self.crease_pairs[i, 0]), int(self.crease_pairs[i, 1])] for i in range(n)],
-                dtype=np.int32,
-            )
-        else:
-            pairs = np.asarray(pairs[:n], dtype=np.int32)
-        self._crease_pairs_np = pairs
-        return pairs
-
-    def _fold_crease_records(self, positions):
-        """
-        Mountain/valley creases with both live 3D and design (paper) flat ends.
-
-        Each record:
-          a3d, b3d  — current sim positions
-          a_flat, b_flat — design xy from self.kps (true paper line)
-        """
-        recs = []
-        pairs = self._get_crease_pairs_np()
-        if pairs is None or len(pairs) == 0:
-            return recs
-        flat_kps = getattr(self, "_flat_kps_np", None)
-        if flat_kps is None:
-            flat_kps = np.asarray(self.kps, dtype=numpy_data_type)
-            self._flat_kps_np = flat_kps
-        n_pos = len(positions)
-        n_flat = len(flat_kps)
-        for i0, i1 in pairs:
-            i0 = int(i0)
-            i1 = int(i1)
-            if i0 < 0 or i1 < 0 or i0 >= n_pos or i1 >= n_pos:
-                continue
-            if i0 >= n_flat or i1 >= n_flat:
-                continue
-            recs.append({
-                "a3d": positions[i0][:3],
-                "b3d": positions[i1][:3],
-                "a_flat": flat_kps[i0][:2],
-                "b_flat": flat_kps[i1][:2],
-                "i0": i0,
-                "i1": i1,
-            })
-        return recs
-
-    def _fold_crease_segments_3d(self, positions):
-        """3D crease segments only (compatibility helper)."""
-        return [(r["a3d"], r["b3d"]) for r in self._fold_crease_records(positions)]
-
-    def _unit_kp_set(self, sim_unit_id):
-        """Set of keypoint indices owned by a sim unit."""
-        if not hasattr(self, "ori_sim") or sim_unit_id is None:
-            return set()
-        try:
-            raw = self.ori_sim.indices[int(sim_unit_id)]
-        except Exception:
-            return set()
-        return {int(j) for j in raw if int(j) >= 0}
-
-    def _shared_crease_record(self, unit_a, unit_b, crease_recs):
-        """
-        Shared mountain/valley crease between two units: both crease
-        endpoints belong to both panels (the common fold edge).
-        """
-        va = self._unit_kp_set(unit_a)
-        vb = self._unit_kp_set(unit_b)
-        if not va or not vb:
-            return None
-        for r in crease_recs:
-            i0, i1 = r["i0"], r["i1"]
-            if i0 in va and i1 in va and i0 in vb and i1 in vb:
-                return r
-        return None
-
-    def _nearest_crease_vertex_json(self, p3d, crease_recs):
-        """
-        Snap p3d to the nearest *actual JSON keypoint* that is a crease end
-        (not an interpolated point on the segment).
-
-        Returns (kp_index, flat_xy, dist3d) or (None, None, inf).
-        """
-        if not crease_recs:
-            return None, None, float("inf")
-        p = np.asarray(p3d, dtype=float).reshape(3)
-        best_i = None
-        best_f = None
-        best_d = float("inf")
-        seen = set()
-        for r in crease_recs:
-            for key, flat_key in (("i0", "a_flat"), ("i1", "b_flat")):
-                ii = r[key]
-                if ii in seen:
-                    continue
-                seen.add(ii)
-                q = r["a3d"] if key == "i0" else r["b3d"]
-                d = float(np.linalg.norm(p - q))
-                if d < best_d:
-                    best_d = d
-                    best_i = ii
-                    best_f = [float(r[flat_key][0]), float(r[flat_key][1])]
-        return best_i, best_f, best_d
-
-    def _json_crease_first_pair(self, p0_3d, p1_3d, crease_recs, unit_a=None, unit_b=None):
-        """
-        first endpoints = real JSON keypoint coordinates on creases.
-
-        Priority:
-          1) Shared fold edge between unit_a and unit_b → exact crease kps
-          2) Else nearest crease *vertex* (JSON kp) for each contact node
-
-        Returns (f0, f1, d0, d1, kp0, kp1) or Nones.
-        """
-        # 1) Shared crease between the two panels — true fold edge on the paper
-        shared = None
-        if unit_a is not None and unit_b is not None:
-            shared = self._shared_crease_record(unit_a, unit_b, crease_recs)
-        if shared is not None:
-            f0 = [float(shared["a_flat"][0]), float(shared["a_flat"][1])]
-            f1 = [float(shared["b_flat"][0]), float(shared["b_flat"][1])]
-            # Distance of contact segment mid to that crease (for "near" test)
-            mid = 0.5 * (
-                np.asarray(p0_3d, dtype=float)[:3]
-                + np.asarray(p1_3d, dtype=float)[:3]
-            )
-            d_mid = self._point_segment_distance_3d(
-                mid, shared["a3d"], shared["b3d"]
-            )
-            return f0, f1, d_mid, d_mid, int(shared["i0"]), int(shared["i1"])
-
-        # 2) Snap each contact node to nearest crease vertex (defined in JSON)
-        i0, f0, d0 = self._nearest_crease_vertex_json(p0_3d, crease_recs)
-        i1, f1, d1 = self._nearest_crease_vertex_json(p1_3d, crease_recs)
-        if f0 is None or f1 is None:
-            return None, None, float("inf"), float("inf"), None, None
-
-        # If both snapped to the same kp, use that kp's full crease endpoints
-        if i0 is not None and i0 == i1:
-            for r in crease_recs:
-                if r["i0"] == i0 or r["i1"] == i0:
-                    f0 = [float(r["a_flat"][0]), float(r["a_flat"][1])]
-                    f1 = [float(r["b_flat"][0]), float(r["b_flat"][1])]
-                    i0, i1 = int(r["i0"]), int(r["i1"])
-                    break
-
-        if float(np.hypot(f1[0] - f0[0], f1[1] - f0[1])) < 1e-9:
-            return None, None, d0, d1, None, None
-        return f0, f1, d0, d1, i0, i1
-
-    def _endpoints_off_creases(self, p0_3d, p1_3d, crease_segs, tol):
-        """
-        True when BOTH contact nodes are farther than tol from every crease.
-        Segment must still exist (caller guarantees both endpoints present).
-        """
-        if p0_3d is None or p1_3d is None or not crease_segs:
-            return False
-        def _off(p):
-            for a, b in crease_segs:
-                if self._point_segment_distance_3d(p, a, b) <= tol:
-                    return False
-            return True
-        return _off(p0_3d) and _off(p1_3d)
+        samples.append({"angle": float(angle), "p0": p0, "p1": p1})
 
     def _track_per_pair_flat_contacts(self):
         """
         Track every red contact (one slot per triangle–triangle pair).
 
-        - **first**: actual JSON crease *keypoint* coords (shared fold edge
-          endpoints, or nearest crease vertices) — discrete design vertices
-          so first+last can form a closed polygon on the paper.
-        - **last (p0/p1)**: live contact flat map; locked when both nodes leave
-          the creases (or contact ends).
-        - **sweep (2D paint)**: successive p0–p1 samples on the design plane
-          while the contact line is live. The ribbon those samples sweep out
-          is the 2D panel paint region (no 3D paint geometry) and the
-          paint region coordinates.
+        - **live p0/p1**: current flat-mapped contact line
+        - **sweep**: successive p0–p1 samples while the contact is live
+          (reprojected onto panels as locus strokes)
+        - **lock**: when the contact disappears, or fold hits π
 
         Multiple concurrent segments between the same unit pair are all kept
         (keyed by tri_a/tri_b), matching the GUI red lines.
@@ -4440,23 +3851,15 @@ class PD_Origami_Simulator:
                 return
 
         angle = float(self.folding_angle)
-        positions = self._cache_frame_positions()
-        crease_recs = self._fold_crease_records(positions)
-        crease_segs = [(r["a3d"], r["b3d"]) for r in crease_recs]
-        crease_tol = max(float(getattr(self, "max_size", 100.0)) * 0.012, 0.35)
-        # One stroke every SWEEP_SAMPLE_STEP_DEG degrees of fold angle (not time/distance)
-        sweep_angle_step = float(
-            getattr(self, "_paint_angle_step_rad", SWEEP_SAMPLE_STEP_RAD)
-        )
+        # Min mid-point travel (design units) before recording another sweep sample
+        sweep_min_move = max(float(getattr(self, "max_size", 100.0)) * 3e-4, 0.012)
 
         # One entry per triangle–triangle contact (same as each red GUI segment/point).
-        # Do NOT collapse multiple contacts that share the same unit pair.
+        # Adopt collision hits by reference — rebuilt fresh each detection frame.
         segs_now = {}
         for s in self._collision_contact_segments_flat:
-            s = dict(s)
             s["folding_angle"] = angle
-            key = self._contact_pair_key(s)
-            segs_now[key] = self._copy_segment_entry(s)
+            segs_now[self._contact_pair_key(s)] = s
 
         pts_now = {}
         for e in self._collision_contact_points_flat:
@@ -4464,17 +3867,11 @@ class PD_Origami_Simulator:
             # Same tri-pair already produced a segment this frame → skip lone point
             if key in segs_now:
                 continue
-            e = dict(e)
             e["folding_angle"] = angle
-            pts_now[key] = self._copy_point_entry(e)
-
+            pts_now[key] = e
 
         def _carry_sweep(ent, prev):
-            """Bring prior 2D sweep trail onto the live entry (fresh copy has none).
-
-            Share the list by reference while the contact is live (append in place).
-            Deep-copy only when locking / exporting via _copy_segment_entry.
-            """
+            """Move prior 2D sweep trail onto this frame's sides (by reference)."""
             if prev is None:
                 return
             for sk in ("side_a", "side_b"):
@@ -4483,205 +3880,69 @@ class PD_Origami_Simulator:
                 if side is None or pside is None:
                     continue
                 if side.get("sweep_samples"):
-                    continue  # already has trail
+                    continue
                 samples = pside.get("sweep_samples")
                 if samples:
-                    side["sweep_samples"] = samples  # shared mutable trail
+                    side["sweep_samples"] = samples
 
         def _record_sweep(ent, force_last=False):
-            """Append current 2D contact line every angle_step (2°) of fold."""
+            """Append current 2D contact line (min_move density; force locks tip)."""
+            min_move = 0.0 if force_last else sweep_min_move
             for sk in ("side_a", "side_b"):
                 side = ent.get(sk)
                 if side is None:
                     continue
-                self._append_sweep_sample_2d(
-                    side, angle, force=force_last, angle_step=sweep_angle_step,
-                )
+                self._append_sweep_sample_2d(side, angle, min_move=min_move)
 
         def _is_locked(key):
             fin = self._collision_fixed_segments.get(key)
             return bool(fin and fin.get("coords_locked"))
-
-        def _apply_first_on_creases(ent, prev, p0_3d, p1_3d):
-            """
-            Set first_* to *actual JSON keypoint coords* on creases
-            (shared fold edge endpoints, or nearest crease vertices).
-
-            These are discrete design vertices so first+last can form a
-            closed polygon with real pattern corners.
-            """
-            def _copy_first_from(src):
-                ent["first_locked"] = bool(src.get("first_locked", False))
-                if "first_kp0" in src:
-                    ent["first_kp0"] = int(src["first_kp0"])
-                    ent["first_kp1"] = int(src["first_kp1"])
-                for sk in ("side_a", "side_b"):
-                    side = ent.get(sk)
-                    ps = src.get(sk)
-                    if side is None or ps is None:
-                        continue
-                    if "first_p0" in ps:
-                        side["first_p0"] = list(ps["first_p0"])
-                        side["first_p1"] = list(ps["first_p1"])
-                        side["first_folding_angle"] = float(
-                            ps.get("first_folding_angle", angle)
-                        )
-                if "first_p0" in src:
-                    ent["first_p0"] = list(src["first_p0"])
-                    ent["first_p1"] = list(src["first_p1"])
-                    ent["first_folding_angle"] = float(
-                        src.get("first_folding_angle", angle)
-                    )
-
-            # Keep already-locked first (JSON vertices stay fixed)
-            if prev and prev.get("first_locked") and prev.get("first_p0") is not None:
-                _copy_first_from(prev)
-                ent["first_locked"] = True
-                return
-
-            if p0_3d is None or p1_3d is None or not crease_recs:
-                if prev and prev.get("first_p0") is not None:
-                    _copy_first_from(prev)
-                return
-
-            f0, f1, d0, d1, kp0, kp1 = self._json_crease_first_pair(
-                p0_3d, p1_3d, crease_recs,
-                unit_a=ent.get("unit_a"), unit_b=ent.get("unit_b"),
-            )
-            if f0 is None:
-                if prev and prev.get("first_p0") is not None:
-                    _copy_first_from(prev)
-                return
-
-            near = (d0 <= crease_tol * 2.0) and (d1 <= crease_tol * 2.0)
-            # If far and we already have a first, keep it (wait for a near frame)
-            if not near and prev is not None and prev.get("first_p0") is not None:
-                _copy_first_from(prev)
-                return
-
-            # Write exact JSON crease-vertex coords on both sides
-            for sk in ("side_a", "side_b"):
-                side = ent.get(sk)
-                if side is None:
-                    continue
-                side["first_p0"] = list(f0)
-                side["first_p1"] = list(f1)
-                side["first_folding_angle"] = float(angle)
-            ent["first_p0"] = list(f0)
-            ent["first_p1"] = list(f1)
-            ent["first_folding_angle"] = float(angle)
-            if kp0 is not None:
-                ent["first_kp0"] = int(kp0)
-                ent["first_kp1"] = int(kp1)
-            # Lock once contact is near the hinge (reliable shared crease)
-            if near:
-                ent["first_locked"] = True
 
         for key, ent in segs_now.items():
             already = _is_locked(key)
             prev = self._collision_active_segments.get(key)
 
             if already:
-                locked = self._collision_fixed_segments[key]
-                _carry_sweep(ent, locked)
-                # Keep first from locked snapshot on live display entry
-                _apply_first_on_creases(ent, locked, ent.get("p0_3d"), ent.get("p1_3d"))
-                # Locked: paint trail is frozen (no more 2D samples)
-                self._collision_active_segments[key] = ent
+                # Locked trail is frozen — keep the fixed entry for display
+                self._collision_active_segments[key] = self._collision_fixed_segments[key]
                 continue
 
             if ent.get("side_a") and "p0" in ent["side_a"]:
                 sa = ent["side_a"]
-                ent["p0"], ent["p1"] = list(sa["p0"]), list(sa["p1"])
+                ent["p0"], ent["p1"] = sa["p0"], sa["p1"]
             elif ent.get("side_b") and "p0" in ent["side_b"]:
                 sb = ent["side_b"]
-                ent["p0"], ent["p1"] = list(sb["p0"]), list(sb["p1"])
+                ent["p0"], ent["p1"] = sb["p0"], sb["p1"]
             if prev is not None:
                 if ent.get("p0_3d") is None and prev.get("p0_3d") is not None:
-                    ent["p0_3d"] = list(prev["p0_3d"])
-                    ent["p1_3d"] = list(prev["p1_3d"])
+                    ent["p0_3d"] = prev["p0_3d"]
+                    ent["p1_3d"] = prev["p1_3d"]
             _carry_sweep(ent, prev)
-
-            p0_3d = ent.get("p0_3d")
-            p1_3d = ent.get("p1_3d")
-            _apply_first_on_creases(ent, prev, p0_3d, p1_3d)
 
             # 2D paint: record the mapped two-node line on each panel's design xy
             _record_sweep(ent, force_last=False)
-
-            # Lock last when BOTH nodes left creases (segment still live)
-            min_len = max(float(getattr(self, "max_size", 100.0)) * 0.002, 0.05)
-            long_enough = self._segment_length_xy(ent) >= min_len
-            if (
-                long_enough
-                and p0_3d is not None
-                and p1_3d is not None
-                and self._endpoints_off_creases(p0_3d, p1_3d, crease_segs, crease_tol)
-            ):
-                # Ensure first exists even if we never got a near-crease frame
-                if not ent.get("first_p0") and crease_recs:
-                    f0, f1, _, _, kp0, kp1 = self._json_crease_first_pair(
-                        p0_3d, p1_3d, crease_recs,
-                        unit_a=ent.get("unit_a"), unit_b=ent.get("unit_b"),
-                    )
-                    if f0 is not None:
-                        for sk in ("side_a", "side_b"):
-                            side = ent.get(sk)
-                            if side is None:
-                                continue
-                            side["first_p0"] = list(f0)
-                            side["first_p1"] = list(f1)
-                            side["first_folding_angle"] = float(angle)
-                        ent["first_p0"] = list(f0)
-                        ent["first_p1"] = list(f1)
-                        ent["first_folding_angle"] = float(angle)
-                        if kp0 is not None:
-                            ent["first_kp0"] = int(kp0)
-                            ent["first_kp1"] = int(kp1)
-                        ent["first_locked"] = True
-                # Order last endpoints for a simple closed quad with first
-                if ent.get("first_p0") is not None:
-                    ent = self._order_last_to_first(ent)
-                    for sk in ("side_a", "side_b"):
-                        self._maybe_seed_sweep_with_first(ent.get(sk))
-                # Final paint sample at lock position
-                _record_sweep(ent, force_last=True)
-                ent["coords_locked"] = True
-                ent["fixed_reason"] = "off_crease"
-                snap = self._copy_segment_entry(ent)
-                snap["coords_locked"] = True
-                snap["fixed_reason"] = "off_crease"
-                if "first_kp0" in ent:
-                    snap["first_kp0"] = ent["first_kp0"]
-                    snap["first_kp1"] = ent["first_kp1"]
-                self._collision_fixed_segments[key] = snap
-            else:
-                self._collision_fixed_segments.pop(key, None)
-
             self._collision_active_segments[key] = ent
 
         for key, ent in pts_now.items():
             if key in self._collision_fixed_segments and self._collision_fixed_segments[key].get("coords_locked"):
                 self._collision_active_points.pop(key, None)
                 continue
-            prev = self._collision_active_points.get(key)
             if ent.get("side_a"):
-                ent["p"] = list(ent["side_a"]["p"])
+                ent["p"] = ent["side_a"]["p"]
             self._collision_active_points[key] = ent
             self._collision_fixed_points.pop(key, None)
 
-        # Contact ended → lock if not already locked off-crease
+        # Contact ended → freeze trail
         for key in list(self._collision_active_segments.keys()):
             if key not in segs_now:
                 fin = self._collision_active_segments.pop(key)
                 if not (self._collision_fixed_segments.get(key) or {}).get("coords_locked"):
-                    # Seal last paint sample on the final known 2D line
                     for sk in ("side_a", "side_b"):
                         side = fin.get(sk)
                         if side is not None and "p0" in side:
                             self._append_sweep_sample_2d(
                                 side, float(fin.get("folding_angle", angle)),
-                                force=True,
+                                min_move=0.0,
                             )
                     fin["coords_locked"] = True
                     fin["fixed_reason"] = fin.get("fixed_reason") or "contact_ended"
@@ -4705,13 +3966,51 @@ class PD_Origami_Simulator:
         if angle >= 3.1415 - 1e-6:
             self._stop_sweep_drawing_at_pi()
 
+    def _stop_sweep_drawing_at_pi(self):
+        """
+        Immediately freeze locus paint when θ hits π.
+
+        Called from update_folding_target / slider / 'u' so drawing stops on the
+        same step the clamp happens — not delayed until the next collision frame.
+        """
+        if getattr(self, "_sweep_draw_stopped", False):
+            return
+        self._sweep_draw_stopped = True
+        # No further canvas stamps or trail growth / reproject
+        self._paint_dirty = False
+        self._stamp_paint_needed = False
+        # Drop live red contact markers (locus strokes stay frozen as last drawn)
+        self._collision_contact_count = 0
+        self._collision_segment_count = 0
+        self._collision_contact_points_list = []
+        self._collision_contact_segments_list = []
+        self._collision_contact_points_flat = []
+        self._collision_contact_segments_flat = []
+        if getattr(self, "_collision_coords_exported", False):
+            return
+        angle = float(getattr(self, "folding_angle", 3.1415))
+        for ent in (getattr(self, "_collision_active_segments", None) or {}).values():
+            for sk in ("side_a", "side_b"):
+                side = ent.get(sk)
+                if side is not None and "p0" in side:
+                    try:
+                        self._append_sweep_sample_2d(side, angle, min_move=0.0)
+                    except Exception:
+                        pass
+        try:
+            self._seal_fixed_flat_contacts(reason="fold_pi")
+        except Exception as exc:
+            if getattr(self, "verbose", False):
+                print(f"[Contact] seal@π failed: {exc}")
+            self._collision_coords_exported = True
+
     # 5. seal trails at π
 
     def _seal_fixed_flat_contacts(self, reason="fold_complete"):
         """Move remaining actives into fixed and stop further trail growth.
 
         reason: fixed_reason tag for still-live contacts (e.g. fold_pi).
-        Does not write JSON / log files.
+        No export / deep-copy — entries kept by reference.
         """
         if self._collision_coords_exported:
             if self._collision_fixed_segments or self._collision_fixed_points:
@@ -4725,9 +4024,8 @@ class PD_Origami_Simulator:
                     es = (ent.get(sk) or {}).get("sweep_samples") or []
                     xs = (existing.get(sk) or {}).get("sweep_samples") or []
                     if len(es) > len(xs) and existing.get(sk) is not None:
-                        existing[sk]["sweep_samples"] = self._copy_sweep_samples(es)
+                        existing[sk]["sweep_samples"] = es
                 continue
-            ent = self._copy_segment_entry(ent)
             ent["coords_locked"] = True
             ent["fixed_reason"] = ent.get("fixed_reason") or seal_reason
             self._collision_fixed_segments[key] = ent
@@ -4735,7 +4033,6 @@ class PD_Origami_Simulator:
         for key, ent in list(self._collision_active_points.items()):
             if key in self._collision_fixed_segments:
                 continue
-            ent = dict(ent)
             ent["coords_locked"] = True
             ent["fixed_reason"] = ent.get("fixed_reason") or seal_reason
             self._collision_fixed_points.setdefault(key, ent)
@@ -4756,10 +4053,9 @@ class PD_Origami_Simulator:
                     continue
                 if key in self._collision_fixed_segments:
                     continue
-                ent = self._copy_segment_entry(s)
-                ent["coords_locked"] = True
-                ent["fixed_reason"] = "fold_pi"
-                self._collision_fixed_segments[key] = ent
+                s["coords_locked"] = True
+                s["fixed_reason"] = "fold_pi"
+                self._collision_fixed_segments[key] = s
 
         # Mark sealed so paint / tracking stop (no JSON write)
         if (
@@ -4876,10 +4172,6 @@ class PD_Origami_Simulator:
                     continue
                 yield side, ent
 
-    def _paint_angle_step(self):
-        """Fold-angle spacing (radians) between paint strokes (default 2 deg)."""
-        return float(getattr(self, "_paint_angle_step_rad", SWEEP_SAMPLE_STEP_RAD))
-
     @staticmethod
     def _eval_bary_on_positions(loc, positions, lift=0.0):
         """Evaluate material barycentric on current vertex positions (+ tiny lift)."""
@@ -4927,11 +4219,32 @@ class PD_Origami_Simulator:
             p = p + (float(lift) / nn) * nrm
         return p
 
+    @staticmethod
+    def _copy_loc(loc):
+        """Copy material barycentric handle (i0,i1,i2,u,v,w)."""
+        if loc is None:
+            return None
+        try:
+            return (
+                int(loc[0]), int(loc[1]), int(loc[2]),
+                float(loc[3]), float(loc[4]), float(loc[5]),
+            )
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def _paint_min_move_dist(self):
+        # Match export sweep density so the on-panel locus is not sparse
+        if getattr(self, "_paint_min_move", None) is None:
+            self._paint_min_move = max(
+                float(getattr(self, "max_size", 100.0)) * 3e-4, 0.012
+            )
+        return float(self._paint_min_move)
+
     def _stamp_paint_canvas_from_contacts(self):
         """
         Record locus using barycentric locs from the collision hit triangle.
-
-        Strict 2° fold-angle bins only — independent of fold speed / frame rate.
+        af0a695 min_move sampling: append when mid-point moved enough; else
+        refresh tip locs so the last sample tracks the live contact.
         """
         if not getattr(self, "collision_shading", False):
             return
@@ -4946,16 +4259,13 @@ class PD_Origami_Simulator:
         if not active:
             return
 
-        ang = float(getattr(self, "folding_angle", 0.0))
-        ang_step = self._paint_angle_step()
-        bin_i = self._sweep_angle_bin(ang, ang_step)
-        store_ang = float(bin_i) * ang_step
+        min_move = self._paint_min_move_dist()
         dirty = False
         copy_loc = self._copy_loc
         order2 = self._order_segment_endpoints_2d
+        mid_dist = self._segment_mid_dist_2d
 
         for ent in active.values():
-            # Stamp BOTH sides (each panel gets its own material locus)
             for sk in ("side_a", "side_b"):
                 side = ent.get(sk)
                 if not side or "p0" not in side:
@@ -4975,25 +4285,25 @@ class PD_Origami_Simulator:
                 if trail:
                     last = trail[-1]
                     p0o, p1o = order2(p0, p1, last["p0"], last["p1"])
-                    # If endpoints swapped for trail order, swap locs too
                     if p0o[0] != p0[0] or p0o[1] != p0[1]:
                         loc0, loc1 = loc1, loc0
                     p0, p1 = p0o, p1o
-                    last_bin = self._sweep_angle_bin(
-                        last.get("angle", 0.0), ang_step
-                    )
-                    if bin_i == last_bin:
-                        # Same 2° bucket — do not add another stroke
+                    moved = mid_dist(last["p0"], last["p1"], p0, p1)
+                    if moved < min_move:
+                        trail[-1] = {
+                            "p0": p0, "p1": p1, "loc0": loc0, "loc1": loc1,
+                        }
+                        dirty = True
                         continue
 
                 trail.append({
                     "p0": p0, "p1": p1,
                     "loc0": loc0, "loc1": loc1,
-                    "angle": store_ang,
                 })
                 dirty = True
         if dirty:
             self._paint_dirty = True
+
 
     def _ensure_paint_line_capacity(self, n_verts):
         """Grow Taichi paint line field if needed (no hard cap on stroke count)."""
@@ -5018,8 +4328,7 @@ class PD_Origami_Simulator:
         Draw locus glued to panels: evaluate stored barycentrics on current x.
         Paths move with the paper — not free-floating 3D polylines.
 
-        Matches pre-Taichi packing:
-          per unit trail of node0, trail of node1, then contact-line samples.
+        Restored from af0a695 (non-Taichi numpy reproject + from_numpy upload).
         """
         if not hasattr(self, "paint_line_vertices") and not getattr(
             self, "collision_shading", False
@@ -5028,7 +4337,6 @@ class PD_Origami_Simulator:
             self._paint_n_strokes = 0
             return
 
-        # At π: keep the last uploaded strokes; do not grow or reproject
         if getattr(self, "_sweep_draw_stopped", False):
             return
 
@@ -5039,7 +4347,6 @@ class PD_Origami_Simulator:
                 self._paint_n_strokes = 0
             return
 
-        # Reuse previous line verts when mesh is frozen and canvas unchanged
         paused = bool(getattr(self, "paused", False)) and not bool(
             getattr(self, "step_once", False)
         )
@@ -5051,13 +4358,11 @@ class PD_Origami_Simulator:
             return
 
         positions = self._cache_frame_positions()
-        # tiny offset so lines win depth buffer without looking off-surface
         lift = max(float(getattr(self, "max_size", 100.0)) * 5e-5, 0.005)
 
-        # Batch all bary evals, then pack line segments (same as pre-Taichi)
         all_loc0 = []
         all_loc1 = []
-        unit_ranges = []  # (start, count) into all_loc*
+        unit_ranges = []
         for _uid, strokes in canvas.items():
             if not strokes:
                 continue
@@ -5082,7 +4387,6 @@ class PD_Origami_Simulator:
         pts0_all = self._eval_bary_batch(all_loc0, positions, lift=lift)
         pts1_all = self._eval_bary_batch(all_loc1, positions, lift=lift)
 
-        # Upper bound: 2 chains of (n-1) segs + n cross bars → ~ (4n-2) verts/unit
         n_total = len(all_loc0)
         est_verts = max(4 * n_total * 2, 64)
         self._ensure_paint_line_capacity(est_verts)
@@ -5093,10 +4397,8 @@ class PD_Origami_Simulator:
         for start, n in unit_ranges:
             pts0 = pts0_all[start : start + n]
             pts1 = pts1_all[start : start + n]
-            # drop non-finite rows
             good0 = np.isfinite(pts0).all(axis=1)
             good1 = np.isfinite(pts1).all(axis=1)
-            # locus of each contact node (on surface)
             for pts, good in ((pts0, good0), (pts1, good1)):
                 prev = None
                 for i in range(n):
@@ -5116,7 +4418,6 @@ class PD_Origami_Simulator:
                         ln_buf[li] = cur
                         li += 1
                     prev = cur
-            # Contact line samples on the panel (every sample)
             for i in range(n):
                 if not (good0[i] and good1[i]):
                     continue
@@ -5136,7 +4437,6 @@ class PD_Origami_Simulator:
         self._paint_dirty = False
         if li > 0:
             self._ensure_paint_line_capacity(li)
-            # from_numpy needs full field shape
             max_lv = int(self._paint_max_line_verts)
             if ln_buf.shape[0] != max_lv:
                 full = np.zeros((max_lv, 3), dtype=np.float32)
@@ -5144,14 +4444,10 @@ class PD_Origami_Simulator:
                 ln_buf = full
             self.paint_line_vertices.from_numpy(ln_buf)
 
-
-
-
-
     def _render_panel_meshes(self, scene):
         """
         Draw base mesh + surface sweep paint (design-xy mapped onto panels)
-        + red contact markers.
+        + red contact markers. (af0a695 non-Taichi draw path)
         """
         scene.mesh(
             self.vertices,
@@ -5162,14 +4458,14 @@ class PD_Origami_Simulator:
 
         n_pts = self._collision_contact_count
         n_segs = self._collision_segment_count
-        has_red_markers = n_pts > 0 or n_segs > 0
 
-        # Design-locus strokes on panel surfaces
         if self.collision_shading and hasattr(self, "paint_line_vertices"):
             try:
                 self._update_surface_sweep_paint()
-            except Exception:
-                pass
+            except Exception as exc:
+                if not getattr(self, "_paint_update_error_logged", False):
+                    self._paint_update_error_logged = True
+                    print(f"[Paint] surface sweep update failed: {exc}")
             n_pl = int(getattr(self, "_paint_line_vert_count", 0) or 0)
             if n_pl >= 2:
                 scene.lines(
