@@ -5,6 +5,7 @@ imgui.ini
 
 # results
 physResult/
+trimmedData/
 
 # generated batch simulation JSON (e.g. mountain-thick_batch_25.json)
 **/*_batch*.json

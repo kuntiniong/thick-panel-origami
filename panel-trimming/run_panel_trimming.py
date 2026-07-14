@@ -1,8 +1,12 @@
 """
-Collision-shading runner for phys_sim_pd14 (no trimmed-JSON export).
+Collision-shading runner for phys_sim_pd14.
 
   headless: true  → use_gui=False (run() auto-drives θ 0→π)
   headless: false → use_gui=True  (interactive GUI)
+
+When θ hits π, phys_sim_pd14 auto-writes:
+  trimmedData/<name>-trimmed.json
+  (source descriptionData JSON is left alone; dual-curve shaded_regions appended)
 
 Usage:
   python panel-trimming/run_panel_trimming.py
@@ -64,6 +68,11 @@ def run_simulations(
         )
         print(f"{'=' * 60}")
 
+        # thick designs need thick_mode; default True when name contains "thick"
+        thick_mode = sim.get("thick_mode")
+        if thick_mode is None:
+            thick_mode = "thick" in str(name).lower()
+
         ori = PD_Origami_Simulator(
             origami_name=name,
             use_gui=use_gui,
@@ -81,11 +90,28 @@ def run_simulations(
         ori.start(
             filepath=name,
             unit_edge_max=sim.get("unit_edge_max", 4),
-            thick_mode=sim.get("thick_mode", False),
+            thick_mode=bool(thick_mode),
         )
 
-        # use_gui → hold angle; headless → auto-fold until stop()
+        # headless: auto 0→π → export; GUI: manual fold, export when θ hits π
+        mode = "headless auto-fold" if headless else "GUI manual fold"
+        print(
+            f"[collision-shading] thick_mode={bool(thick_mode)}; {mode}; "
+            f"export trimmedData/{name}-trimmed.json at π"
+        )
         ori.run()
+
+        out = getattr(ori, "_trimmed_json_path", None)
+        if out and os.path.isfile(out):
+            print(f"[collision-shading] Done. Trimmed JSON: {out}")
+        elif getattr(ori, "_trimmed_json_exported", False):
+            print(f"[collision-shading] Done. Export flag set: {out}")
+        else:
+            print(
+                f"[collision-shading] WARNING: no trimmed JSON written "
+                f"(θ={float(getattr(ori, 'folding_angle', 0.0)):.4f}). "
+                f"Expected trimmedData/{name}-trimmed.json"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:

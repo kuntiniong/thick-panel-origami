@@ -174,6 +174,8 @@ class PD_Origami_Simulator:
         self._collision_fixed_points = {}
         self._collision_coords_exported = False  # sealed at π (no more trail growth)
         self._sweep_draw_stopped = False  # True once θ hits π — no more paint growth
+        self._trimmed_json_exported = False  # one-shot write of *-trimmed.json at π
+        self._trimmed_json_path = None
         # Locus paint: path of two contact nodes + the line (design xy → panel).
         # Host canvas stores bary locs; reprojected onto live x (af0a695 min_move).
         self._paint_canvas = {}          # unit_id -> list[{p0,p1,loc0,loc1}]
@@ -1568,6 +1570,8 @@ class PD_Origami_Simulator:
         self._collision_fixed_points = {}
         self._collision_coords_exported = False
         self._sweep_draw_stopped = False
+        self._trimmed_json_exported = False
+        self._trimmed_json_path = None
         self._collision_contact_count = 0
         self._collision_segment_count = 0
         self._collision_contact_points_list = []
@@ -2771,11 +2775,34 @@ class PD_Origami_Simulator:
         #         and self.folding_angle > 3.14 and self.folding_angle_reach_pi[None]:
         #     return True
         # self.backup_energy[None] = self.energy[None]
+
+        # Collision-shading GUI: never auto-quit after π — export is one-shot;
+        # user closes the window when done inspecting.
+        if self.collision_shading and self.use_gui:
+            return False
+
         angle_sum = self.calculateCreaseAngleSum()
-        if abs(angle_sum - self.backup_crease_angle_sum[None]) < 1e-3 * angle_sum and self.folding_angle > 3.14:
+        at_pi = float(self.folding_angle) >= 3.1415 - 1e-6
+        if abs(angle_sum - self.backup_crease_angle_sum[None]) < 1e-3 * angle_sum and (
+            self.folding_angle > 3.14 or at_pi
+        ):
             # Seal every pair's final coords (including still-active)
-            if self.collision_shading and not self._collision_coords_exported:
-                self._seal_fixed_flat_contacts()
+            if self.collision_shading:
+                if not self._collision_coords_exported:
+                    self._seal_fixed_flat_contacts(reason="stop")
+                if not getattr(self, "_trimmed_json_exported", False):
+                    try:
+                        self.export_trimmed_json(reason="stop")
+                    except Exception as exc:
+                        print(f"[Contact] trimmed export @stop failed: {exc}")
+            return True
+        # Headless collision-shading: exit only after export so batch jobs finish
+        if (
+            self.collision_shading
+            and not self.use_gui
+            and at_pi
+            and getattr(self, "_trimmed_json_exported", False)
+        ):
             return True
         self.backup_crease_angle_sum[None] = angle_sum
         return False
@@ -2800,6 +2827,17 @@ class PD_Origami_Simulator:
                 self.step_once = False
                 self._mesh_advanced = True
             self.current_t += self.dt
+
+        # Headless collision-shading: render() is never called, so sample contacts here
+        if self.collision_shading and not self.use_gui and self._mesh_advanced:
+            try:
+                self.update_vertices()
+                self._cache_frame_positions(force=True)
+                self._maybe_detect_panel_collisions()
+            except Exception as exc:
+                if not getattr(self, "_headless_coll_error_logged", False):
+                    self._headless_coll_error_logged = True
+                    print(f"[Contact] headless collision step failed: {exc}")
 
     def reward(self):
         reward_list = np.zeros(self.split_origami_num)
@@ -2857,7 +2895,7 @@ class PD_Origami_Simulator:
         # for i in range(self.split_origami_num):
         #     self.gui.text(f"Sub-energy: {round(self.split_energy[i], 3)}")
 
-        self.folding_angle = self.gui.slider_float('Folding angle', self.folding_angle, 0, 3.135)
+        self.folding_angle = self.gui.slider_float('Folding angle', self.folding_angle, 0, 3.1415)
         if (
             self.collision_shading
             and float(self.folding_angle) >= 3.1415 - 1e-6
@@ -2880,6 +2918,73 @@ class PD_Origami_Simulator:
                 pass
         self.window.show()
 
+    def _default_trimmed_json_path(self):
+        """trimmedData/<name>-trimmed.json (never clobber source descriptionData)."""
+        name = str(getattr(self, "origami_name", "export") or "export")
+        # avoid name-trimmed-trimmed if already a trimmed stem
+        if name.endswith("-trimmed"):
+            stem = name
+        else:
+            stem = f"{name}-trimmed"
+        return os.path.join("trimmedData", f"{stem}.json")
+
+    def export_trimmed_json(self, path=None, reason="fold_pi", force=False):
+        """
+        Write design JSON + dual-curve shaded_regions to trimmedData/*-trimmed.json.
+
+        Called automatically when θ hits π (collision_shading). Source design
+        ``descriptionData/<name>.json`` is left unchanged.
+        """
+        if not getattr(self, "collision_shading", False):
+            return None
+        if getattr(self, "_trimmed_json_exported", False) and not force:
+            return getattr(self, "_trimmed_json_path", None)
+        if not hasattr(self, "input_json") or self.input_json is None:
+            return None
+
+        # Pack shaded dual-curves into input_json (in-place attributes only)
+        try:
+            self._append_shaded_export_to_json()
+        except Exception as exc:
+            print(f"[Contact] shaded pack before trimmed write failed: {exc}")
+
+        # Latest crease targets if PD fields exist
+        try:
+            self.input_json["crease_angle"] = [
+                max(min(self.crease_angle[i], 1.), -1.)
+                for i in range(self.crease_pairs_num)
+            ]
+            self.input_json["crease_info"] = [
+                [self.kps[self.crease_pairs[i, 0]], self.kps[self.crease_pairs[i, 1]]]
+                for i in range(self.crease_pairs_num)
+            ]
+        except Exception:
+            pass
+
+        self.input_json["export_meta"] = {
+            "source": str(getattr(self, "origami_name", "")),
+            "reason": str(reason or "fold_pi"),
+            "folding_angle": float(getattr(self, "folding_angle", 0.0)),
+            "schema": "dual_curve_v1",
+            "n_shaded_regions": len(self.input_json.get("shaded_regions") or []),
+        }
+
+        out_path = path or self._default_trimmed_json_path()
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as fw:
+            json.dump(self.input_json, fw, indent=4)
+
+        self._trimmed_json_exported = True
+        self._trimmed_json_path = out_path
+        n_sh = len(self.input_json.get("shaded_regions") or [])
+        print(
+            f"[Contact] auto-exported trimmed JSON @π "
+            f"(shaded_regions={n_sh}) → {out_path}"
+        )
+        return out_path
+
     def appendCreaseInfo(self):
         self.input_json["crease_angle"] = [
             max(min(self.crease_angle[i], 1.), -1.) for i in range(self.crease_pairs_num)
@@ -2887,17 +2992,52 @@ class PD_Origami_Simulator:
         self.input_json["crease_info"] = [
             [self.kps[self.crease_pairs[i, 0]], self.kps[self.crease_pairs[i, 1]]] for i in range(self.crease_pairs_num)
         ]
+        # Collision shading: keep *-trimmed.json in sync with final crease angles
+        if getattr(self, "collision_shading", False):
+            try:
+                self.export_trimmed_json(reason="run_end", force=True)
+            except Exception as exc:
+                if getattr(self, "verbose", False):
+                    print(f"[Contact] trimmed export at run end failed: {exc}")
+                try:
+                    self._append_shaded_export_to_json()
+                except Exception:
+                    pass
+        # Original design file (crease angles); shaded keys may be present if packed
         with open("./descriptionData/" + self.origami_name + ".json", 'w', encoding='utf-8') as fw:
             json.dump(self.input_json, fw, indent=4)
 
     def run(self):
         self.initializeRunning()
-        # GUI: hold angle (use slider / i=start, k=stop, m=reverse).
-        # Headless: auto-drive fold target each step (same as phy_sim_target).
+        # GUI: never auto-increment θ — user drives slider / i / k / m / u.
+        # Headless: auto-drive 0→π (export still fires when θ hits π either way).
         if self.use_gui:
             self.enable_add_folding_angle = 0.0
+            if self.collision_shading:
+                print(
+                    f"[Contact] collision_shading GUI: fold manually "
+                    f"(i=start, k=stop, u=jump π, slider). "
+                    f"Writes {self._default_trimmed_json_path()} at π"
+                )
         else:
-            self.enable_add_folding_angle = 0.105
+            try:
+                step = float(self.folding_micro_step[None])
+            except Exception:
+                step = 0.0
+            if step <= 1e-12:
+                step = math.pi / 100.0
+            if self.collision_shading:
+                # Slow headless fold so contact locus stays dense (not as slow as π/2000)
+                # (~π/1000 rad/step ≈ 0.18° → ~1000 steps from 0 to π)
+                step = min(step * 0.1, math.pi / 1000.0)
+                step = max(step, math.pi / 2500.0)  # floor so it still finishes
+            self.enable_add_folding_angle = step
+            if self.collision_shading:
+                print(
+                    f"[Contact] collision_shading headless: slow auto-fold 0→π "
+                    f"(dθ={step:.6g} rad ≈ {step * 180.0 / math.pi:.3f}°/step); "
+                    f"will write {self._default_trimmed_json_path()} at π"
+                )
         while self.window.running:
             self.step()
             # ti.profiler.print_kernel_profiler_info()  # 看每个kernel的执行时间、线程数
@@ -2906,7 +3046,17 @@ class PD_Origami_Simulator:
                 self.render()
             if self.stop():
                 self.backupSimulationSetting()
-                break 
+                break
+        # Safety: if loop exited without writing (window closed mid-fold, etc.)
+        if (
+            self.collision_shading
+            and not getattr(self, "_trimmed_json_exported", False)
+            and float(getattr(self, "folding_angle", 0.0)) >= 3.1415 - 1e-6
+        ):
+            try:
+                self.export_trimmed_json(reason="run_exit")
+            except Exception as exc:
+                print(f"[Contact] trimmed export @run_exit failed: {exc}")
         if not self.ref_target:
             self.appendCreaseInfo()
 
@@ -2916,6 +3066,7 @@ class PD_Origami_Simulator:
     1. map each panel in each layer as a uniquely identifiable object
     2. apply AABB collision detection to each panel object
     4. sweeping visualization
+    5. shaded export as dual curves (c0, c1, theta) → input_json
     """
 
     # 1. panel mapping
@@ -3101,6 +3252,11 @@ class PD_Origami_Simulator:
                 num_tris = max_tris
                 self._collision_num_tris = num_tris
             tri_panel = np.full(num_tris, -1, dtype=np.int32)
+            # Match by per-panel layer_idx (shell ordinal), not absolute height_z.
+            # Thick stacks expand each design panel into shells 0..n-1; contacts
+            # are tested between shells with the same ordinal even when crease
+            # heights differ across panels (e.g. P0 shell0 @ -3 vs P2 shell0 @ -9).
+            # Absolute mm matching kills all hits for miura-style stacks.
             tri_layer = np.full(num_tris, -1, dtype=np.int32)
             for t in range(num_tris):
                 u = int(tri_unit_ids[t])
@@ -3346,7 +3502,9 @@ class PD_Origami_Simulator:
     @ti.kernel
     def _kernel_detect_panel_contacts(self, hit_eps: data_type):
         """
-        All triangle pairs: different panels, same layer, no shared verts.
+        All triangle pairs: different panels, same shell layer_idx, no shared verts.
+
+        coll_tri_layer = per-panel layer ordinal (0 = bottom shell of that panel).
         Writes contact hits into coll_hit_* (float64).
         """
         self.coll_hit_count[None] = 0
@@ -3546,13 +3704,12 @@ class PD_Origami_Simulator:
             p_of_uhi = int(panel_bs[hi])
             tri_lo = int(tri_as[hi])
             tri_hi = int(tri_bs[hi])
-            layer_idx_hit = int(layers[hi])
-            _, layer_h = _layer_of(u_lo, tri_lo)
-            # Prefer meta layer_idx when present
-            meta_li, meta_h = _layer_of(u_lo, tri_lo)
-            if meta_li >= 0:
-                layer_idx_hit = meta_li
-            layer_h = meta_h
+            # Per-unit thickness identity (absolute offset + per-panel ordinal)
+            layer_idx_a, layer_h_a = _layer_of(u_lo, tri_lo)
+            layer_idx_b, layer_h_b = _layer_of(u_hi, tri_hi)
+            # Segment-level fields: prefer lo unit (legacy); sides carry own meta
+            layer_idx_hit = layer_idx_a if layer_idx_a >= 0 else int(layers[hi])
+            layer_h = layer_h_a
 
             p_lo = p_of_ulo if p_of_ulo <= p_of_uhi else p_of_uhi
             p_hi = p_of_uhi if p_of_ulo <= p_of_uhi else p_of_ulo
@@ -3565,6 +3722,10 @@ class PD_Origami_Simulator:
                 "panel_b": p_hi,
                 "layer_idx": layer_idx_hit,
                 "layer_h": layer_h,
+                "layer_idx_a": layer_idx_a,
+                "layer_h_a": layer_h_a,
+                "layer_idx_b": layer_idx_b,
+                "layer_h_b": layer_h_b,
                 "tri_a": tri_lo,
                 "tri_b": tri_hi,
                 "tri_lo": tri_lo,
@@ -3572,7 +3733,9 @@ class PD_Origami_Simulator:
             }
 
             def _side_flat(p3d0, p3d1=None, _tri_lo=tri_lo, _tri_hi=tri_hi,
-                           _u_lo=u_lo, _u_hi=u_hi, _pulo=p_of_ulo, _puhi=p_of_uhi):
+                           _u_lo=u_lo, _u_hi=u_hi, _pulo=p_of_ulo, _puhi=p_of_uhi,
+                           _li_a=layer_idx_a, _lh_a=layer_h_a,
+                           _li_b=layer_idx_b, _lh_b=layer_h_b):
                 a0 = _flat_of(p3d0, _tri_lo)
                 b0 = _flat_of(p3d0, _tri_hi)
                 if p3d1 is None:
@@ -3582,12 +3745,14 @@ class PD_Origami_Simulator:
                     if a0 is not None:
                         out["side_a"] = {
                             "unit": _u_lo, "panel": _pulo,
+                            "layer_idx": int(_li_a), "layer_h": float(_lh_a),
                             "p": a0["p"], "loc": a0["loc"],
                         }
                         out["p"] = a0["p"]
                     if b0 is not None:
                         out["side_b"] = {
                             "unit": _u_hi, "panel": _puhi,
+                            "layer_idx": int(_li_b), "layer_h": float(_lh_b),
                             "p": b0["p"], "loc": b0["loc"],
                         }
                         if "p" not in out:
@@ -3599,6 +3764,7 @@ class PD_Origami_Simulator:
                 if a0 is not None and a1 is not None:
                     out["side_a"] = {
                         "unit": _u_lo, "panel": _pulo,
+                        "layer_idx": int(_li_a), "layer_h": float(_lh_a),
                         "p0": a0["p"], "p1": a1["p"],
                         "loc0": a0["loc"], "loc1": a1["loc"],
                     }
@@ -3606,6 +3772,7 @@ class PD_Origami_Simulator:
                 if b0 is not None and b1 is not None:
                     out["side_b"] = {
                         "unit": _u_hi, "panel": _puhi,
+                        "layer_idx": int(_li_b), "layer_h": float(_lh_b),
                         "p0": b0["p"], "p1": b1["p"],
                         "loc0": b0["loc"], "loc1": b1["loc"],
                     }
@@ -3851,8 +4018,9 @@ class PD_Origami_Simulator:
                 return
 
         angle = float(self.folding_angle)
-        # Min mid-point travel (design units) before recording another sweep sample
-        sweep_min_move = max(float(getattr(self, "max_size", 100.0)) * 3e-4, 0.012)
+        # Min mid-point travel (design units) before recording another sweep sample.
+        # Keep in sync with on-panel paint density (_paint_min_move_dist).
+        sweep_min_move = self._paint_min_move_dist()
 
         # One entry per triangle–triangle contact (same as each red GUI segment/point).
         # Adopt collision hits by reference — rebuilt fresh each detection frame.
@@ -3986,23 +4154,27 @@ class PD_Origami_Simulator:
         self._collision_contact_segments_list = []
         self._collision_contact_points_flat = []
         self._collision_contact_segments_flat = []
-        if getattr(self, "_collision_coords_exported", False):
-            return
-        angle = float(getattr(self, "folding_angle", 3.1415))
-        for ent in (getattr(self, "_collision_active_segments", None) or {}).values():
-            for sk in ("side_a", "side_b"):
-                side = ent.get(sk)
-                if side is not None and "p0" in side:
-                    try:
-                        self._append_sweep_sample_2d(side, angle, min_move=0.0)
-                    except Exception:
-                        pass
+        if not getattr(self, "_collision_coords_exported", False):
+            angle = float(getattr(self, "folding_angle", 3.1415))
+            for ent in (getattr(self, "_collision_active_segments", None) or {}).values():
+                for sk in ("side_a", "side_b"):
+                    side = ent.get(sk)
+                    if side is not None and "p0" in side:
+                        try:
+                            self._append_sweep_sample_2d(side, angle, min_move=0.0)
+                        except Exception:
+                            pass
+            try:
+                self._seal_fixed_flat_contacts(reason="fold_pi")
+            except Exception as exc:
+                if getattr(self, "verbose", False):
+                    print(f"[Contact] seal@π failed: {exc}")
+                self._collision_coords_exported = True
+        # Always write trimmedData/<name>-trimmed.json once θ hits π
         try:
-            self._seal_fixed_flat_contacts(reason="fold_pi")
+            self.export_trimmed_json(reason="fold_pi")
         except Exception as exc:
-            if getattr(self, "verbose", False):
-                print(f"[Contact] seal@π failed: {exc}")
-            self._collision_coords_exported = True
+            print(f"[Contact] trimmed JSON export @π failed: {exc}")
 
     # 5. seal trails at π
 
@@ -4057,13 +4229,250 @@ class PD_Origami_Simulator:
                 s["fixed_reason"] = "fold_pi"
                 self._collision_fixed_segments[key] = s
 
-        # Mark sealed so paint / tracking stop (no JSON write)
+        # Mark sealed so paint / tracking stop; pack lean shaded payload for JSON
         if (
             self._collision_fixed_segments
             or self._collision_fixed_points
             or seal_reason == "fold_pi"
         ):
             self._collision_coords_exported = True
+            try:
+                self._append_shaded_export_to_json()
+            except Exception as exc:
+                if getattr(self, "verbose", False):
+                    print(f"[Contact] shaded pack@seal failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # Shaded-area export (dual-curve, no deep-copy of contact graphs)
+    #
+    # Representation: each live contact is a generator segment p0–p1.
+    # Over the fold it sweeps two curves on the design plane:
+    #   c0(θ) = locus of endpoint 0
+    #   c1(θ) = locus of endpoint 1
+    # Sample i is the generator (c0[i], c1[i]) at theta[i].
+    # Shaded ribbon ring = c0 + reverse(c1)  (rebuilt by consumers; not
+    # stored under five alias keys).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _xy2(p):
+        """Two floats for JSON — no nested copy of larger structures."""
+        return [float(p[0]), float(p[1])]
+
+    @staticmethod
+    def _polygon_area_2d(pts):
+        """Absolute shoelace area of a 2D ring."""
+        n = len(pts) if pts is not None else 0
+        if n < 3:
+            return 0.0
+        acc = 0.0
+        for i in range(n):
+            x0 = float(pts[i][0])
+            y0 = float(pts[i][1])
+            x1 = float(pts[(i + 1) % n][0])
+            y1 = float(pts[(i + 1) % n][1])
+            acc += x0 * y1 - x1 * y0
+        return abs(acc) * 0.5
+
+    @classmethod
+    def _pack_dual_curves(cls, samples):
+        """
+        Pack successive {p0,p1,angle} samples into parallel curve arrays.
+
+        Endpoint order is stabilized along the trail so c0/c1 are continuous
+        curves (no bow-tie). Returns (theta, c0, c1) — plain float lists only.
+        """
+        theta, c0, c1 = [], [], []
+        prev0 = prev1 = None
+        if not samples:
+            return theta, c0, c1
+        for s in samples:
+            if s is None or "p0" not in s or "p1" not in s:
+                continue
+            p0, p1 = cls._order_segment_endpoints_2d(
+                s["p0"], s["p1"], prev0, prev1
+            )
+            a = cls._xy2(p0)
+            b = cls._xy2(p1)
+            theta.append(float(s.get("angle", 0.0)))
+            c0.append(a)
+            c1.append(b)
+            prev0, prev1 = a, b
+        return theta, c0, c1
+
+    @classmethod
+    def ribbon_ring_from_curves(cls, c0, c1):
+        """
+        Closed shaded ring from dual curves: walk c0 then reverse(c1).
+        Returns list of [x,y] or None if degenerate.
+        """
+        if not c0 or not c1 or len(c0) != len(c1) or len(c0) < 2:
+            return None
+        ring = list(c0)
+        for q in reversed(c1):
+            ring.append(q)
+        # Drop near-duplicate consecutive verts (cheap, in-place style build)
+        cleaned = [ring[0]]
+        for q in ring[1:]:
+            prev = cleaned[-1]
+            if abs(q[0] - prev[0]) > 1e-9 or abs(q[1] - prev[1]) > 1e-9:
+                cleaned.append(q)
+        if len(cleaned) < 3:
+            return None
+        if cls._polygon_area_2d(cleaned) < 1e-12:
+            return None
+        return cleaned
+
+    @classmethod
+    def sweep_paint_polygon_2d(cls, samples):
+        """Ribbon polygon from raw sample list (compat helper for tooling)."""
+        _, c0, c1 = cls._pack_dual_curves(samples)
+        return cls.ribbon_ring_from_curves(c0, c1)
+
+    def build_shaded_regions(self):
+        """
+        Compact dual-curve shaded regions from locked (or active) contacts.
+
+        Walks tracker entries **by reference** — no deep-copy of side/loc/3d
+        trees. Builds only the thin parallel arrays needed for JSON.
+        """
+        regions = []
+        # Prefer sealed trails; fall back to still-active if seal was empty
+        ents = list((getattr(self, "_collision_fixed_segments", None) or {}).values())
+        if not ents:
+            ents = list(
+                (getattr(self, "_collision_active_segments", None) or {}).values()
+            )
+        # Stable order for diffs / visualizer
+        ents.sort(key=lambda s: (
+            int(s.get("panel_a", -1)), int(s.get("panel_b", -1)),
+            int(s.get("layer_idx", -1)),
+            int(s.get("unit_a", -1)), int(s.get("unit_b", -1)),
+            int(s.get("tri_a", -1)), int(s.get("tri_b", -1)),
+        ))
+
+        for seg in ents:
+            for side_key in ("side_a", "side_b"):
+                side = seg.get(side_key)
+                if not side or "p0" not in side:
+                    continue
+                samples = side.get("sweep_samples") or []
+                # Seed with crease-snapped first if present but not in trail
+                if not samples and "first_p0" in side and "first_p1" in side:
+                    samples = [{
+                        "angle": float(side.get("first_folding_angle", 0.0)),
+                        "p0": side["first_p0"],
+                        "p1": side["first_p1"],
+                    }, {
+                        "angle": float(seg.get("folding_angle", 0.0)),
+                        "p0": side["p0"],
+                        "p1": side["p1"],
+                    }]
+                theta, c0, c1 = self._pack_dual_curves(samples)
+                n = len(c0)
+                if n < 1:
+                    # Degenerate: single live line only
+                    if "p0" in side and "p1" in side:
+                        c0 = [self._xy2(side["p0"])]
+                        c1 = [self._xy2(side["p1"])]
+                        theta = [float(seg.get("folding_angle", 0.0))]
+                        n = 1
+                    else:
+                        continue
+                ring = self.ribbon_ring_from_curves(c0, c1)
+                kind = "sweep" if ring is not None else ("line" if n >= 1 else "empty")
+                area = self._polygon_area_2d(ring) if ring is not None else 0.0
+                # Per-side thickness offset: each sim unit has its own height_z.
+                # Legacy exports copied seg.layer_h (from unit_a) onto both sides —
+                # wrong when panels have different stacks (miura P0@-3 vs P2@-9).
+                if side.get("layer_h") is not None:
+                    side_layer_h = float(side["layer_h"])
+                elif side_key == "side_a" and seg.get("layer_h_a") is not None:
+                    side_layer_h = float(seg["layer_h_a"])
+                elif side_key == "side_b" and seg.get("layer_h_b") is not None:
+                    side_layer_h = float(seg["layer_h_b"])
+                else:
+                    side_layer_h = float(seg.get("layer_h", 0.0))
+                if side.get("layer_idx") is not None:
+                    side_layer_idx = int(side["layer_idx"])
+                elif side_key == "side_a" and seg.get("layer_idx_a") is not None:
+                    side_layer_idx = int(seg["layer_idx_a"])
+                elif side_key == "side_b" and seg.get("layer_idx_b") is not None:
+                    side_layer_idx = int(seg["layer_idx_b"])
+                else:
+                    side_layer_idx = int(seg.get("layer_idx", -1))
+                # Authoritative: sim unit → panel layer registry
+                su = side.get("unit")
+                if su is not None:
+                    try:
+                        um = self.unit_to_panel_layer(int(su))
+                        side_layer_h = float(um.get("height_z", side_layer_h))
+                        side_layer_idx = int(um.get("layer_idx", side_layer_idx))
+                    except Exception:
+                        pass
+
+                regions.append({
+                    # identity
+                    "panel": int(side.get("panel", seg.get("panel_a", -1))),
+                    "unit": int(side.get("unit", -1)),
+                    "side": side_key,
+                    "layer_idx": side_layer_idx,
+                    "layer_h": side_layer_h,
+                    "unit_a": int(seg.get("unit_a", -1)),
+                    "unit_b": int(seg.get("unit_b", -1)),
+                    "tri_a": int(seg.get("tri_a", -1)),
+                    "tri_b": int(seg.get("tri_b", -1)),
+                    # dual curves (primary geometry — one source of truth)
+                    "theta": theta,
+                    "c0": c0,
+                    "c1": c1,
+                    "n": n,
+                    # derived once (consumers may also rebuild from c0/c1)
+                    "kind": kind,
+                    "area": float(area),
+                    "fixed_reason": seg.get("fixed_reason"),
+                    "folding_angle": float(
+                        seg.get("folding_angle", getattr(self, "folding_angle", 0.0))
+                    ),
+                })
+        return regions
+
+    def _append_shaded_export_to_json(self):
+        """
+        Mutate ``self.input_json`` in place with compact shaded attributes.
+
+        No deep-copy of the contact tracker: only newly packed dual-curve
+        arrays are attached. Existing crease / unit / line data is left alone.
+        """
+        if not hasattr(self, "input_json") or self.input_json is None:
+            return
+        regions = self.build_shaded_regions()
+        self._shaded_regions_export = regions
+        # Primary: dual-curve list (curves + rebuildable ribbon)
+        self.input_json["shaded_regions"] = regions
+        # Lean stats block for tooling / visualizer discovery (no nested
+        # segment trees, no duplicated polygon aliases)
+        n_fixed = len(getattr(self, "_collision_fixed_segments", {}) or {})
+        n_pts = len(getattr(self, "_collision_fixed_points", {}) or {})
+        n_sweep = sum(1 for r in regions if r.get("kind") == "sweep")
+        self.input_json["collision_stats"] = {
+            "schema": "dual_curve_v1",
+            "n_shaded_regions": len(regions),
+            "n_shaded_areas": len(regions),  # alias for older readers
+            "n_sweep_paints": n_sweep,
+            "n_segments": n_fixed,
+            "n_points": n_pts,
+            "n_closed_polygons": n_sweep,
+            "folding_angle": float(getattr(self, "folding_angle", 0.0)),
+            # Pointer: full geometry lives in top-level shaded_regions
+            "shaded_regions_key": "shaded_regions",
+        }
+        if getattr(self, "verbose", False) or len(regions) > 0:
+            print(
+                f"[Contact] shaded export: {len(regions)} region(s) "
+                f"(sweep={n_sweep}, sealed_lines={n_fixed}) "
+                f"schema=dual_curve_v1 → input_json['shaded_regions']"
+            )
 
     def get_fixed_flat_segments(self):
         """All finalized segment cut lines (sorted by panel group, layer, units)."""
@@ -4233,10 +4642,12 @@ class PD_Origami_Simulator:
             return None
 
     def _paint_min_move_dist(self):
-        # Match export sweep density so the on-panel locus is not sparse
+        # Dense on-panel locus: small mid-point travel between successive
+        # contact lines (p0–p1) so the sweep paints many strokes, not a few.
+        # Floor keeps tiny models from recording every noise flicker.
         if getattr(self, "_paint_min_move", None) is None:
             self._paint_min_move = max(
-                float(getattr(self, "max_size", 100.0)) * 3e-4, 0.012
+                float(getattr(self, "max_size", 100.0)) * 5e-5, 0.002
             )
         return float(self._paint_min_move)
 

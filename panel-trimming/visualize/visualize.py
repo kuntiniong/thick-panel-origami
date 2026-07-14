@@ -1,23 +1,35 @@
 """
 Panel-trimming visualizer — 2D contact-line sweep paint + first/last fallback.
 
-Primary shade (design plane only, no 3D) = **exported coordinates**:
-  1) coordinates / shaded_polygon / paint_polygon — sweep ribbon of the
-     two-node contact line (preferred; matches sim GUI locus)
-  2) closed_triangle — first crease edge + max-area last apex (fallback)
+Primary shade (design plane only, no 3D) = **dual-curve export** (preferred):
+  shaded_regions[] with c0 / c1 / theta  (schema dual_curve_v1)
+  ribbon ring = c0 + reverse(c1); stroke i = segment(c0[i], c1[i])
 
-  first      = JSON mountain/valley crease endpoints (green)
-  last       = locked cut endpoints (red)
-  sweep line samples drawn as thin strokes when present
+Legacy shade keys still accepted:
+  1) coordinates / shaded_polygon / paint_polygon
+  2) closed_triangle — first crease edge + max-area last apex
+
+  first      = first dual-curve sample (green)
+  last       = last dual-curve sample (red)
+  sweep strokes drawn as thin segments when present
 
 Data sources (in order):
-  1) collision_stats.closed_polygons[] / shaded_areas[]  (sim export)
-  2) collision_stats.segments  (recomputed max-area triangle)
-  3) Reconstructed: shared crease (first) + matched cut (last)
+  1) shaded_regions[]  (dual_curve_v1, top-level on design JSON)
+  2) collision_stats.closed_polygons[] / shaded_areas[]  (legacy)
+  3) collision_stats.segments  (recomputed max-area triangle)
+  4) Reconstructed: shared crease (first) + matched cut (last)
+
+Layer mapping:
+  Each subplot is a thickness offset (layer_h). Only panels that actually
+  have that offset (crease thick_panel_height, same rule as phys_sim thick
+  mode) are drawn. Shades are filtered by export panel + layer_h.
 
 Usage:
-  python visualization/panel-trimming/visualize.py
-  python visualization/panel-trimming/visualize.py --name mountain-thick-trimmed
+  python panel-trimming/visualize/visualize.py
+  python panel-trimming/visualize/visualize.py --name mountain-thick-trimmed
+
+Trimmed JSON is read from project trimmedData/ (sim export folder);
+source designs still resolve from descriptionData/.
 """
 
 from __future__ import annotations
@@ -51,10 +63,6 @@ matplotlib.rcParams["font.size"] = 9
 # ---------------------------------------------------------------------------
 PANEL_FACE = "#f4f4f6"
 PANEL_EDGE = "#b0b0b8"
-HOST_FACE = "#4c78a8"
-HOST_ALPHA = 0.22
-INTRUDER_FACE = "#f58518"
-INTRUDER_ALPHA = 0.28
 TRIM_POLY_FACE = "#e45756"
 TRIM_POLY_ALPHA = 0.50
 TRIM_POLY_EDGE = "#a32020"
@@ -69,6 +77,8 @@ TYPE_MOUNTAIN = 0
 TYPE_VALLEY = 1
 
 DESCRIPTION_DIR = os.path.join(_PROJECT_ROOT, "descriptionData")
+# Sim export target (phys_sim_pd14.export_trimmed_json)
+TRIMMED_DIR = os.path.join(_PROJECT_ROOT, "trimmedData")
 DEFAULT_CONFIG = os.path.join(_THIS_DIR, "config.yml")
 DEFAULT_OUTPUT_DIR = os.path.join(_THIS_DIR, "output")
 
@@ -87,17 +97,43 @@ def _load_json(path: str) -> dict:
         return json.load(f)
 
 
-def _resolve_json_path(name: str) -> str:
+def _resolve_in_dirs(name: str, dirs: Sequence[str]) -> Optional[str]:
+    """Resolve name or name.json under the given directories (first hit wins)."""
     if os.path.isfile(name):
         return name
-    candidate = os.path.join(DESCRIPTION_DIR, name)
-    if os.path.isfile(candidate):
-        return candidate
+    basenames = [name]
     if not name.endswith(".json"):
-        candidate = os.path.join(DESCRIPTION_DIR, name + ".json")
-        if os.path.isfile(candidate):
-            return candidate
-    raise FileNotFoundError(f"JSON not found for name/path: {name}")
+        basenames.append(name + ".json")
+    for d in dirs:
+        for bn in basenames:
+            candidate = os.path.join(d, bn)
+            if os.path.isfile(candidate):
+                return candidate
+            # bare stem under dir
+            candidate = os.path.join(d, os.path.basename(bn))
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def _resolve_json_path(name: str, *, prefer_trimmed: bool = False) -> str:
+    """
+    Find a design JSON.
+
+    prefer_trimmed=True  → trimmedData first, then descriptionData (exports)
+    prefer_trimmed=False → descriptionData first, then trimmedData (source / original)
+    """
+    if prefer_trimmed:
+        dirs = [TRIMMED_DIR, DESCRIPTION_DIR]
+    else:
+        dirs = [DESCRIPTION_DIR, TRIMMED_DIR]
+    path = _resolve_in_dirs(name, dirs)
+    if path is not None:
+        return path
+    raise FileNotFoundError(
+        f"JSON not found for name/path: {name} "
+        f"(searched {', '.join(dirs)})"
+    )
 
 
 def _guess_original_name(trimmed_name: str) -> Optional[str]:
@@ -120,8 +156,103 @@ def _xy_key(pt, nd: int = 3) -> Tuple[float, float]:
     return (round(float(pt[0]), nd), round(float(pt[1]), nd))
 
 
+def _edge_key(a, b, nd: int = 3) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    ka, kb = _xy_key(a, nd), _xy_key(b, nd)
+    return (ka, kb) if ka <= kb else (kb, ka)
+
+
 def _layer_key(h: float) -> str:
     return str(round(float(h), 6))
+
+
+def _line_edge_table(data: dict) -> Dict[Tuple, List[Dict[str, Any]]]:
+    """Undirected design-xy edge → {type, height} from lines / line_features."""
+    lines = data.get("lines") or []
+    feats = data.get("line_features") or []
+    table: Dict[Tuple, List[Dict[str, Any]]] = {}
+    for i, ln in enumerate(lines):
+        if not ln or len(ln) < 2:
+            continue
+        a, b = ln[0], ln[1]
+        t = 2
+        th = None
+        if i < len(feats):
+            t = int(feats[i].get("type", 2))
+            if feats[i].get("thick_panel_height") is not None:
+                th = float(feats[i]["thick_panel_height"])
+        if th is None and len(a) > 2:
+            th = float(a[2])
+        if th is None:
+            th = 0.0
+        ek = _edge_key(a, b)
+        table.setdefault(ek, []).append({"type": t, "height": float(th), "index": i})
+    return table
+
+
+def panel_thickness_offsets(
+    units: Sequence,
+    data: dict,
+    shaded_regions: Optional[Sequence[dict]] = None,
+) -> List[List[float]]:
+    """
+    Per design-panel thickness offsets (mm), matching phys_sim thick-mode.
+
+    Unique mountain/valley crease ``thick_panel_height`` values on each panel
+    outline → one layer unit at each height. Shade ``layer_h`` values are
+    merged so paint never references a missing offset.
+    """
+    table = _line_edge_table(data)
+    n = len(units)
+    per_panel: List[List[float]] = [[] for _ in range(n)]
+
+    for pi, unit in enumerate(units):
+        if not unit or len(unit) < 2:
+            continue
+        heights: List[float] = []
+        nu = len(unit)
+        for j in range(nu):
+            a, b = unit[j], unit[(j + 1) % nu]
+            for ent in table.get(_edge_key(a, b), []):
+                if ent["type"] in (TYPE_MOUNTAIN, TYPE_VALLEY):
+                    h = float(ent["height"])
+                    if not any(abs(h - x) < 1e-9 for x in heights):
+                        heights.append(h)
+        heights.sort()
+        per_panel[pi] = heights
+
+    for sh in shaded_regions or []:
+        p = sh.get("panel")
+        lh = sh.get("layer_h")
+        if p is None or lh is None:
+            continue
+        try:
+            pi = int(p)
+            h = float(lh)
+        except (TypeError, ValueError):
+            continue
+        if pi < 0 or pi >= n:
+            continue
+        if not any(abs(h - x) < 1e-9 for x in per_panel[pi]):
+            per_panel[pi].append(h)
+            per_panel[pi].sort()
+
+    for pi in range(n):
+        if not per_panel[pi]:
+            per_panel[pi] = [0.0]
+    return per_panel
+
+
+def _panels_at_height(
+    panel_offsets: Sequence[Sequence[float]],
+    h: float,
+    eps: float = 1e-6,
+) -> set:
+    """Design panel indices that have a thick-panel layer at offset h."""
+    out = set()
+    for i, offs in enumerate(panel_offsets):
+        if any(abs(float(h) - float(x)) <= eps for x in offs):
+            out.add(i)
+    return out
 
 
 def _layer_keys(units_by_layer: dict) -> List[str]:
@@ -479,24 +610,60 @@ def _pick_first_crease(
 # Build closed-poly items
 # ---------------------------------------------------------------------------
 
-def _items_from_collision_stats(
-    stats: dict, layer_h: float, eps: float = 1e-6
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
+def _ribbon_from_dual_curves(
+    c0: Sequence, c1: Sequence
+) -> Optional[np.ndarray]:
+    """Rebuild shaded ring: walk c0 then reverse(c1)."""
+    if not c0 or not c1 or len(c0) != len(c1) or len(c0) < 2:
+        return None
+    ring = [[float(p[0]), float(p[1])] for p in c0]
+    ring += [[float(p[0]), float(p[1])] for p in reversed(c1)]
+    if len(ring) < 3:
+        return None
+    return np.asarray(ring, dtype=float)
 
-    # Prefer dedicated shaded_areas list when present (primary export payload)
-    shaded_list = stats.get("shaded_areas") or []
-    poly_list = stats.get("closed_polygons") or []
-    # If shaded_areas is non-empty, still walk closed_polygons (has more meta);
-    # fall back to shaded_areas alone when closed_polygons empty.
-    source_entries = poly_list if poly_list else [
-        {
+
+def _samples_from_dual_curves(
+    theta: Sequence, c0: Sequence, c1: Sequence
+) -> List[Dict[str, Any]]:
+    """Rebuild stroke samples from parallel dual-curve arrays."""
+    n = min(len(c0), len(c1))
+    out: List[Dict[str, Any]] = []
+    for i in range(n):
+        ang = float(theta[i]) if theta is not None and i < len(theta) else 0.0
+        out.append({
+            "angle": ang,
+            "p0": [float(c0[i][0]), float(c0[i][1])],
+            "p1": [float(c1[i][0]), float(c1[i][1])],
+        })
+    return out
+
+
+def _entries_from_shaded_regions(
+    regions: Sequence[dict],
+) -> List[Dict[str, Any]]:
+    """
+    dual_curve_v1 → visualizer entry shape.
+
+    Geometry source of truth is (c0, c1, theta); coordinates / sweep_samples
+    are rebuilt here (no duplicated polygon keys required in JSON).
+    """
+    entries: List[Dict[str, Any]] = []
+    for sh in regions or []:
+        c0 = sh.get("c0") or []
+        c1 = sh.get("c1") or []
+        theta = sh.get("theta") or []
+        ring = _ribbon_from_dual_curves(c0, c1)
+        samples = _samples_from_dual_curves(theta, c0, c1)
+        coords = ring.tolist() if ring is not None else sh.get("coordinates")
+        kind = sh.get("kind") or ("sweep" if ring is not None else "line")
+        entries.append({
             "layer_h": sh.get("layer_h"),
-            "coordinates": sh.get("coordinates"),
-            "shaded_polygon": sh.get("coordinates"),
-            "paint_polygon": sh.get("coordinates"),
-            "paint_kind": sh.get("kind"),
-            "shaded_kind": sh.get("kind"),
+            "coordinates": coords,
+            "shaded_polygon": coords,
+            "paint_polygon": coords,
+            "paint_kind": kind,
+            "shaded_kind": kind,
             "paint_area": sh.get("area"),
             "shaded_area": sh.get("area"),
             "panel": sh.get("panel"),
@@ -506,10 +673,57 @@ def _items_from_collision_stats(
             "other_panel": sh.get("other_panel"),
             "tri_a": sh.get("tri_a"),
             "tri_b": sh.get("tri_b"),
-            "sweep_n_samples": sh.get("sweep_n_samples"),
-        }
-        for sh in shaded_list
-    ]
+            "sweep_n_samples": sh.get("n") or len(c0),
+            "sweep_samples": samples,
+            "first_p0": c0[0] if c0 else None,
+            "first_p1": c1[0] if c1 else None,
+            "last_p0": c0[-1] if c0 else None,
+            "last_p1": c1[-1] if c1 else None,
+            "c0": c0,
+            "c1": c1,
+            "theta": theta,
+        })
+    return entries
+
+
+def _items_from_collision_stats(
+    stats: dict, layer_h: float, eps: float = 1e-6,
+    shaded_regions: Optional[Sequence[dict]] = None,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+
+    # dual_curve_v1: top-level shaded_regions (preferred) or stats pointer
+    dual = list(shaded_regions or [])
+    if not dual:
+        dual = list(stats.get("shaded_regions") or [])
+    if dual:
+        source_entries = _entries_from_shaded_regions(dual)
+    else:
+        # Legacy: closed_polygons / shaded_areas with full polygon copies
+        shaded_list = stats.get("shaded_areas") or []
+        poly_list = stats.get("closed_polygons") or []
+        source_entries = poly_list if poly_list else [
+            {
+                "layer_h": sh.get("layer_h"),
+                "coordinates": sh.get("coordinates"),
+                "shaded_polygon": sh.get("coordinates"),
+                "paint_polygon": sh.get("coordinates"),
+                "paint_kind": sh.get("kind"),
+                "shaded_kind": sh.get("kind"),
+                "paint_area": sh.get("area"),
+                "shaded_area": sh.get("area"),
+                "panel": sh.get("panel"),
+                "unit": sh.get("unit"),
+                "side": sh.get("side"),
+                "intruder_panel": sh.get("intruder_panel"),
+                "other_panel": sh.get("other_panel"),
+                "tri_a": sh.get("tri_a"),
+                "tri_b": sh.get("tri_b"),
+                "sweep_n_samples": sh.get("sweep_n_samples"),
+                "sweep_samples": sh.get("sweep_samples") or [],
+            }
+            for sh in shaded_list
+        ]
 
     for cp in source_entries:
         if not _layer_match(cp.get("layer_h"), layer_h, eps):
@@ -749,8 +963,13 @@ def _items_reconstructed(
     return out
 
 
-def _active_layers_from_stats(stats: dict) -> set:
+def _active_layers_from_stats(
+    stats: dict, shaded_regions: Optional[Sequence[dict]] = None
+) -> set:
     active = set()
+    for sh in shaded_regions or stats.get("shaded_regions") or []:
+        if sh.get("layer_h") is not None:
+            active.add(_layer_key(sh["layer_h"]))
     for cp in stats.get("closed_polygons") or []:
         if cp.get("layer_h") is not None:
             active.add(_layer_key(cp["layer_h"]))
@@ -797,63 +1016,84 @@ def _draw_layer(
     show_panel_ids: bool = True,
     show_closed_polys: bool = True,
     show_first_last_edges: bool = True,
-    show_host_polys: bool = False,
+    panels_on_layer: Optional[set] = None,
 ):
-    n = min(len(orig_units), len(layer_units))
+    """
+    Draw one thickness-offset subplot.
 
-    intruder_ids = set()
-    host_ids = set()
+    ``panels_on_layer``: design panel indices that exist at this layer_h
+    (thick-panel offset). If None, all panels in layer_units are drawn
+    (legacy behaviour).
+    """
+    # Prefer full design unit count so panel index == design panel index
+    n = max(len(orig_units), len(layer_units))
+    if orig_units and layer_units:
+        n = max(len(orig_units), len(layer_units))
+    elif orig_units:
+        n = len(orig_units)
+    else:
+        n = len(layer_units)
+
+    # Panels that own a shade here (for ids / draw set only — no special fill color)
+    shade_panel_ids = set()
     for p in closed_polys:
-        if p.get("panel") is not None and p.get("role") != "host":
-            intruder_ids.add(int(p["panel"]))
-        if p.get("panel") is not None and p.get("role") == "host":
-            host_ids.add(int(p["panel"]))
-        if p.get("host_panel") is not None:
+        if p.get("panel") is not None:
             try:
-                host_ids.add(int(p["host_panel"]))
+                shade_panel_ids.add(int(p["panel"]))
             except (TypeError, ValueError):
                 pass
 
-    for i in range(n):
-        xy = _poly_xy(layer_units[i] if i < len(layer_units) else orig_units[i])
+    # Only draw panels that have this thickness offset
+    draw_ids = set(range(n)) if panels_on_layer is None else set(panels_on_layer)
+    # Always include panels that own a shade here (export is source of truth)
+    draw_ids |= shade_panel_ids
+
+    n_drawn = 0
+    for i in sorted(draw_ids):
+        if i < 0:
+            continue
+        if i < len(layer_units) and layer_units[i]:
+            xy = _poly_xy(layer_units[i])
+        elif i < len(orig_units) and orig_units[i]:
+            xy = _poly_xy(orig_units[i])
+        else:
+            continue
+        n_drawn += 1
         _draw_poly(
             ax, xy, facecolor=PANEL_FACE, edgecolor=PANEL_EDGE,
             linewidth=0.7, zorder=1,
         )
-
-    for i in sorted(host_ids):
-        if 0 <= i < n:
-            xy = _poly_xy(layer_units[i])
-            _draw_poly(
-                ax, xy, facecolor=HOST_FACE, edgecolor="#2f4b7c",
-                linewidth=0.8, alpha=HOST_ALPHA, zorder=2,
-            )
-
-    for i in sorted(intruder_ids):
-        if 0 <= i < n:
-            xy = _poly_xy(layer_units[i])
-            _draw_poly(
-                ax, xy, facecolor=INTRUDER_FACE, edgecolor="#b35c00",
-                linewidth=0.9, alpha=INTRUDER_ALPHA, zorder=3,
-            )
 
     if show_lines and all_lines:
         for idx, ln in enumerate(all_lines):
             if not ln or len(ln) < 2:
                 continue
             p0, p1 = ln[0], ln[1]
-            if len(p0) > 2 and len(p1) > 2:
-                z0, z1 = float(p0[2]), float(p1[2])
-                if abs(z0) > 1e-6 or abs(z1) > 1e-6:
-                    if abs(z0 - float(layer_h)) > 1e-3 or abs(z1 - float(layer_h)) > 1e-3:
-                        continue
-            color, lw = CREASE_COLOR, 0.55
+            # Prefer endpoint z; fall back to thick_panel_height on the feature
+            z0 = float(p0[2]) if len(p0) > 2 else None
+            z1 = float(p1[2]) if len(p1) > 2 else None
+            th = None
+            t = 2
             if line_features and idx < len(line_features):
-                t = line_features[idx].get("type", 2)
+                t = int(line_features[idx].get("type", 2))
+                if line_features[idx].get("thick_panel_height") is not None:
+                    th = float(line_features[idx]["thick_panel_height"])
+            if z0 is None:
+                z0 = th if th is not None else 0.0
+            if z1 is None:
+                z1 = th if th is not None else 0.0
+            # Keep creases/borders whose geometry lives at this offset
+            if abs(z0 - float(layer_h)) > 1e-3 or abs(z1 - float(layer_h)) > 1e-3:
+                # Allow border (type 2) with flat z if it frames panels on this layer
                 if t in (TYPE_MOUNTAIN, TYPE_VALLEY):
-                    color, lw = "#555555", 0.95
-                elif t == 2:
-                    color, lw = BORDER_LINE_COLOR, 0.4
+                    continue
+                if abs(z0 - float(layer_h)) > 1e-3 and abs(z1 - float(layer_h)) > 1e-3:
+                    continue
+            color, lw = CREASE_COLOR, 0.55
+            if t in (TYPE_MOUNTAIN, TYPE_VALLEY):
+                color, lw = "#555555", 0.95
+            elif t == 2:
+                color, lw = BORDER_LINE_COLOR, 0.4
             ax.plot(
                 [p0[0], p1[0]], [p0[1], p1[1]],
                 color=color, linewidth=lw, zorder=4, solid_capstyle="round",
@@ -869,9 +1109,6 @@ def _draw_layer(
     n_shaded = 0
     if show_closed_polys:
         for item in closed_polys:
-            role = item.get("role", "intruder")
-            if role == "host" and not show_host_polys:
-                continue
             poly = item["poly"]
             if poly is None or len(poly) < 3:
                 continue
@@ -880,19 +1117,21 @@ def _draw_layer(
                 item.get("paint_kind") == "sweep"
                 or str(item.get("source", "")).endswith("sweep")
             )
-            if role == "host":
-                _draw_poly(
-                    ax, poly,
-                    facecolor="#72b7b2", edgecolor="#3d7a76",
-                    linewidth=0.9, alpha=0.25, zorder=5,
-                )
-            else:
-                _draw_poly(
-                    ax, poly,
-                    facecolor=TRIM_POLY_FACE, edgecolor=TRIM_POLY_EDGE,
-                    linewidth=1.2, alpha=TRIM_POLY_ALPHA,
-                    hatch=None if is_sweep else "///",
-                    zorder=6,
+            _draw_poly(
+                ax, poly,
+                facecolor=TRIM_POLY_FACE, edgecolor=TRIM_POLY_EDGE,
+                linewidth=1.2, alpha=TRIM_POLY_ALPHA,
+                hatch=None if is_sweep else "///",
+                zorder=6,
+            )
+            # Panel tag on shade (export association)
+            pid = item.get("panel")
+            if pid is not None and len(poly) >= 1:
+                c = poly.mean(axis=0)
+                ax.text(
+                    float(c[0]), float(c[1]), f"P{int(pid)}",
+                    ha="center", va="center", fontsize=6.5,
+                    color="#5a0a0a", fontweight="bold", zorder=11,
                 )
             # Draw intermediate two-node line samples (the actual sweep stroke)
             samples = item.get("sweep_samples") or []
@@ -908,8 +1147,6 @@ def _draw_layer(
 
     if show_first_last_edges:
         for item in closed_polys:
-            if item.get("role") == "host" and not show_host_polys:
-                continue
             fr = item.get("first")
             la = item.get("last")
             apex = item.get("apex")
@@ -946,21 +1183,22 @@ def _draw_layer(
                 )
 
     if show_panel_ids:
-        for i in range(n):
-            xy = _poly_xy(layer_units[i])
+        for i in sorted(draw_ids):
+            if i < len(layer_units) and layer_units[i]:
+                xy = _poly_xy(layer_units[i])
+            elif i < len(orig_units) and orig_units[i]:
+                xy = _poly_xy(orig_units[i])
+            else:
+                continue
             c = xy.mean(axis=0)
-            tag = str(i)
-            if i in intruder_ids:
-                tag += " I"
-            if i in host_ids:
-                tag += " H"
             ax.text(
-                c[0], c[1], tag, ha="center", va="center",
+                c[0], c[1], str(i), ha="center", va="center",
                 fontsize=7.5, color=TEXT_COLOR, zorder=12,
-                fontweight="bold" if i in intruder_ids else "normal",
+                fontweight="bold" if i in shade_panel_ids else "normal",
             )
 
     ax.set_aspect("equal", adjustable="box")
+    n_panels = len(draw_ids)
     if closed_polys:
         src = closed_polys[0]["source"].split(".")[0]
         n_sw = sum(
@@ -970,17 +1208,76 @@ def _draw_layer(
         )
         kind = f"{n_sw} sweeps" if n_sw else "tris/quads"
         ax.set_title(
-            f"layer h = {layer_h:g}   ({n_shaded} 2D paints, {kind}, src={src})",
+            f"offset h = {layer_h:g}   "
+            f"({n_panels} panels, {n_shaded} paints, {kind}, src={src})",
             fontsize=11,
         )
     else:
         ax.set_title(
-            f"layer h = {layer_h:g}   (no trims on this layer)",
+            f"offset h = {layer_h:g}   "
+            f"({n_panels} panels, no trims on this offset)",
             fontsize=11, color="#666666",
         )
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     return n_shaded
+
+
+def _synthesize_units_by_layer(
+    trimmed: dict,
+    base: dict,
+    shaded_regions: Optional[Sequence[dict]] = None,
+    panel_offsets: Optional[Sequence[Sequence[float]]] = None,
+) -> Dict[str, List]:
+    """
+    Build a units_by_layer map for drawing.
+
+    dual_curve_v1 export keeps design ``units`` only (no per-height copies).
+    Subplots are one per distinct thickness offset (from shades + panel
+    crease heights). Each layer still stores the full design unit list so
+    panel index stays stable; drawing filters via ``panels_on_layer``.
+    """
+    units = list(trimmed.get("units") or base.get("units") or [])
+    heights: List[float] = []
+
+    for sh in shaded_regions or []:
+        if sh.get("layer_h") is not None:
+            heights.append(float(sh["layer_h"]))
+    stats = trimmed.get("collision_stats") or {}
+    for bucket in (
+        stats.get("shaded_areas") or [],
+        stats.get("closed_polygons") or [],
+        stats.get("segments") or [],
+    ):
+        for ent in bucket:
+            if ent.get("layer_h") is not None:
+                heights.append(float(ent["layer_h"]))
+
+    # Prefer real panel thickness offsets (not border z) when available
+    if panel_offsets is not None:
+        for offs in panel_offsets:
+            heights.extend(float(h) for h in offs)
+
+    # Unique heights (rounded) sorted
+    uniq: List[float] = []
+    seen = set()
+    for h in sorted(heights):
+        key = round(h, 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(float(h))
+
+    if not uniq:
+        # No layer meta → single design-plane view
+        uniq = [0.0]
+
+    if not units:
+        # Still allow shade-only plots (empty panel outlines)
+        return {_layer_key(h): [] for h in uniq}
+
+    # Same design polygons for every offset; filter at draw time
+    return {_layer_key(h): units for h in uniq}
 
 
 def visualize_trimmed(
@@ -992,31 +1289,62 @@ def visualize_trimmed(
     show_panel_ids: bool = True,
     show_closed_polys: bool = True,
     show_first_last_edges: bool = True,
-    show_host_polys: bool = False,
     title: Optional[str] = None,
 ) -> plt.Figure:
+    base = original or trimmed
+    stats = trimmed.get("collision_stats")
+    # dual_curve_v1 lives at top-level; fall back to stats-embedded copy
+    shaded_regions = trimmed.get("shaded_regions") or (
+        (stats or {}).get("shaded_regions") if stats else None
+    )
+
+    orig_units = base.get("units") or trimmed.get("units") or []
+    # Per-panel thickness offsets (crease thick_panel_height), same as sim
+    panel_offsets = panel_thickness_offsets(
+        orig_units or list(trimmed.get("units") or []),
+        base,
+        shaded_regions,
+    )
+
     ubl = trimmed.get("units_by_layer")
     if not ubl:
-        raise ValueError("JSON has no units_by_layer — expected a trimmed design.")
+        # dual_curve / crease-only export: synthesize from units + offsets
+        ubl = _synthesize_units_by_layer(
+            trimmed, base, shaded_regions, panel_offsets=panel_offsets
+        )
+        if not any(ubl.values()) and not (trimmed.get("units") or base.get("units")):
+            raise ValueError(
+                "JSON has neither units_by_layer nor units — nothing to draw."
+            )
 
-    base = original or trimmed
-    orig_units = base.get("units") or []
     if not orig_units:
         first_key = _layer_keys(ubl)[0]
         orig_units = ubl[first_key]
+        panel_offsets = panel_thickness_offsets(
+            orig_units, base, shaded_regions
+        )
 
     classifications = trimmed.get("intruder_classifications") or []
     all_lines = trimmed.get("lines") or base.get("lines") or []
     line_features = trimmed.get("line_features") or base.get("line_features") or []
     creases = _mountain_valley_creases(base)
-    stats = trimmed.get("collision_stats")
 
     keys = _layer_keys(ubl)
     if layers is not None:
         keys = [k for k in keys if any(abs(float(k) - float(h)) < 1e-6 for h in layers)]
         if not keys:
             raise ValueError(f"No matching layers for {layers}; available {list(ubl.keys())}")
-    # else: show ALL thickness layers
+    else:
+        # Prefer subplots only for offsets that have shades (trim view).
+        # Fall back to all reconstructed panel offsets if no shades.
+        shade_hs = set()
+        for sh in shaded_regions or []:
+            if sh.get("layer_h") is not None:
+                shade_hs.add(round(float(sh["layer_h"]), 6))
+        if shade_hs:
+            keys = [k for k in keys if round(float(k), 6) in shade_hs]
+            if not keys:
+                keys = _layer_keys(ubl)
 
     n = len(keys)
     ncols = min(3, max(n, 1))
@@ -1036,22 +1364,33 @@ def visualize_trimmed(
         r, c = divmod(idx, ncols)
         ax = axes[r][c]
         layer_h = float(key)
-        layer_units = ubl[key]
+        layer_units = ubl.get(key) or orig_units
         layer_cls = _classifications_for_layer(classifications, layer_h)
         cut_segs = _cut_segments_for_layer(trimmed, layer_h)
 
         closed: List[Dict[str, Any]] = []
-        if stats:
-            closed = _items_from_collision_stats(stats, layer_h)
+        if stats or shaded_regions:
+            closed = _items_from_collision_stats(
+                stats or {}, layer_h, shaded_regions=shaded_regions
+            )
         if not closed:
             closed = _items_reconstructed(
                 orig_units, layer_units, layer_h,
                 layer_cls, cut_segs, creases,
             )
 
-        total_polys += sum(1 for p in closed if p.get("role") != "host")
+        total_polys += len(closed)
         for p in closed:
             sources.add(p.get("source", "?"))
+
+        # Panels that physically exist at this thickness offset
+        panels_on_layer = _panels_at_height(panel_offsets, layer_h)
+        for p in closed:
+            if p.get("panel") is not None:
+                try:
+                    panels_on_layer.add(int(p["panel"]))
+                except (TypeError, ValueError):
+                    pass
 
         n_sh = _draw_layer(
             ax,
@@ -1067,14 +1406,16 @@ def visualize_trimmed(
             show_panel_ids=show_panel_ids,
             show_closed_polys=show_closed_polys,
             show_first_last_edges=show_first_last_edges,
-            show_host_polys=show_host_polys,
+            panels_on_layer=panels_on_layer,
         )
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
+        panel_list = ",".join(str(i) for i in sorted(panels_on_layer))
         ax.text(
             0.02, 0.98,
-            f"closed polys: {n_sh}\n"
-            f"first=green crease · last=red cut",
+            f"panels @ h: [{panel_list}]\n"
+            f"shades: {n_sh}  (P# on ribbon)\n"
+            f"first=green · last=red",
             transform=ax.transAxes, ha="left", va="top",
             fontsize=7.5, color="#333333",
             bbox=dict(boxstyle="round,pad=0.28", facecolor="white",
@@ -1086,20 +1427,12 @@ def visualize_trimmed(
         axes[r][c].axis("off")
 
     legend_handles = [
-        Patch(facecolor=PANEL_FACE, edgecolor=PANEL_EDGE, label="Panel"),
-        Patch(
-            facecolor=INTRUDER_FACE, edgecolor="#b35c00", alpha=INTRUDER_ALPHA,
-            label="Intruder panel",
-        ),
-        Patch(
-            facecolor=HOST_FACE, edgecolor="#2f4b7c", alpha=HOST_ALPHA,
-            label="Host panel",
-        ),
+        Patch(facecolor=PANEL_FACE, edgecolor=PANEL_EDGE, label="Panel at this offset"),
         Patch(
             facecolor=TRIM_POLY_FACE, edgecolor=TRIM_POLY_EDGE, alpha=TRIM_POLY_ALPHA,
-            label="Shaded area (exported sweep coordinates)",
+            label="Shaded area (panel P# @ layer_h)",
         ),
-        Line2D([0], [0], color=FIRST_LINE_COLOR, lw=2.4, label="first (JSON crease)"),
+        Line2D([0], [0], color=FIRST_LINE_COLOR, lw=2.4, label="first"),
         Line2D([0], [0], color=LAST_LINE_COLOR, lw=2.4, label="last (cut / contact)"),
     ]
     fig.legend(
@@ -1109,16 +1442,20 @@ def visualize_trimmed(
 
     fig_title = title or "Panel trimming"
     fig_title += (
-        "\nshaded = exported coordinates (contact-line sweep ribbon on design xy)"
+        "\nshaded = dual-curve ribbon · each subplot = thickness offset · "
+        "only panels with that offset"
     )
     meta = trimmed.get("trim_3d_metadata") or {}
     bits = [f"shaded={total_polys}"]
     if meta:
         bits.append(f"trimmer_cuts={meta.get('n_cuts', '?')}")
+    n_dual = len(shaded_regions or [])
+    if n_dual:
+        bits.append(f"dual_curve={n_dual}")
     if stats:
         bits.append(f"stats_segs={stats.get('n_segments', '?')}")
         bits.append(
-            f"stats_shaded={stats.get('n_shaded_areas', stats.get('n_closed_polygons', '?'))}"
+            f"stats_shaded={stats.get('n_shaded_regions', stats.get('n_shaded_areas', stats.get('n_closed_polygons', '?')))}"
         )
     if sources:
         bits.append("src=" + ",".join(sorted(s.split(".")[0] for s in sources)))
@@ -1134,27 +1471,36 @@ def visualize_trimmed(
 
 def _run_one(sim: dict, output_dir: str) -> str:
     name = sim["name"]
-    trimmed_path = _resolve_json_path(name)
+    # Prefer trimmedData/ for exported *-trimmed.json
+    trimmed_path = _resolve_json_path(name, prefer_trimmed=True)
     trimmed = _load_json(trimmed_path)
 
     original = None
     orig_name = sim.get("original") or _guess_original_name(name)
     if orig_name:
         try:
-            original = _load_json(_resolve_json_path(orig_name))
+            # Source design lives in descriptionData/
+            original = _load_json(_resolve_json_path(orig_name, prefer_trimmed=False))
         except FileNotFoundError:
             print(f"[warn] original JSON '{orig_name}' not found; using trimmed.units")
 
     has_stats = bool(trimmed.get("collision_stats"))
-    n_segs = (trimmed.get("collision_stats") or {}).get("n_segments", 0)
-    n_poly = (trimmed.get("collision_stats") or {}).get(
-        "n_closed_triangles",
-        (trimmed.get("collision_stats") or {}).get("n_closed_polygons", 0),
+    stats = trimmed.get("collision_stats") or {}
+    n_segs = stats.get("n_segments", 0)
+    n_poly = stats.get(
+        "n_shaded_regions",
+        stats.get(
+            "n_shaded_areas",
+            stats.get("n_closed_triangles", stats.get("n_closed_polygons", 0)),
+        ),
     )
+    n_dual = len(trimmed.get("shaded_regions") or [])
+    has_ubl = bool(trimmed.get("units_by_layer"))
     print(
         f"[panel-trimming] {os.path.basename(trimmed_path)}  "
         f"collision_stats={'yes' if has_stats else 'no'}  "
-        f"segs={n_segs} closed_tris={n_poly}"
+        f"segs={n_segs} shaded={n_poly} dual_curve={n_dual}  "
+        f"units_by_layer={'yes' if has_ubl else 'synth-from-units'}"
     )
 
     fig = visualize_trimmed(
@@ -1166,7 +1512,6 @@ def _run_one(sim: dict, output_dir: str) -> str:
         show_panel_ids=bool(sim.get("show_panel_ids", True)),
         show_closed_polys=bool(sim.get("show_closed_polys", True)),
         show_first_last_edges=bool(sim.get("show_first_last_edges", True)),
-        show_host_polys=bool(sim.get("show_host_polys", False)),
         title=os.path.basename(trimmed_path),
     )
 
