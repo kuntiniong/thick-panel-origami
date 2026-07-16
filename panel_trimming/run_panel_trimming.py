@@ -73,6 +73,22 @@ def run_simulations(
         if thick_mode is None:
             thick_mode = "thick" in str(name).lower()
 
+        # Collision-only ghost Z shells: one every X mm between physical heights
+        # (0 = off). Not a fixed count between shells.
+        thick_ghost_spacing_mm = float(sim.get("thick_ghost_spacing_mm", 0.0) or 0.0)
+        # Legacy alias: thick_intermediate_layers was a count; ignore if new key set.
+        if thick_ghost_spacing_mm <= 0 and sim.get("thick_intermediate_layers") is not None:
+            # Old configs used integer count; treat as mm spacing of 1.0 if count>0
+            # so old files still get *some* ghosts. Prefer migrating to spacing_mm.
+            legacy_n = int(sim.get("thick_intermediate_layers") or 0)
+            if legacy_n > 0:
+                print(
+                    "[collision-shading] WARNING: thick_intermediate_layers is deprecated; "
+                    "use thick_ghost_spacing_mm (mm). "
+                    f"Interpreting legacy count={legacy_n} as spacing=1.0 mm."
+                )
+                thick_ghost_spacing_mm = 1.0
+
         ori = PD_Origami_Simulator(
             origami_name=name,
             use_gui=use_gui,
@@ -85,6 +101,7 @@ def run_simulations(
             pd_iter_time=sim.get("pd_iter_time", 5),
             verbose=sim.get("verbose", False),
             collision_shading=True,
+            thick_ghost_spacing_mm=thick_ghost_spacing_mm,
         )
 
         ori.start(
@@ -96,8 +113,9 @@ def run_simulations(
         # headless: auto 0→π → export; GUI: manual fold, export when θ hits π
         mode = "headless auto-fold" if headless else "GUI manual fold"
         print(
-            f"[collision-shading] thick_mode={bool(thick_mode)}; {mode}; "
-            f"export trimmedData/{name}-trimmed.json at π"
+            f"[collision-shading] thick_mode={bool(thick_mode)}; "
+            f"thick_ghost_spacing_mm={thick_ghost_spacing_mm:g} (ghost); "
+            f"{mode}; export trimmedData/{name}-trimmed.json at π"
         )
         ori.run()
 

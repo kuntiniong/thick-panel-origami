@@ -7,7 +7,8 @@ import gc
 from spatialhash import SpatialHash
 from ori_sim_sys import *
 # Triangle contact narrowphase is Taichi (_kernel_detect_panel_contacts);
-# utils.triangle_intersection_contacts_3d kept only for non-sim tooling.
+# ghost intermediate shells use host-side triangle_intersection_contacts_3d.
+from utils import triangle_intersection_contacts_3d
 
 data_type = ti.f64
 numpy_data_type = np.float64
@@ -153,9 +154,15 @@ def _map_point_3d_to_flat_2d(p3d, verts_3d, verts_flat_xy, return_bary=False):
 
 @ti.data_oriented
 class PD_Origami_Simulator:
-    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.975, material_type=1, ref_target=False, verbose=False, collision_shading=False):
+    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.975, material_type=1, ref_target=False, verbose=False, collision_shading=False, thick_ghost_spacing_mm=0.0):
         self.use_gui = use_gui
         self.collision_shading = collision_shading
+        # Collision-only ghost Z shells every this many mm between physical
+        # thick heights (0 = off). No PD / mass / springs.
+        self.thick_ghost_spacing_mm = float(thick_ghost_spacing_mm or 0.0)
+        self._collision_ghost_shells = []
+        self._panel_stock_span = {}
+        self._unit_coll_layer_idx = {}
         self._collision_contact_count = 0
         self._collision_segment_count = 0
         self._collision_contact_max = 4096
@@ -3241,6 +3248,12 @@ class PD_Origami_Simulator:
         # Per-unit layer meta for collision paint
         self._collision_unit_layer_meta = self._build_unit_layer_meta()
 
+        # Ghost intermediate shells (collision-only) + full-stack layer ordinals.
+        # Must run before Taichi upload so coll_tri_layer uses stack ranks.
+        if getattr(self, "_flat_kps_np", None) is None:
+            self._flat_kps_np = np.asarray(self.kps, dtype=numpy_data_type)
+        self._build_ghost_collision_shells()
+
         # Upload topology into Taichi fields for the contact kernel
         if hasattr(self, "coll_tri_kp"):
             max_tris = int(self._coll_max_tris)
@@ -3252,17 +3265,19 @@ class PD_Origami_Simulator:
                 num_tris = max_tris
                 self._collision_num_tris = num_tris
             tri_panel = np.full(num_tris, -1, dtype=np.int32)
-            # Match by per-panel layer_idx (shell ordinal), not absolute height_z.
-            # Thick stacks expand each design panel into shells 0..n-1; contacts
-            # are tested between shells with the same ordinal even when crease
-            # heights differ across panels (e.g. P0 shell0 @ -3 vs P2 shell0 @ -9).
-            # Absolute mm matching kills all hits for miura-style stacks.
+            # Match by full collision-stack layer_idx (physical + ghost ranks).
+            # Ghosts are host-side only; physical tris use remapped ranks so the
+            # same ordinal still means "same depth sample" across panels.
+            coll_layer_map = getattr(self, "_unit_coll_layer_idx", {}) or {}
             tri_layer = np.full(num_tris, -1, dtype=np.int32)
             for t in range(num_tris):
                 u = int(tri_unit_ids[t])
                 if 0 <= u < len(unit_panel_idx):
                     tri_panel[t] = int(unit_panel_idx[u])
-                    tri_layer[t] = int(unit_layer_idx[u])
+                    if u in coll_layer_map:
+                        tri_layer[t] = int(coll_layer_map[u])
+                    else:
+                        tri_layer[t] = int(unit_layer_idx[u])
             kp_buf = np.zeros((max_tris, 3), dtype=np.int32)
             unit_buf = np.zeros(max_tris, dtype=np.int32)
             panel_buf = np.full(max_tris, -1, dtype=np.int32)
@@ -3276,6 +3291,395 @@ class PD_Origami_Simulator:
             self.coll_tri_unit.from_numpy(unit_buf)
             self.coll_tri_panel.from_numpy(panel_buf)
             self.coll_tri_layer.from_numpy(layer_buf)
+
+    # ------------------------------------------------------------------
+    # Ghost intermediate shells (collision-only, no PD / springs)
+    # ------------------------------------------------------------------
+
+    def _stack_depth_fields(self, panel_idx, layer_h):
+        """Depth of a shell height within the panel's physical stock span."""
+        span = (getattr(self, "_panel_stock_span", {}) or {}).get(int(panel_idx))
+        if not span:
+            return {
+                "stock_span_mm": 0.0,
+                "depth_from_top_mm": 0.0,
+                "depth_from_bottom_mm": 0.0,
+            }
+        zmin, zmax = float(span[0]), float(span[1])
+        stock = max(zmax - zmin, 0.0)
+        lh = float(layer_h)
+        return {
+            "stock_span_mm": float(stock),
+            "depth_from_top_mm": float(max(0.0, zmax - lh)),
+            "depth_from_bottom_mm": float(max(0.0, lh - zmin)),
+        }
+
+    def _match_unit_kp_correspondence(self, unit_lo, unit_hi, flat_kps):
+        """Pair kp indices of two physical shells by design-xy proximity."""
+        kps_lo = list(self._unit_kp_indices(unit_lo))
+        kps_hi = list(self._unit_kp_indices(unit_hi))
+        if len(kps_lo) < 3 or len(kps_hi) < 3 or len(kps_lo) != len(kps_hi):
+            # Fall back to equal-length prefix if counts differ slightly
+            n = min(len(kps_lo), len(kps_hi))
+            if n < 3:
+                return None, None
+            kps_lo, kps_hi = kps_lo[:n], kps_hi[:n]
+        flat = np.asarray(flat_kps, dtype=float)
+        matched_hi = []
+        used = set()
+        for g_lo in kps_lo:
+            xy_lo = flat[int(g_lo), :2]
+            best_j, best_d = -1, 1e300
+            for j, g_hi in enumerate(kps_hi):
+                if j in used:
+                    continue
+                dxy = flat[int(g_hi), :2] - xy_lo
+                d = float(dxy[0] * dxy[0] + dxy[1] * dxy[1])
+                if d < best_d:
+                    best_d, best_j = d, j
+            if best_j < 0:
+                return None, None
+            used.add(best_j)
+            matched_hi.append(int(kps_hi[best_j]))
+        return [int(k) for k in kps_lo], matched_hi
+
+    def _local_tris_for_unit(self, unit_id, kp_list):
+        """Map unit triangle global kps → local indices into kp_list."""
+        g2local = {int(g): i for i, g in enumerate(kp_list)}
+        tri_arr = self._unit_triangle_indices_flat(unit_id)
+        local_tris = []
+        for t in range(0, len(tri_arr), 3):
+            try:
+                i0 = g2local[int(tri_arr[t])]
+                i1 = g2local[int(tri_arr[t + 1])]
+                i2 = g2local[int(tri_arr[t + 2])]
+            except KeyError:
+                continue
+            local_tris.append((i0, i1, i2))
+        return local_tris
+
+    def _build_ghost_collision_shells(self):
+        """
+        Build collision-only intermediate Z shells between physical thick heights.
+
+        Spacing is controlled by ``thick_ghost_spacing_mm``: one ghost every
+        X mm along Z between consecutive physical shells (not a fixed count).
+        Ghosts have no mass/springs/creases. Positions each frame are linear
+        blends of the two bounding physical shell vertices.
+        """
+        self._collision_ghost_shells = []
+        self._panel_stock_span = {}
+        self._unit_coll_layer_idx = {}
+
+        spacing = float(getattr(self, "thick_ghost_spacing_mm", 0.0) or 0.0)
+        mapping = self._panel_layer_mapping()
+        flat_kps = getattr(self, "_flat_kps_np", None)
+        if flat_kps is None:
+            flat_kps = np.asarray(self.kps, dtype=numpy_data_type)
+            self._flat_kps_np = flat_kps
+
+        n_ghost = 0
+        for panel_idx, unit_ids in enumerate(mapping):
+            if not unit_ids:
+                continue
+            phys = []
+            for phys_lid, uid in enumerate(unit_ids):
+                h = float(self._unit_layer_height_z(uid))
+                phys.append({"unit": int(uid), "h": h, "phys_layer_idx": int(phys_lid)})
+            phys.sort(key=lambda x: x["h"])
+            zs = [p["h"] for p in phys]
+            self._panel_stock_span[int(panel_idx)] = (
+                (float(min(zs)), float(max(zs))) if zs else (0.0, 0.0)
+            )
+
+            stack = []
+            for i, p in enumerate(phys):
+                stack.append({
+                    "kind": "physical",
+                    "h": p["h"],
+                    "unit": p["unit"],
+                })
+                if spacing <= 1e-12 or i + 1 >= len(phys):
+                    continue
+                h0, h1 = float(p["h"]), float(phys[i + 1]["h"])
+                u0, u1 = p["unit"], phys[i + 1]["unit"]
+                dh = h1 - h0
+                if abs(dh) < 1e-12:
+                    continue
+                # One ghost every ``spacing`` mm strictly between h0 and h1
+                # (do not duplicate the physical endpoints).
+                h = h0 + spacing
+                # Guard against floating-point landing on h1
+                while h < h1 - 1e-9:
+                    alpha = (h - h0) / dh
+                    if alpha <= 1e-12 or alpha >= 1.0 - 1e-12:
+                        h += spacing
+                        continue
+                    stack.append({
+                        "kind": "ghost",
+                        "h": float(h),
+                        "alpha": float(alpha),
+                        "unit_lo": int(u0),
+                        "unit_hi": int(u1),
+                        "panel_idx": int(panel_idx),
+                    })
+                    h += spacing
+
+            for coll_rank, item in enumerate(stack):
+                if item["kind"] == "physical":
+                    self._unit_coll_layer_idx[int(item["unit"])] = int(coll_rank)
+                    continue
+                kp_lo, kp_hi = self._match_unit_kp_correspondence(
+                    item["unit_lo"], item["unit_hi"], flat_kps
+                )
+                if kp_lo is None:
+                    continue
+                local_tris = self._local_tris_for_unit(item["unit_lo"], kp_lo)
+                if not local_tris:
+                    continue
+                ghost = {
+                    "ghost_id": n_ghost,
+                    "panel_idx": int(item["panel_idx"]),
+                    "layer_h": float(item["h"]),
+                    "layer_idx": int(coll_rank),
+                    "alpha": float(item["alpha"]),
+                    "unit_lo": int(item["unit_lo"]),
+                    "unit_hi": int(item["unit_hi"]),
+                    "kp_lo": kp_lo,
+                    "kp_hi": kp_hi,
+                    "local_tris": local_tris,
+                    "shell_kind": "ghost",
+                }
+                self._collision_ghost_shells.append(ghost)
+                n_ghost += 1
+
+        if spacing > 1e-12 or getattr(self, "verbose", False):
+            print(
+                f"[Contact] ghost shells: every {spacing:g} mm → "
+                f"{n_ghost} collision-only shell(s) (no PD); "
+                f"physical units unchanged."
+            )
+
+    def _ghost_shell_live_verts(self, ghost, positions):
+        """Blend live physical shell verts → ghost shell vertex array (n,3)."""
+        a = float(ghost["alpha"])
+        lo = np.asarray(positions[ghost["kp_lo"]], dtype=float)
+        hi = np.asarray(positions[ghost["kp_hi"]], dtype=float)
+        return (1.0 - a) * lo + a * hi
+
+    def _flat_from_ghost_bary(self, p3d, ghost, verts, i0, i1, i2, flat_kps):
+        """Map a 3D ghost contact onto design xy via barycentric on blended tri."""
+        a = verts[i0]
+        b = verts[i1]
+        c = verts[i2]
+        _q, u, v, w = _closest_point_on_triangle_3d(p3d, a, b, c)
+        k0 = int(ghost["kp_lo"][i0])
+        k1 = int(ghost["kp_lo"][i1])
+        k2 = int(ghost["kp_lo"][i2])
+        f0 = np.asarray(flat_kps[k0, :2], dtype=float)
+        f1 = np.asarray(flat_kps[k1, :2], dtype=float)
+        f2 = np.asarray(flat_kps[k2, :2], dtype=float)
+        xy = u * f0 + v * f1 + w * f2
+        return {
+            "p": [float(xy[0]), float(xy[1])],
+            "loc": (k0, k1, k2, float(u), float(v), float(w)),
+        }
+
+    def _annotate_side_depth(self, side, panel_idx, layer_h, shell_kind):
+        """Attach shell_kind + stack depth fields to a contact side dict."""
+        if side is None:
+            return
+        side["shell_kind"] = shell_kind
+        side.update(self._stack_depth_fields(panel_idx, layer_h))
+
+    def _detect_ghost_shell_contacts(
+        self,
+        positions,
+        flat_kps,
+        contact_points,
+        contact_segments,
+        contact_points_flat,
+        contact_segments_flat,
+        max_pts,
+        max_segs,
+    ):
+        """
+        Host-side narrowphase for collision-only ghost shells.
+
+        Ghosts at the same collision-stack layer_idx on different panels are
+        tested with triangle_intersection_contacts_3d. No physics involvement.
+        """
+        ghosts = getattr(self, "_collision_ghost_shells", None) or []
+        if not ghosts:
+            return
+
+        # Prepare live geometry once per ghost
+        prepared = []
+        for g in ghosts:
+            verts = self._ghost_shell_live_verts(g, positions)
+            tris = []
+            for ti, (i0, i1, i2) in enumerate(g["local_tris"]):
+                tris.append({
+                    "local": (i0, i1, i2),
+                    "tri_idx": int(g["ghost_id"]) * 1024 + ti,  # synthetic id
+                    "corners": [
+                        verts[i0].tolist(),
+                        verts[i1].tolist(),
+                        verts[i2].tolist(),
+                    ],
+                })
+            prepared.append({"g": g, "verts": verts, "tris": tris})
+
+        by_layer = {}
+        for prep in prepared:
+            by_layer.setdefault(int(prep["g"]["layer_idx"]), []).append(prep)
+
+        for layer_idx, group in by_layer.items():
+            n = len(group)
+            for ia in range(n):
+                for ib in range(ia + 1, n):
+                    pa = group[ia]
+                    pb = group[ib]
+                    ga = pa["g"]
+                    gb = pb["g"]
+                    if int(ga["panel_idx"]) == int(gb["panel_idx"]):
+                        continue
+                    for ta in pa["tris"]:
+                        for tb in pb["tris"]:
+                            pts = triangle_intersection_contacts_3d(
+                                ta["corners"], tb["corners"], eps=1e-4
+                            )
+                            if not pts:
+                                continue
+                            # Dedup → point or segment
+                            if len(pts) == 1:
+                                kind = 1
+                                p0 = [float(pts[0][0]), float(pts[0][1]), float(pts[0][2])]
+                                p1 = None
+                            else:
+                                kind = 2
+                                p0 = [float(pts[0][0]), float(pts[0][1]), float(pts[0][2])]
+                                p1 = [float(pts[-1][0]), float(pts[-1][1]), float(pts[-1][2])]
+
+                            # Stable unit order for keys (swap both geometry handles)
+                            left, right = pa, pb
+                            t_left, t_right = ta, tb
+                            if int(left["g"]["unit_lo"]) > int(right["g"]["unit_lo"]):
+                                left, right = right, left
+                                t_left, t_right = t_right, t_left
+
+                            gL, gR = left["g"], right["g"]
+                            u_lo = int(gL["unit_lo"])
+                            u_hi = int(gR["unit_lo"])
+                            p_of_ulo = int(gL["panel_idx"])
+                            p_of_uhi = int(gR["panel_idx"])
+                            layer_h_a = float(gL["layer_h"])
+                            layer_h_b = float(gR["layer_h"])
+                            layer_idx_a = int(gL["layer_idx"])
+                            layer_idx_b = int(gR["layer_idx"])
+                            p_lo = min(p_of_ulo, p_of_uhi)
+                            p_hi = max(p_of_ulo, p_of_uhi)
+                            i0a, i1a, i2a = t_left["local"]
+                            i0b, i1b, i2b = t_right["local"]
+
+                            pair_meta = {
+                                "unit_a": u_lo,
+                                "unit_b": u_hi,
+                                "panel_of_unit_a": p_of_ulo,
+                                "panel_of_unit_b": p_of_uhi,
+                                "panel_a": p_lo,
+                                "panel_b": p_hi,
+                                "layer_idx": int(layer_idx),
+                                "layer_h": layer_h_a,
+                                "layer_idx_a": layer_idx_a,
+                                "layer_h_a": layer_h_a,
+                                "layer_idx_b": layer_idx_b,
+                                "layer_h_b": layer_h_b,
+                                "tri_a": int(t_left["tri_idx"]),
+                                "tri_b": int(t_right["tri_idx"]),
+                                "tri_lo": int(t_left["tri_idx"]),
+                                "tri_hi": int(t_right["tri_idx"]),
+                                "shell_kind": "ghost",
+                                "shell_kind_a": "ghost",
+                                "shell_kind_b": "ghost",
+                            }
+
+                            def _side_for(g, verts, loc_i, p3d, panel, lh, sk):
+                                flat = self._flat_from_ghost_bary(
+                                    p3d, g, verts, loc_i[0], loc_i[1], loc_i[2], flat_kps
+                                )
+                                side = {
+                                    "unit": int(g["unit_lo"]),
+                                    "panel": int(panel),
+                                    "layer_idx": int(g["layer_idx"]),
+                                    "layer_h": float(lh),
+                                    "shell_kind": sk,
+                                }
+                                return flat, side
+
+                            if kind == 1:
+                                if len(contact_points) >= max_pts:
+                                    continue
+                                contact_points.append(p0)
+                                ent = dict(pair_meta)
+                                fa, sa = _side_for(
+                                    gL, left["verts"], (i0a, i1a, i2a), p0,
+                                    p_of_ulo, layer_h_a, "ghost",
+                                )
+                                fb, sb = _side_for(
+                                    gR, right["verts"], (i0b, i1b, i2b), p0,
+                                    p_of_uhi, layer_h_b, "ghost",
+                                )
+                                sa["p"] = fa["p"]
+                                sa["loc"] = fa["loc"]
+                                sb["p"] = fb["p"]
+                                sb["loc"] = fb["loc"]
+                                self._annotate_side_depth(sa, p_of_ulo, layer_h_a, "ghost")
+                                self._annotate_side_depth(sb, p_of_uhi, layer_h_b, "ghost")
+                                ent["side_a"] = sa
+                                ent["side_b"] = sb
+                                ent["p"] = fa["p"]
+                                ent["p_3d"] = p0
+                                ent.update(self._stack_depth_fields(p_of_ulo, layer_h_a))
+                                contact_points_flat.append(ent)
+                            else:
+                                if len(contact_segments) >= max_segs:
+                                    continue
+                                contact_segments.append((p0, p1))
+                                ent = dict(pair_meta)
+                                fa0, sa = _side_for(
+                                    gL, left["verts"], (i0a, i1a, i2a), p0,
+                                    p_of_ulo, layer_h_a, "ghost",
+                                )
+                                fa1, _ = _side_for(
+                                    gL, left["verts"], (i0a, i1a, i2a), p1,
+                                    p_of_ulo, layer_h_a, "ghost",
+                                )
+                                fb0, sb = _side_for(
+                                    gR, right["verts"], (i0b, i1b, i2b), p0,
+                                    p_of_uhi, layer_h_b, "ghost",
+                                )
+                                fb1, _ = _side_for(
+                                    gR, right["verts"], (i0b, i1b, i2b), p1,
+                                    p_of_uhi, layer_h_b, "ghost",
+                                )
+                                sa["p0"], sa["p1"] = fa0["p"], fa1["p"]
+                                sa["loc0"], sa["loc1"] = fa0["loc"], fa1["loc"]
+                                sb["p0"], sb["p1"] = fb0["p"], fb1["p"]
+                                sb["loc0"], sb["loc1"] = fb0["loc"], fb1["loc"]
+                                self._annotate_side_depth(sa, p_of_ulo, layer_h_a, "ghost")
+                                self._annotate_side_depth(sb, p_of_uhi, layer_h_b, "ghost")
+                                ent["side_a"] = sa
+                                ent["side_b"] = sb
+                                ent["p0"], ent["p1"] = fa0["p"], fa1["p"]
+                                ent["p0_3d"] = p0
+                                ent["p1_3d"] = p1
+                                ent.update(self._stack_depth_fields(p_of_ulo, layer_h_a))
+                                contact_segments_flat.append(ent)
+                                if len(contact_points) < max_pts:
+                                    contact_points.append(p0)
+                                if len(contact_points) < max_pts:
+                                    contact_points.append(p1)
 
     # ------------------------------------------------------------------
     # Taichi triangle–triangle contact detection (float64)
@@ -3682,9 +4086,18 @@ class PD_Origami_Simulator:
 
         def _layer_of(unit_id, tri_idx):
             meta = unit_layer_meta.get(int(unit_id), {})
-            layer_idx = meta.get("layer_idx")
-            if layer_idx is None:
-                layer_idx = int(unit_layer_idx[unit_id]) if unit_id < len(unit_layer_idx) else -1
+            # Prefer full collision-stack ordinal (includes ghost ranks)
+            coll_map = getattr(self, "_unit_coll_layer_idx", {}) or {}
+            if int(unit_id) in coll_map:
+                layer_idx = int(coll_map[int(unit_id)])
+            else:
+                layer_idx = meta.get("layer_idx")
+                if layer_idx is None:
+                    layer_idx = (
+                        int(unit_layer_idx[unit_id])
+                        if unit_id < len(unit_layer_idx)
+                        else -1
+                    )
             layer_h = meta.get("layer_h", meta.get("height_z"))
             if layer_h is None:
                 kp = tri_kp_indices[int(tri_idx)]
@@ -3704,11 +4117,11 @@ class PD_Origami_Simulator:
             p_of_uhi = int(panel_bs[hi])
             tri_lo = int(tri_as[hi])
             tri_hi = int(tri_bs[hi])
-            # Per-unit thickness identity (absolute offset + per-panel ordinal)
+            # Per-unit thickness identity (absolute offset + collision-stack ordinal)
             layer_idx_a, layer_h_a = _layer_of(u_lo, tri_lo)
             layer_idx_b, layer_h_b = _layer_of(u_hi, tri_hi)
-            # Segment-level fields: prefer lo unit (legacy); sides carry own meta
-            layer_idx_hit = layer_idx_a if layer_idx_a >= 0 else int(layers[hi])
+            # Prefer kernel layer (already remapped to collision stack)
+            layer_idx_hit = int(layers[hi]) if int(layers[hi]) >= 0 else layer_idx_a
             layer_h = layer_h_a
 
             p_lo = p_of_ulo if p_of_ulo <= p_of_uhi else p_of_uhi
@@ -3730,7 +4143,11 @@ class PD_Origami_Simulator:
                 "tri_b": tri_hi,
                 "tri_lo": tri_lo,
                 "tri_hi": tri_hi,
+                "shell_kind": "physical",
+                "shell_kind_a": "physical",
+                "shell_kind_b": "physical",
             }
+            pair_meta.update(self._stack_depth_fields(p_of_ulo, layer_h_a))
 
             def _side_flat(p3d0, p3d1=None, _tri_lo=tri_lo, _tri_hi=tri_hi,
                            _u_lo=u_lo, _u_hi=u_hi, _pulo=p_of_ulo, _puhi=p_of_uhi,
@@ -3748,6 +4165,9 @@ class PD_Origami_Simulator:
                             "layer_idx": int(_li_a), "layer_h": float(_lh_a),
                             "p": a0["p"], "loc": a0["loc"],
                         }
+                        self._annotate_side_depth(
+                            out["side_a"], _pulo, _lh_a, "physical"
+                        )
                         out["p"] = a0["p"]
                     if b0 is not None:
                         out["side_b"] = {
@@ -3755,6 +4175,9 @@ class PD_Origami_Simulator:
                             "layer_idx": int(_li_b), "layer_h": float(_lh_b),
                             "p": b0["p"], "loc": b0["loc"],
                         }
+                        self._annotate_side_depth(
+                            out["side_b"], _puhi, _lh_b, "physical"
+                        )
                         if "p" not in out:
                             out["p"] = b0["p"]
                     return out
@@ -3768,6 +4191,9 @@ class PD_Origami_Simulator:
                         "p0": a0["p"], "p1": a1["p"],
                         "loc0": a0["loc"], "loc1": a1["loc"],
                     }
+                    self._annotate_side_depth(
+                        out["side_a"], _pulo, _lh_a, "physical"
+                    )
                     out["p0"], out["p1"] = a0["p"], a1["p"]
                 if b0 is not None and b1 is not None:
                     out["side_b"] = {
@@ -3776,6 +4202,9 @@ class PD_Origami_Simulator:
                         "p0": b0["p"], "p1": b1["p"],
                         "loc0": b0["loc"], "loc1": b1["loc"],
                     }
+                    self._annotate_side_depth(
+                        out["side_b"], _puhi, _lh_b, "physical"
+                    )
                     if "p0" not in out:
                         out["p0"], out["p1"] = b0["p"], b1["p"]
                 return out if out else None
@@ -3814,6 +4243,23 @@ class PD_Origami_Simulator:
 
             if recorded:
                 colliding_unit_pairs.add((min(u_lo, u_hi), max(u_lo, u_hi)))
+
+        # Collision-only ghost intermediate shells (no physics)
+        try:
+            self._detect_ghost_shell_contacts(
+                positions,
+                flat_kps,
+                contact_points,
+                contact_segments,
+                contact_points_flat,
+                contact_segments_flat,
+                max_pts,
+                max_segs,
+            )
+        except Exception as exc:
+            if not getattr(self, "_ghost_contact_error_logged", False):
+                self._ghost_contact_error_logged = True
+                print(f"[Contact] ghost shell detect failed: {exc}")
 
         self._collision_contact_count = len(contact_points)
         self._collision_segment_count = len(contact_segments)
@@ -4401,23 +4847,52 @@ class PD_Origami_Simulator:
                     side_layer_idx = int(seg["layer_idx_b"])
                 else:
                     side_layer_idx = int(seg.get("layer_idx", -1))
-                # Authoritative: sim unit → panel layer registry
-                su = side.get("unit")
-                if su is not None:
-                    try:
-                        um = self.unit_to_panel_layer(int(su))
-                        side_layer_h = float(um.get("height_z", side_layer_h))
-                        side_layer_idx = int(um.get("layer_idx", side_layer_idx))
-                    except Exception:
-                        pass
+                panel_id = int(side.get("panel", seg.get("panel_a", -1)))
+                shell_kind = side.get("shell_kind") or seg.get("shell_kind") or "physical"
+                # Authoritative physical height from registry — but never for ghost
+                # sides: unit_lo is only a kinematics parent; layer_h is the ghost Z.
+                if shell_kind != "ghost":
+                    su = side.get("unit")
+                    if su is not None:
+                        try:
+                            um = self.unit_to_panel_layer(int(su))
+                            side_layer_h = float(um.get("height_z", side_layer_h))
+                            # Prefer collision-stack ordinal when available
+                            coll_map = getattr(self, "_unit_coll_layer_idx", {}) or {}
+                            if int(su) in coll_map:
+                                side_layer_idx = int(coll_map[int(su)])
+                            else:
+                                side_layer_idx = int(
+                                    um.get("layer_idx", side_layer_idx)
+                                )
+                        except Exception:
+                            pass
+
+                # Depth: prefer values stamped on the side; recompute if missing
+                if side.get("stock_span_mm") is not None and side.get("depth_from_top_mm") is not None:
+                    depth_fields = {
+                        "stock_span_mm": float(side["stock_span_mm"]),
+                        "depth_from_top_mm": float(side["depth_from_top_mm"]),
+                        "depth_from_bottom_mm": float(
+                            side.get("depth_from_bottom_mm", 0.0)
+                        ),
+                    }
+                else:
+                    depth_fields = self._stack_depth_fields(panel_id, side_layer_h)
+                # Keep layer_h consistent with depth if side carried stamped depths
+                # (ghost: side_layer_h already correct; recompute depths from it if
+                # stamped values were from a stale overwrite in older runs).
+                if shell_kind == "ghost":
+                    depth_fields = self._stack_depth_fields(panel_id, side_layer_h)
 
                 regions.append({
                     # identity
-                    "panel": int(side.get("panel", seg.get("panel_a", -1))),
+                    "panel": panel_id,
                     "unit": int(side.get("unit", -1)),
                     "side": side_key,
                     "layer_idx": side_layer_idx,
                     "layer_h": side_layer_h,
+                    "shell_kind": shell_kind,
                     "unit_a": int(seg.get("unit_a", -1)),
                     "unit_b": int(seg.get("unit_b", -1)),
                     "tri_a": int(seg.get("tri_a", -1)),
@@ -4434,6 +4909,8 @@ class PD_Origami_Simulator:
                     "folding_angle": float(
                         seg.get("folding_angle", getattr(self, "folding_angle", 0.0))
                     ),
+                    # stack depth (physical + ghost shells share the same fields)
+                    **depth_fields,
                 })
         return regions
 
@@ -4455,14 +4932,35 @@ class PD_Origami_Simulator:
         n_fixed = len(getattr(self, "_collision_fixed_segments", {}) or {})
         n_pts = len(getattr(self, "_collision_fixed_points", {}) or {})
         n_sweep = sum(1 for r in regions if r.get("kind") == "sweep")
+        n_ghost = sum(1 for r in regions if r.get("shell_kind") == "ghost")
+        n_phys = sum(1 for r in regions if r.get("shell_kind") != "ghost")
+        depth_tops = [
+            float(r["depth_from_top_mm"])
+            for r in regions
+            if r.get("depth_from_top_mm") is not None
+        ]
+        depth_bots = [
+            float(r["depth_from_bottom_mm"])
+            for r in regions
+            if r.get("depth_from_bottom_mm") is not None
+        ]
         self.input_json["collision_stats"] = {
             "schema": "dual_curve_v1",
+            "depth_schema": "stack_shell_v1",
             "n_shaded_regions": len(regions),
             "n_shaded_areas": len(regions),  # alias for older readers
             "n_sweep_paints": n_sweep,
             "n_segments": n_fixed,
             "n_points": n_pts,
             "n_closed_polygons": n_sweep,
+            "n_physical_regions": n_phys,
+            "n_ghost_regions": n_ghost,
+            "thick_ghost_spacing_mm": float(
+                getattr(self, "thick_ghost_spacing_mm", 0.0) or 0.0
+            ),
+            "n_ghost_shells": len(getattr(self, "_collision_ghost_shells", None) or []),
+            "depth_global_max_from_top": float(max(depth_tops) if depth_tops else 0.0),
+            "depth_global_max_from_bottom": float(max(depth_bots) if depth_bots else 0.0),
             "folding_angle": float(getattr(self, "folding_angle", 0.0)),
             # Pointer: full geometry lives in top-level shaded_regions
             "shaded_regions_key": "shaded_regions",
@@ -4470,8 +4968,9 @@ class PD_Origami_Simulator:
         if getattr(self, "verbose", False) or len(regions) > 0:
             print(
                 f"[Contact] shaded export: {len(regions)} region(s) "
-                f"(sweep={n_sweep}, sealed_lines={n_fixed}) "
-                f"schema=dual_curve_v1 → input_json['shaded_regions']"
+                f"(sweep={n_sweep}, sealed_lines={n_fixed}, "
+                f"physical={n_phys}, ghost={n_ghost}) "
+                f"schema=dual_curve_v1 depth=stack_shell_v1 → input_json['shaded_regions']"
             )
 
     def get_fixed_flat_segments(self):

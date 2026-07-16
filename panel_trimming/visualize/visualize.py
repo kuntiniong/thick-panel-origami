@@ -5,6 +5,10 @@ Primary shade (design plane only, no 3D) = **dual-curve export** (preferred):
   shaded_regions[] with c0 / c1 / theta  (schema dual_curve_v1)
   ribbon ring = c0 + reverse(c1); stroke i = segment(c0[i], c1[i])
 
+Shell classification (stack depth):
+  shell_kind == "ghost"     → collision-only intermediate Z shell (no PD)
+  shell_kind == "physical"  → real thick-panel shell (default if missing)
+
 Legacy shade keys still accepted:
   1) coordinates / shaded_polygon / paint_polygon
   2) closed_triangle — first crease edge + max-area last apex
@@ -20,7 +24,8 @@ Data sources (in order):
   4) Reconstructed: shared crease (first) + matched cut (last)
 
 Layer mapping:
-  Each subplot is a thickness offset (layer_h). Only panels that actually
+  Each subplot is a thickness offset (layer_h), stacked vertically from
+  highest offset (top) to lowest (bottom). Only panels that actually
   have that offset (crease thick_panel_height, same rule as phys_sim thick
   mode) are drawn. Shades are filtered by export panel + layer_h.
 
@@ -66,6 +71,11 @@ PANEL_EDGE = "#b0b0b8"
 TRIM_POLY_FACE = "#e45756"
 TRIM_POLY_ALPHA = 0.50
 TRIM_POLY_EDGE = "#a32020"
+# Ghost intermediate shells (collision-only) — distinct from physical red
+GHOST_POLY_FACE = "#4c78a8"
+GHOST_POLY_ALPHA = 0.45
+GHOST_POLY_EDGE = "#1f4e79"
+GHOST_STROKE_COLOR = "#5b8db8"
 FIRST_LINE_COLOR = "#2ca02c"
 LAST_LINE_COLOR = "#d62728"
 CUT_LINE_COLOR = "#c41e3a"
@@ -639,6 +649,19 @@ def _samples_from_dual_curves(
     return out
 
 
+def _shell_kind_of(entry: Optional[dict]) -> str:
+    """Normalize shell_kind: 'ghost' | 'physical' (legacy / missing → physical)."""
+    if not entry:
+        return "physical"
+    raw = entry.get("shell_kind")
+    if raw is None:
+        return "physical"
+    s = str(raw).strip().lower()
+    if s in ("ghost", "g", "intermediate", "collision_only"):
+        return "ghost"
+    return "physical"
+
+
 def _entries_from_shaded_regions(
     regions: Sequence[dict],
 ) -> List[Dict[str, Any]]:
@@ -657,8 +680,14 @@ def _entries_from_shaded_regions(
         samples = _samples_from_dual_curves(theta, c0, c1)
         coords = ring.tolist() if ring is not None else sh.get("coordinates")
         kind = sh.get("kind") or ("sweep" if ring is not None else "line")
+        shell_kind = _shell_kind_of(sh)
         entries.append({
             "layer_h": sh.get("layer_h"),
+            "layer_idx": sh.get("layer_idx"),
+            "shell_kind": shell_kind,
+            "depth_from_top_mm": sh.get("depth_from_top_mm"),
+            "depth_from_bottom_mm": sh.get("depth_from_bottom_mm"),
+            "stock_span_mm": sh.get("stock_span_mm"),
             "coordinates": coords,
             "shaded_polygon": coords,
             "paint_polygon": coords,
@@ -825,6 +854,11 @@ def _items_from_collision_stats(
             "sweep_samples": sweep_samples,
             "tri_a": cp.get("tri_a"),
             "tri_b": cp.get("tri_b"),
+            "shell_kind": _shell_kind_of(cp),
+            "layer_idx": cp.get("layer_idx"),
+            "depth_from_top_mm": cp.get("depth_from_top_mm"),
+            "depth_from_bottom_mm": cp.get("depth_from_bottom_mm"),
+            "stock_span_mm": cp.get("stock_span_mm"),
         })
 
     if out:
@@ -1107,41 +1141,61 @@ def _draw_layer(
             )
 
     n_shaded = 0
+    n_ghost = 0
+    n_physical = 0
     if show_closed_polys:
         for item in closed_polys:
             poly = item["poly"]
             if poly is None or len(poly) < 3:
                 continue
             n_shaded += 1
+            is_ghost = _shell_kind_of(item) == "ghost"
+            if is_ghost:
+                n_ghost += 1
+            else:
+                n_physical += 1
             is_sweep = (
                 item.get("paint_kind") == "sweep"
                 or str(item.get("source", "")).endswith("sweep")
             )
+            face = GHOST_POLY_FACE if is_ghost else TRIM_POLY_FACE
+            edge = GHOST_POLY_EDGE if is_ghost else TRIM_POLY_EDGE
+            alpha = GHOST_POLY_ALPHA if is_ghost else TRIM_POLY_ALPHA
+            # Ghost: dotted hatch; physical non-sweep: diagonal hatch
+            if is_ghost:
+                hatch = "..."
+            elif is_sweep:
+                hatch = None
+            else:
+                hatch = "///"
             _draw_poly(
                 ax, poly,
-                facecolor=TRIM_POLY_FACE, edgecolor=TRIM_POLY_EDGE,
-                linewidth=1.2, alpha=TRIM_POLY_ALPHA,
-                hatch=None if is_sweep else "///",
+                facecolor=face, edgecolor=edge,
+                linewidth=1.2, alpha=alpha,
+                hatch=hatch,
                 zorder=6,
             )
-            # Panel tag on shade (export association)
+            # Panel tag on shade (export association); ·G = ghost shell
             pid = item.get("panel")
             if pid is not None and len(poly) >= 1:
                 c = poly.mean(axis=0)
+                tag = f"P{int(pid)}·G" if is_ghost else f"P{int(pid)}"
                 ax.text(
-                    float(c[0]), float(c[1]), f"P{int(pid)}",
+                    float(c[0]), float(c[1]), tag,
                     ha="center", va="center", fontsize=6.5,
-                    color="#5a0a0a", fontweight="bold", zorder=11,
+                    color="#0a2a5a" if is_ghost else "#5a0a0a",
+                    fontweight="bold", zorder=11,
                 )
             # Draw intermediate two-node line samples (the actual sweep stroke)
             samples = item.get("sweep_samples") or []
+            stroke = GHOST_STROKE_COLOR if is_ghost else "#e45756"
             if is_sweep and len(samples) >= 2:
                 for s in samples:
                     if "p0" not in s or "p1" not in s:
                         continue
                     _draw_seg(
                         ax, s["p0"], s["p1"],
-                        color="#e45756", linewidth=0.55, alpha=0.35,
+                        color=stroke, linewidth=0.55, alpha=0.35,
                         zorder=7, solid_capstyle="round",
                     )
 
@@ -1207,9 +1261,11 @@ def _draw_layer(
             or str(it.get("source", "")).endswith("sweep")
         )
         kind = f"{n_sw} sweeps" if n_sw else "tris/quads"
+        shell_bits = f"phys={n_physical} ghost={n_ghost}"
         ax.set_title(
             f"offset h = {layer_h:g}   "
-            f"({n_panels} panels, {n_shaded} paints, {kind}, src={src})",
+            f"({n_panels} panels, {n_shaded} paints [{shell_bits}], "
+            f"{kind}, src={src})",
             fontsize=11,
         )
     else:
@@ -1334,24 +1390,20 @@ def visualize_trimmed(
         keys = [k for k in keys if any(abs(float(k) - float(h)) < 1e-6 for h in layers)]
         if not keys:
             raise ValueError(f"No matching layers for {layers}; available {list(ubl.keys())}")
-    else:
-        # Prefer subplots only for offsets that have shades (trim view).
-        # Fall back to all reconstructed panel offsets if no shades.
-        shade_hs = set()
-        for sh in shaded_regions or []:
-            if sh.get("layer_h") is not None:
-                shade_hs.add(round(float(sh["layer_h"]), 6))
-        if shade_hs:
-            keys = [k for k in keys if round(float(k), 6) in shade_hs]
-            if not keys:
-                keys = _layer_keys(ubl)
+    # Always show every thickness offset (crease heights + any shade-only
+    # layers). Layers without collision still get a panel outline subplot.
 
     n = len(keys)
-    ncols = min(3, max(n, 1))
-    nrows = int(np.ceil(n / ncols)) if n else 1
+    # Vertical stack: highest thickness offset at top → lowest at bottom
+    try:
+        keys = sorted(keys, key=lambda k: float(k), reverse=True)
+    except ValueError:
+        keys = list(reversed(keys))
+    ncols = 1
+    nrows = max(n, 1)
     fig, axes = plt.subplots(
         nrows, ncols,
-        figsize=(5.2 * ncols, 4.9 * nrows),
+        figsize=(6.2, 4.9 * nrows),
         squeeze=False,
     )
 
@@ -1361,7 +1413,7 @@ def visualize_trimmed(
     sources = set()
 
     for idx, key in enumerate(keys):
-        r, c = divmod(idx, ncols)
+        r, c = idx, 0
         ax = axes[r][c]
         layer_h = float(key)
         layer_units = ubl.get(key) or orig_units
@@ -1408,13 +1460,24 @@ def visualize_trimmed(
             show_first_last_edges=show_first_last_edges,
             panels_on_layer=panels_on_layer,
         )
+        n_g_draw = sum(
+            1 for p in closed
+            if p.get("poly") is not None and len(p["poly"]) >= 3
+            and _shell_kind_of(p) == "ghost"
+        )
+        n_p_draw = sum(
+            1 for p in closed
+            if p.get("poly") is not None and len(p["poly"]) >= 3
+            and _shell_kind_of(p) != "ghost"
+        )
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
         panel_list = ",".join(str(i) for i in sorted(panels_on_layer))
         ax.text(
             0.02, 0.98,
             f"panels @ h: [{panel_list}]\n"
-            f"shades: {n_sh}  (P# on ribbon)\n"
+            f"shades: {n_sh}  (phys={n_p_draw} · ghost={n_g_draw})\n"
+            f"P# = physical · P#·G = ghost shell\n"
             f"first=green · last=red",
             transform=ax.transAxes, ha="left", va="top",
             fontsize=7.5, color="#333333",
@@ -1422,15 +1485,18 @@ def visualize_trimmed(
                       edgecolor="#cccccc", alpha=0.9),
         )
 
-    for idx in range(n, nrows * ncols):
-        r, c = divmod(idx, ncols)
-        axes[r][c].axis("off")
+    for idx in range(n, nrows):
+        axes[idx][0].axis("off")
 
     legend_handles = [
         Patch(facecolor=PANEL_FACE, edgecolor=PANEL_EDGE, label="Panel at this offset"),
         Patch(
             facecolor=TRIM_POLY_FACE, edgecolor=TRIM_POLY_EDGE, alpha=TRIM_POLY_ALPHA,
-            label="Shaded area (panel P# @ layer_h)",
+            label="Physical shell shade (P#)",
+        ),
+        Patch(
+            facecolor=GHOST_POLY_FACE, edgecolor=GHOST_POLY_EDGE, alpha=GHOST_POLY_ALPHA,
+            hatch="...", label="Ghost shell shade (P#·G)",
         ),
         Line2D([0], [0], color=FIRST_LINE_COLOR, lw=2.4, label="first"),
         Line2D([0], [0], color=LAST_LINE_COLOR, lw=2.4, label="last (cut / contact)"),
@@ -1442,11 +1508,20 @@ def visualize_trimmed(
 
     fig_title = title or "Panel trimming"
     fig_title += (
-        "\nshaded = dual-curve ribbon · each subplot = thickness offset · "
-        "only panels with that offset"
+        "\nshaded = dual-curve ribbon · red=physical · blue=ghost intermediate · "
+        "subplots top→bottom = highest→lowest thickness offset"
     )
     meta = trimmed.get("trim_3d_metadata") or {}
     bits = [f"shaded={total_polys}"]
+    n_ghost_all = sum(
+        1 for sh in (shaded_regions or []) if _shell_kind_of(sh) == "ghost"
+    )
+    n_phys_all = sum(
+        1 for sh in (shaded_regions or []) if _shell_kind_of(sh) != "ghost"
+    )
+    if shaded_regions:
+        bits.append(f"phys={n_phys_all}")
+        bits.append(f"ghost={n_ghost_all}")
     if meta:
         bits.append(f"trimmer_cuts={meta.get('n_cuts', '?')}")
     n_dual = len(shaded_regions or [])
@@ -1457,6 +1532,8 @@ def visualize_trimmed(
         bits.append(
             f"stats_shaded={stats.get('n_shaded_regions', stats.get('n_shaded_areas', stats.get('n_closed_polygons', '?')))}"
         )
+        if stats.get("n_ghost_regions") is not None:
+            bits.append(f"stats_ghost={stats.get('n_ghost_regions')}")
     if sources:
         bits.append("src=" + ",".join(sorted(s.split(".")[0] for s in sources)))
     fig_title += "  (" + ", ".join(bits) + ")"
@@ -1495,11 +1572,17 @@ def _run_one(sim: dict, output_dir: str) -> str:
         ),
     )
     n_dual = len(trimmed.get("shaded_regions") or [])
+    n_ghost = sum(
+        1 for sh in (trimmed.get("shaded_regions") or [])
+        if _shell_kind_of(sh) == "ghost"
+    )
+    n_phys = n_dual - n_ghost
     has_ubl = bool(trimmed.get("units_by_layer"))
     print(
         f"[panel-trimming] {os.path.basename(trimmed_path)}  "
         f"collision_stats={'yes' if has_stats else 'no'}  "
         f"segs={n_segs} shaded={n_poly} dual_curve={n_dual}  "
+        f"phys={n_phys} ghost={n_ghost}  "
         f"units_by_layer={'yes' if has_ubl else 'synth-from-units'}"
     )
 

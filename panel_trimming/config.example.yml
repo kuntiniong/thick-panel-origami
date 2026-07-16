@@ -11,3 +11,7 @@ simulations:
     ref_target: false
     thick_mode: true
     unit_edge_max: 4
+    # Collision-only ghost Z shells: one every this many mm between physical
+    # thick heights (no PD / springs). 0 = off.
+    # Example: physical shells at -6 and 2 with spacing 2 → ghosts at -4, -2, 0.
+    thick_ghost_spacing_mm: 2.0

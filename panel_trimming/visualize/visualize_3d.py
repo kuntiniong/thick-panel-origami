@@ -8,6 +8,7 @@ individual thickness layers (checkboxes + All / None).
 
 Each shaded (collided) region is tied to a **specific panel** and **layer**:
   dual_curve_v1 fields: panel, unit, layer_h, layer_idx, side, unit_a/b
+  shell_kind: "physical" (real thick shell) or "ghost" (collision-only intermediate)
   If panel/layer are missing (legacy JSON), they are inferred from geometry.
 
 Usage:
@@ -54,11 +55,27 @@ ACTIVE_PANEL_FACE = "#f5c26b"
 ACTIVE_PANEL_EDGE = "#c47d1a"
 TRIM_FACE = "#e45756"
 TRIM_EDGE = "#a32020"
+# Ghost intermediate shells (collision-only stack samples)
+GHOST_FACE = "#4c78a8"
+GHOST_EDGE = "#1f4e79"
 CREASE_MV = "#444444"
 CREASE_BORDER = "#bbbbbb"
 GUIDE_COLOR = "#9aa0a8"
 TEXT_COLOR = "#222222"
 LAYER_CMAP = "coolwarm"
+
+
+def _shell_kind_of(entry: Optional[dict]) -> str:
+    """Normalize shell_kind: 'ghost' | 'physical' (legacy / missing → physical)."""
+    if not entry:
+        return "physical"
+    raw = entry.get("shell_kind")
+    if raw is None:
+        return "physical"
+    s = str(raw).strip().lower()
+    if s in ("ghost", "g", "intermediate", "collision_only"):
+        return "ghost"
+    return "physical"
 
 
 # ---------------------------------------------------------------------------
@@ -447,12 +464,17 @@ def resolve_shaded_associations(
             and float(area or 0.0) >= 1e-3
         )
 
+        shell_kind = _shell_kind_of(sh)
         rec = {
             "index": idx,
             "panel": panel,
             "unit": unit if unit is not None else sh.get("unit"),
             "layer_h": float(layer_h) if layer_h is not None else None,
             "layer_idx": int(layer_idx) if layer_idx is not None else None,
+            "shell_kind": shell_kind,
+            "depth_from_top_mm": sh.get("depth_from_top_mm"),
+            "depth_from_bottom_mm": sh.get("depth_from_bottom_mm"),
+            "stock_span_mm": sh.get("stock_span_mm"),
             "side": sh.get("side"),
             "unit_a": sh.get("unit_a"),
             "unit_b": sh.get("unit_b"),
@@ -474,29 +496,43 @@ def association_report(
     records: Sequence[Dict[str, Any]],
     panel_offsets: Optional[Sequence[Sequence[float]]] = None,
 ) -> str:
-    """Human-readable panel × layer association summary."""
+    """Human-readable panel × layer association summary (incl. ghost shells)."""
     n = len(records)
     n_ok = sum(1 for r in records if r.get("associated"))
     n_panel_miss = sum(1 for r in records if r.get("panel") is None)
     n_layer_miss = sum(1 for r in records if r.get("layer_h") is None)
     n_mismatch = sum(1 for r in records if r.get("offset_mismatch"))
+    n_ghost = sum(1 for r in records if _shell_kind_of(r) == "ghost")
+    n_phys = n - n_ghost
     sources = defaultdict(int)
     for r in records:
         sources[r.get("panel_source", "?")] += 1
 
     by_pl: Dict[Tuple[Any, Any], int] = defaultdict(int)
+    by_pl_kind: Dict[Tuple[Any, Any, str], int] = defaultdict(int)
     by_layer: Dict[Any, set] = defaultdict(set)
     by_panel: Dict[Any, set] = defaultdict(set)
+    ghost_panels: set = set()
+    phys_panels: set = set()
     for r in records:
         p, h = r.get("panel"), r.get("layer_h")
+        sk = _shell_kind_of(r)
         by_pl[(p, h)] += 1
+        by_pl_kind[(p, h, sk)] += 1
         if h is not None:
             by_layer[h].add(p)
         if p is not None:
             by_panel[p].add(h)
+            if sk == "ghost":
+                ghost_panels.add(int(p))
+            else:
+                phys_panels.add(int(p))
 
     lines = [
         f"shaded/collided regions: {n}",
+        f"  shell_kind: physical={n_phys}  ghost={n_ghost}",
+        f"  panels with physical shades: {sorted(phys_panels)}",
+        f"  panels with ghost shades:    {sorted(ghost_panels)}",
         f"  fully associated (panel + layer_h): {n_ok}/{n}",
         f"  missing panel: {n_panel_miss}   missing layer_h: {n_layer_miss}",
         f"  panel source counts: {dict(sources)}",
@@ -520,26 +556,31 @@ def association_report(
             lines.append(
                 f"  ⚠ {n_mismatch} shade(s) have layer_h outside reconstructed offsets"
             )
-    lines.append("  panel × layer_h  (count):")
-    for (p, h), c in sorted(
-        by_pl.items(),
+    lines.append("  panel × layer_h × shell_kind  (count):")
+    for (p, h, sk), c in sorted(
+        by_pl_kind.items(),
         key=lambda kv: (
             float(kv[0][1]) if kv[0][1] is not None else 1e99,
             kv[0][0] if kv[0][0] is not None else -1,
+            0 if kv[0][2] == "physical" else 1,
         ),
     ):
         p_s = f"P{p}" if p is not None else "P?"
         h_s = f"h={h:g}" if h is not None else "h=?"
+        sk_s = "ghost" if sk == "ghost" else "phys"
         ok = ""
         if (
             panel_offsets is not None
             and p is not None
             and h is not None
             and 0 <= int(p) < len(panel_offsets)
+            and sk != "ghost"
         ):
             if not _panel_has_offset(panel_offsets, int(p), float(h)):
                 ok = "  ⚠ not in panel offsets"
-        lines.append(f"    {p_s:>4} @ {h_s:<12} ×{c}{ok}")
+        elif sk == "ghost":
+            ok = "  (collision-only intermediate)"
+        lines.append(f"    {p_s:>4} @ {h_s:<12} {sk_s:<5} ×{c}{ok}")
     return "\n".join(lines)
 
 
@@ -920,11 +961,15 @@ def build_explosion_scene(
                 ax.add_collection3d(coll)
                 state["collections"].append(coll)
 
-        # --- shaded: closed dual-curve polygons only (batched, no stroke swarm) ---
+        # --- shaded: closed dual-curve polygons (physical=red, ghost=blue) ---
         n_shade_vis = 0
+        n_shade_ghost_vis = 0
+        n_shade_phys_vis = 0
         if show_shades:
-            shade_rgb = to_rgb(TRIM_FACE)
-            shade_edge = to_rgb(TRIM_EDGE)
+            phys_rgb = to_rgb(TRIM_FACE)
+            phys_edge = to_rgb(TRIM_EDGE)
+            ghost_rgb = to_rgb(GHOST_FACE)
+            ghost_edge = to_rgb(GHOST_EDGE)
             # Sit almost on the panel (tiny lift only to avoid z-fighting)
             if len(heights) >= 2:
                 z_span = abs(
@@ -935,7 +980,8 @@ def build_explosion_scene(
                 z_span = max(abs(float(heights[0])), 1.0) if heights else 1.0
             z_lift = max(0.02, 0.0015 * max(z_span, 1.0))
 
-            shade_verts: List[np.ndarray] = []
+            phys_verts: List[np.ndarray] = []
+            ghost_verts: List[np.ndarray] = []
             for key, items in shades.items():
                 try:
                     h = float(key)
@@ -951,23 +997,45 @@ def build_explosion_scene(
                         continue
                     if float(item.get("area") or 0.0) < 1e-3:
                         continue
-                    shade_verts.append(_xy_to_verts3d(poly, z_bias))
+                    is_ghost = _shell_kind_of(item) == "ghost"
+                    verts3 = _xy_to_verts3d(poly, z_bias)
+                    if is_ghost:
+                        ghost_verts.append(verts3)
+                    else:
+                        phys_verts.append(verts3)
                     if show_shade_labels and item.get("panel") is not None:
                         c = poly.mean(axis=0)
+                        tag = (
+                            f"P{int(item['panel'])}·G"
+                            if is_ghost
+                            else f"P{int(item['panel'])}"
+                        )
                         t = ax.text(
                             float(c[0]), float(c[1]), z_bias,
-                            f"P{int(item['panel'])}",
-                            color="#5a0a0a", fontsize=5.5, ha="center", va="center",
+                            tag,
+                            color="#0a2a5a" if is_ghost else "#5a0a0a",
+                            fontsize=5.5, ha="center", va="center",
                         )
                         state["text_artists"].append(t)
 
-            n_shade_vis = len(shade_verts)
-            if shade_verts:
-                # Single collection for all red closed paints → smooth orbit/slider
+            n_shade_phys_vis = len(phys_verts)
+            n_shade_ghost_vis = len(ghost_verts)
+            n_shade_vis = n_shade_phys_vis + n_shade_ghost_vis
+            if phys_verts:
                 coll = Poly3DCollection(
-                    shade_verts,
-                    facecolors=[(*shade_rgb, shade_alpha)] * len(shade_verts),
-                    edgecolors=[shade_edge] * len(shade_verts),
+                    phys_verts,
+                    facecolors=[(*phys_rgb, shade_alpha)] * len(phys_verts),
+                    edgecolors=[phys_edge] * len(phys_verts),
+                    linewidths=0.7,
+                    zsort="average",
+                )
+                ax.add_collection3d(coll)
+                state["collections"].append(coll)
+            if ghost_verts:
+                coll = Poly3DCollection(
+                    ghost_verts,
+                    facecolors=[(*ghost_rgb, shade_alpha)] * len(ghost_verts),
+                    edgecolors=[ghost_edge] * len(ghost_verts),
                     linewidths=0.7,
                     zsort="average",
                 )
@@ -1064,6 +1132,11 @@ def build_explosion_scene(
         _set_equal_aspect_3d(ax, xs_all, ys_all, zs_all)
 
         n_shade = sum(len(v) for v in shades.values())
+        n_ghost_all = sum(
+            1 for items in shades.values()
+            for it in items if _shell_kind_of(it) == "ghost"
+        )
+        n_phys_all = n_shade - n_ghost_all
         n_assoc = state_assoc["n_associated"]
         n_tot = state_assoc["n_total"]
         n_vis = len(vis_heights)
@@ -1071,7 +1144,9 @@ def build_explosion_scene(
         ax.set_title(
             f"{ttl}\n"
             f"layers {n_vis}/{len(heights)} visible  panels={n_panels}  "
-            f"shades={n_shade_vis}/{n_shade}  "
+            f"shades={n_shade_vis}/{n_shade} "
+            f"(phys={n_shade_phys_vis}/{n_phys_all} "
+            f"ghost={n_shade_ghost_vis}/{n_ghost_all})  "
             f"assoc {n_assoc}/{n_tot}  explosion={factor:.2f}",
             fontsize=11, pad=10,
         )
@@ -1111,6 +1186,10 @@ def build_explosion_scene(
 
     n_assoc = state_assoc["n_associated"]
     n_tot = state_assoc["n_total"]
+    n_ghost_help = sum(
+        1 for r in state_assoc["records"] if _shell_kind_of(r) == "ghost"
+    )
+    n_phys_help = n_tot - n_ghost_help
     help_ax.text(
         0.0, 1.0,
         "Layers\n"
@@ -1118,11 +1197,12 @@ def build_explosion_scene(
         "Top = tallest h\n"
         "Bottom = lowest h\n"
         "Panels: color / layer\n"
-        "  (no red — reserved)\n"
-        "Collided: solid red\n"
+        "Phys shade: red  P#\n"
+        "Ghost shade: blue P#·G\n"
+        f"phys={n_phys_help} ghost={n_ghost_help}\n"
         f"assoc {n_assoc}/{n_tot}",
         transform=help_ax.transAxes,
-        va="top", ha="left", fontsize=8.5, color="#333333",
+        va="top", ha="left", fontsize=8.0, color="#333333",
         family="monospace",
         bbox=dict(
             boxstyle="round,pad=0.4", facecolor="#f7f7f9",
@@ -1323,10 +1403,13 @@ def _run_one(
             rec["offset_mismatch"] = False
     n_shade = len(records)
     n_ok = sum(1 for r in records if r.get("associated"))
+    n_ghost = sum(1 for r in records if _shell_kind_of(r) == "ghost")
+    n_phys = n_shade - n_ghost
     print(
         f"[explosion-3d] {os.path.basename(trimmed_path)}  "
         f"thickness_offsets={heights}  units={len(units)}  "
-        f"shaded_regions={n_shade}  associated={n_ok}/{n_shade}"
+        f"shaded_regions={n_shade}  phys={n_phys} ghost={n_ghost}  "
+        f"associated={n_ok}/{n_shade}"
     )
     print(association_report(records, panel_offsets=panel_offsets))
 
