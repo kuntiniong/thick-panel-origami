@@ -5,7 +5,7 @@ Collision-shading runner for phys_sim_pd14.
   headless: false → use_gui=True  (interactive GUI)
 
 When θ hits π, phys_sim_pd14 auto-writes:
-  trimmedData/<name>-trimmed.json
+  panel_trimming/trimmedData/<name>-trimmed.json
   (source descriptionData JSON is left alone; dual-curve shaded_regions appended)
 
 Usage:
@@ -89,6 +89,9 @@ def run_simulations(
                 )
                 thick_ghost_spacing_mm = 1.0
 
+        # Vertical side panels (unique indices, collision-only). Default on.
+        thick_side_panels = bool(sim.get("thick_side_panels", True))
+
         ori = PD_Origami_Simulator(
             origami_name=name,
             use_gui=use_gui,
@@ -102,6 +105,7 @@ def run_simulations(
             verbose=sim.get("verbose", False),
             collision_shading=True,
             thick_ghost_spacing_mm=thick_ghost_spacing_mm,
+            thick_side_panels=thick_side_panels,
         )
 
         ori.start(
@@ -115,7 +119,8 @@ def run_simulations(
         print(
             f"[collision-shading] thick_mode={bool(thick_mode)}; "
             f"thick_ghost_spacing_mm={thick_ghost_spacing_mm:g} (ghost); "
-            f"{mode}; export trimmedData/{name}-trimmed.json at π"
+            f"thick_side_panels={thick_side_panels}; "
+            f"{mode}; export panel_trimming/trimmedData/{name}-trimmed.json at π"
         )
         ori.run()
 
@@ -128,7 +133,7 @@ def run_simulations(
             print(
                 f"[collision-shading] WARNING: no trimmed JSON written "
                 f"(θ={float(getattr(ori, 'folding_angle', 0.0)):.4f}). "
-                f"Expected trimmedData/{name}-trimmed.json"
+                f"Expected panel_trimming/trimmedData/{name}-trimmed.json"
             )
 
 

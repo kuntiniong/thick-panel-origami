@@ -1,0 +1,48 @@
+# Panel-trimming clean pipeline (example)
+#
+# Reads  panel_trimming/trimmedData/*-trimmed.json
+# Writes panel_trimming/trimmedData/*-cleaned.json
+#
+# STL:
+#   python panel_trimming/clean/json_to_stl.py --name mountain-thick-cleaned
+#
+# Usage:
+#   python panel_trimming/clean/clean.py --config panel_trimming/clean/config.example.yml
+#   python panel_trimming/clean/clean.py --name mountain-thick-trimmed --fabric-offset 0.5
+
+# Defaults applied to every job (per-job keys override these)
+min_area: 0.0
+straight_cut: true
+cut_tol: 1.5
+# Merge near-coincident cut corners → one outermost node each
+corner_merge_tol: 3.0
+# Outward fabrication offset (design units / mm). 0 = off.
+# Offset is clamped: cannot cross mountain/valley creases, borders, or host panel.
+fabric_offset: 0.5
+attach_polygon_meta: true
+drop_line_kind: true
+# output_dir: trimmedData   # optional; default panel_trimming/trimmedData
+
+jobs:
+  - name: mountain-thick-trimmed
+    # example overrides:
+    # min_area: 0
+    # fabric_offset: 0.8
+    # cut_tol: 2.0
+    # corner_merge_tol: 3.0
+    # straight_cut: true
+
+  # - name: miura-thick-trimmed
+  #   fabric_offset: 1.0
+
+# One combined STL per design (all panels merged)
+stl:
+  default_thickness: 6.0
+  hole_source: fabric       # fabric | cut | none
+  crease_height: 1.0        # default |thick_panel_height| (mm); type0=+H else -H
+  force_crease_height: false
+  crease_gap: 0.0           # optional hinge slot width (mm); 0 = off
+  include_ghost: false
+  pack: false               # nest panels along +X (still one file)
+  pack_gap: 5.0
+  ascii: false

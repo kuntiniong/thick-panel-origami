@@ -154,13 +154,21 @@ def _map_point_3d_to_flat_2d(p3d, verts_3d, verts_flat_xy, return_bary=False):
 
 @ti.data_oriented
 class PD_Origami_Simulator:
-    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.975, material_type=1, ref_target=False, verbose=False, collision_shading=False, thick_ghost_spacing_mm=0.0):
+    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.975, material_type=1, ref_target=False, verbose=False, collision_shading=False, thick_ghost_spacing_mm=0.0, thick_side_panels=True):
         self.use_gui = use_gui
         self.collision_shading = collision_shading
         # Collision-only ghost Z shells every this many mm between physical
         # thick heights (0 = off). No PD / mass / springs.
         self.thick_ghost_spacing_mm = float(thick_ghost_spacing_mm or 0.0)
         self._collision_ghost_shells = []
+        # Collision-only vertical side panels between consecutive layer heights
+        # (unique panel indices, no PD / mass / springs). Config can disable.
+        self.thick_side_panels = bool(thick_side_panels)
+        self._collision_side_panels = []
+        # GUI render: index buffer into live self.vertices + edge line verts
+        self._side_panel_index_count = 0
+        self._side_panel_edge_vert_count = 0
+        self._side_panel_edge_kp_pairs = None  # (n_edges, 2) int kp indices
         self._panel_stock_span = {}
         self._unit_coll_layer_idx = {}
         self._collision_contact_count = 0
@@ -559,6 +567,53 @@ class PD_Origami_Simulator:
                 self.coll_hit_panel_a = ti.field(dtype=ti.i32, shape=max_hits)
                 self.coll_hit_panel_b = ti.field(dtype=ti.i32, shape=max_hits)
                 self.coll_hit_layer = ti.field(dtype=ti.i32, shape=max_hits)
+                # Physical tri design height (for side↔phys Z-band filter)
+                self.coll_tri_h = ti.field(dtype=data_type, shape=max_tris)
+
+                # Collision-only vertical side panels (Taichi narrowphase + draw)
+                max_side_tris = max(int(max_tris) * 2, 2048)
+                max_side_edges = max(max_side_tris, 1024)
+                max_side_idx = max(max_side_tris * 3, 3)
+                self._side_max_tris = int(max_side_tris)
+                self._side_max_edges = int(max_side_edges)
+                self.side_n_tris = ti.field(dtype=ti.i32, shape=())
+                self.side_tri_kp = ti.field(dtype=ti.i32, shape=(max_side_tris, 3))
+                self.side_tri_panel = ti.field(dtype=ti.i32, shape=max_side_tris)
+                self.side_tri_parent = ti.field(dtype=ti.i32, shape=max_side_tris)
+                self.side_tri_unit = ti.field(dtype=ti.i32, shape=max_side_tris)
+                self.side_tri_layer = ti.field(dtype=ti.i32, shape=max_side_tris)
+                self.side_tri_layer_h = ti.field(dtype=data_type, shape=max_side_tris)
+                self.side_tri_h_lo = ti.field(dtype=data_type, shape=max_side_tris)
+                self.side_tri_h_hi = ti.field(dtype=data_type, shape=max_side_tris)
+                self.side_tri_id = ti.field(dtype=ti.i32, shape=max_side_tris)
+                # Mesh index buffer (flat 3*n_tris) into live self.vertices
+                self.side_panel_indices = ti.field(dtype=ti.i32, shape=max_side_idx)
+                self.side_n_edges = ti.field(dtype=ti.i32, shape=())
+                self.side_edge_kp = ti.field(dtype=ti.i32, shape=(max_side_edges, 2))
+                self.side_panel_edge_verts = ti.Vector.field(
+                    3, dtype=ti.f32, shape=max_side_edges * 2
+                )
+                # Side-panel contact hits (separate from physical coll_hit_*)
+                self.side_hit_count = ti.field(dtype=ti.i32, shape=())
+                self.side_hit_kind = ti.field(dtype=ti.i32, shape=max_hits)
+                self.side_hit_p0 = ti.Vector.field(3, dtype=data_type, shape=max_hits)
+                self.side_hit_p1 = ti.Vector.field(3, dtype=data_type, shape=max_hits)
+                self.side_hit_tri_a = ti.field(dtype=ti.i32, shape=max_hits)
+                self.side_hit_tri_b = ti.field(dtype=ti.i32, shape=max_hits)
+                self.side_hit_unit_a = ti.field(dtype=ti.i32, shape=max_hits)
+                self.side_hit_unit_b = ti.field(dtype=ti.i32, shape=max_hits)
+                self.side_hit_panel_a = ti.field(dtype=ti.i32, shape=max_hits)
+                self.side_hit_panel_b = ti.field(dtype=ti.i32, shape=max_hits)
+                self.side_hit_parent_a = ti.field(dtype=ti.i32, shape=max_hits)
+                self.side_hit_parent_b = ti.field(dtype=ti.i32, shape=max_hits)
+                self.side_hit_layer_a = ti.field(dtype=ti.i32, shape=max_hits)
+                self.side_hit_layer_b = ti.field(dtype=ti.i32, shape=max_hits)
+                self.side_hit_layer_h_a = ti.field(dtype=data_type, shape=max_hits)
+                self.side_hit_layer_h_b = ti.field(dtype=data_type, shape=max_hits)
+                self.side_hit_h_lo_a = ti.field(dtype=data_type, shape=max_hits)
+                self.side_hit_h_hi_a = ti.field(dtype=data_type, shape=max_hits)
+                # 0 = side↔side, 1 = side↔physical
+                self.side_hit_partner_kind = ti.field(dtype=ti.i32, shape=max_hits)
 
             self.indices = ti.field(int, shape=self.maximum_indice_num) #三角面索引信息
 
@@ -2926,18 +2981,21 @@ class PD_Origami_Simulator:
         self.window.show()
 
     def _default_trimmed_json_path(self):
-        """trimmedData/<name>-trimmed.json (never clobber source descriptionData)."""
+        """panel_trimming/trimmedData/<name>-trimmed.json (never clobber source descriptionData)."""
         name = str(getattr(self, "origami_name", "export") or "export")
         # avoid name-trimmed-trimmed if already a trimmed stem
         if name.endswith("-trimmed"):
             stem = name
         else:
             stem = f"{name}-trimmed"
-        return os.path.join("trimmedData", f"{stem}.json")
+        # Prefer absolute under project root so cwd does not matter
+        root = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(root, "panel_trimming", "trimmedData", f"{stem}.json")
 
     def export_trimmed_json(self, path=None, reason="fold_pi", force=False):
         """
-        Write design JSON + dual-curve shaded_regions to trimmedData/*-trimmed.json.
+        Write design JSON + dual-curve shaded_regions to
+        panel_trimming/trimmedData/*-trimmed.json.
 
         Called automatically when θ hits π (collision_shading). Source design
         ``descriptionData/<name>.json`` is left unchanged.
@@ -3253,6 +3311,8 @@ class PD_Origami_Simulator:
         if getattr(self, "_flat_kps_np", None) is None:
             self._flat_kps_np = np.asarray(self.kps, dtype=numpy_data_type)
         self._build_ghost_collision_shells()
+        # Vertical side panels fill the gap between consecutive physical heights.
+        self._build_side_collision_panels()
 
         # Upload topology into Taichi fields for the contact kernel
         if hasattr(self, "coll_tri_kp"):
@@ -3269,7 +3329,9 @@ class PD_Origami_Simulator:
             # Ghosts are host-side only; physical tris use remapped ranks so the
             # same ordinal still means "same depth sample" across panels.
             coll_layer_map = getattr(self, "_unit_coll_layer_idx", {}) or {}
+            unit_layer_meta = getattr(self, "_collision_unit_layer_meta", None) or {}
             tri_layer = np.full(num_tris, -1, dtype=np.int32)
+            tri_h = np.zeros(num_tris, dtype=numpy_data_type)
             for t in range(num_tris):
                 u = int(tri_unit_ids[t])
                 if 0 <= u < len(unit_panel_idx):
@@ -3278,19 +3340,29 @@ class PD_Origami_Simulator:
                         tri_layer[t] = int(coll_layer_map[u])
                     else:
                         tri_layer[t] = int(unit_layer_idx[u])
+                    meta = unit_layer_meta.get(u, {})
+                    lh = meta.get("layer_h", meta.get("height_z"))
+                    if lh is not None:
+                        tri_h[t] = float(lh)
+                    else:
+                        tri_h[t] = float(self._unit_layer_height_z(u))
             kp_buf = np.zeros((max_tris, 3), dtype=np.int32)
             unit_buf = np.zeros(max_tris, dtype=np.int32)
             panel_buf = np.full(max_tris, -1, dtype=np.int32)
             layer_buf = np.full(max_tris, -1, dtype=np.int32)
+            h_buf = np.zeros(max_tris, dtype=numpy_data_type)
             kp_buf[:num_tris] = tri_kp_indices[:num_tris]
             unit_buf[:num_tris] = tri_unit_ids[:num_tris]
             panel_buf[:num_tris] = tri_panel
             layer_buf[:num_tris] = tri_layer
+            h_buf[:num_tris] = tri_h
             self.coll_n_tris[None] = int(num_tris)
             self.coll_tri_kp.from_numpy(kp_buf)
             self.coll_tri_unit.from_numpy(unit_buf)
             self.coll_tri_panel.from_numpy(panel_buf)
             self.coll_tri_layer.from_numpy(layer_buf)
+            if hasattr(self, "coll_tri_h"):
+                self.coll_tri_h.from_numpy(h_buf)
 
     # ------------------------------------------------------------------
     # Ghost intermediate shells (collision-only, no PD / springs)
@@ -3459,6 +3531,734 @@ class PD_Origami_Simulator:
                 f"{n_ghost} collision-only shell(s) (no PD); "
                 f"physical units unchanged."
             )
+
+    # ------------------------------------------------------------------
+    # Vertical side panels (collision-only, unique panel indices, no PD)
+    # ------------------------------------------------------------------
+
+    def _unit_outline_kp_ordered(self, unit_id):
+        """Boundary keypoint indices of a sim unit in outline order."""
+        if not hasattr(self, "ori_sim"):
+            return []
+        raw = self.ori_sim.indices[int(unit_id)]
+        return [int(idx) for idx in raw if int(idx) != -1]
+
+    def _build_side_collision_panels(self):
+        """
+        Build collision-only vertical side panels between consecutive physical
+        layer heights of each thick design panel.
+
+        Each band (panel, h_lo → h_hi) becomes one side panel with:
+          - a unique panel_idx (after all design panels)
+          - edge quads linking corresponding outline verts of the two shells
+          - no mass / springs / PD (host-side narrowphase only)
+
+        Closes the open gap between stacked thickness layers so side faces
+        participate in contact detection and export/visualization.
+        """
+        self._collision_side_panels = []
+        self._side_panel_index_count = 0
+        self._side_panel_edge_vert_count = 0
+        self._side_panel_edge_kp_pairs = None
+        if not bool(getattr(self, "thick_mode_flag", False)):
+            return
+        if not bool(getattr(self, "collision_shading", False)):
+            return
+        if not bool(getattr(self, "thick_side_panels", True)):
+            if getattr(self, "verbose", False):
+                print("[Contact] side panels: disabled (thick_side_panels=false).")
+            # Clear any prior Taichi counts if fields exist
+            if hasattr(self, "side_n_tris"):
+                self.side_n_tris[None] = 0
+                self.side_n_edges[None] = 0
+                self.side_hit_count[None] = 0
+            return
+
+        mapping = self._panel_layer_mapping()
+        n_design = len(mapping)
+        flat_kps = getattr(self, "_flat_kps_np", None)
+        if flat_kps is None:
+            flat_kps = np.asarray(self.kps, dtype=numpy_data_type)
+            self._flat_kps_np = flat_kps
+
+        next_panel_idx = int(n_design)
+        n_side = 0
+        for panel_idx, unit_ids in enumerate(mapping):
+            if not unit_ids or len(unit_ids) < 2:
+                continue
+            phys = []
+            for phys_lid, uid in enumerate(unit_ids):
+                h = float(self._unit_layer_height_z(uid))
+                phys.append({
+                    "unit": int(uid),
+                    "h": h,
+                    "phys_layer_idx": int(phys_lid),
+                })
+            phys.sort(key=lambda x: x["h"])
+
+            for i in range(len(phys) - 1):
+                p0, p1 = phys[i], phys[i + 1]
+                h0, h1 = float(p0["h"]), float(p1["h"])
+                if abs(h1 - h0) < 1e-9:
+                    continue
+                u0, u1 = int(p0["unit"]), int(p1["unit"])
+                outline_lo = self._unit_outline_kp_ordered(u0)
+                if len(outline_lo) < 3:
+                    continue
+                # Match by design-xy so shared/merged mesh verts still pair correctly
+                # even when outline index order differs between layers.
+                matched_lo, matched_hi = self._match_unit_kp_correspondence(
+                    u0, u1, flat_kps
+                )
+                if matched_lo is None:
+                    continue
+                # Reorder matched pairs into outline_lo order for a closed band.
+                hi_of = {
+                    int(a): int(b) for a, b in zip(matched_lo, matched_hi)
+                }
+                kp_lo = []
+                kp_hi = []
+                for g in outline_lo:
+                    g = int(g)
+                    if g not in hi_of:
+                        # nearest matched lo by design xy
+                        xy = flat_kps[g, :2]
+                        best_a, best_d = None, 1e300
+                        for a in matched_lo:
+                            dxy = flat_kps[int(a), :2] - xy
+                            d = float(dxy[0] * dxy[0] + dxy[1] * dxy[1])
+                            if d < best_d:
+                                best_d, best_a = d, int(a)
+                        if best_a is None or best_a not in hi_of:
+                            continue
+                        g = best_a
+                    kp_lo.append(g)
+                    kp_hi.append(hi_of[g])
+                n_e = len(kp_lo)
+                if n_e < 3 or len(kp_hi) != n_e:
+                    continue
+
+                edges = []
+                local_tris = []  # flat list of (edge_i, i0, i1, i2) for narrowphase
+                for j in range(n_e):
+                    j1 = (j + 1) % n_e
+                    # Quad corners: lo[j], lo[j1], hi[j1], hi[j]
+                    corners = [
+                        int(kp_lo[j]),
+                        int(kp_lo[j1]),
+                        int(kp_hi[j1]),
+                        int(kp_hi[j]),
+                    ]
+                    # Skip degenerate (zero-area) edges in design xy
+                    f0 = flat_kps[corners[0], :2]
+                    f1 = flat_kps[corners[1], :2]
+                    if float(np.dot(f1 - f0, f1 - f0)) < 1e-16:
+                        continue
+                    edges.append({
+                        "kp": corners,
+                        "edge_idx": int(j),
+                    })
+                    ei = len(edges) - 1
+                    # Two triangles of the vertical (or near-vertical) wall
+                    local_tris.append((ei, 0, 1, 2))
+                    local_tris.append((ei, 0, 2, 3))
+
+                if not edges or not local_tris:
+                    continue
+
+                # Design-xy footprint: thin strip along the parent panel outline
+                # (for export/viz association). Use parent outline at mid height.
+                outline_xy = []
+                for g in kp_lo:
+                    outline_xy.append([
+                        float(flat_kps[int(g), 0]),
+                        float(flat_kps[int(g), 1]),
+                    ])
+
+                side = {
+                    "side_id": int(n_side),
+                    "panel_idx": int(next_panel_idx),
+                    "parent_panel_idx": int(panel_idx),
+                    "h_lo": float(h0),
+                    "h_hi": float(h1),
+                    "layer_h": float(0.5 * (h0 + h1)),
+                    "layer_idx": int(i),  # band ordinal within parent
+                    "unit_lo": u0,
+                    "unit_hi": u1,
+                    "edges": edges,
+                    "local_tris": local_tris,
+                    "outline_xy": outline_xy,
+                    "shell_kind": "side",
+                }
+                self._collision_side_panels.append(side)
+                next_panel_idx += 1
+                n_side += 1
+
+        if n_side > 0 or getattr(self, "verbose", False):
+            print(
+                f"[Contact] side panels: {n_side} collision-only vertical "
+                f"band(s) (unique panel indices "
+                f"{n_design}..{next_panel_idx - 1 if n_side else n_design - 1}; "
+                f"no PD)."
+            )
+        self._upload_side_panel_taichi_buffers()
+
+    def _upload_side_panel_taichi_buffers(self):
+        """
+        Upload side-panel topology into Taichi fields (once after build).
+
+        Per-frame: kernels read live ``self.x`` for contact + edge lines.
+        Faces draw via ``side_panel_indices`` into live ``self.vertices``.
+        """
+        sides = getattr(self, "_collision_side_panels", None) or []
+        if not hasattr(self, "side_n_tris"):
+            # collision_shading buffers not allocated
+            self._side_panel_index_count = 0
+            self._side_panel_edge_vert_count = 0
+            return
+
+        max_tris = int(getattr(self, "_side_max_tris", 0) or 0)
+        max_edges = int(getattr(self, "_side_max_edges", 0) or 0)
+        max_idx = int(self.side_panel_indices.shape[0]) if hasattr(self, "side_panel_indices") else 0
+
+        tri_kp = []
+        tri_panel = []
+        tri_parent = []
+        tri_unit = []
+        tri_layer = []
+        tri_layer_h = []
+        tri_h_lo = []
+        tri_h_hi = []
+        tri_id = []
+        edge_pairs = []
+        idx_flat = []
+
+        stopped = False
+        for s in sides:
+            if stopped:
+                break
+            panel = int(s["panel_idx"])
+            parent = int(s["parent_panel_idx"])
+            unit = int(s.get("unit_lo", -1))
+            layer = int(s.get("layer_idx", -1))
+            lh = float(s["layer_h"])
+            h_lo = float(s["h_lo"])
+            h_hi = float(s["h_hi"])
+            edges = s.get("edges") or []
+            for e in edges:
+                if stopped:
+                    break
+                kp = e.get("kp") or []
+                if len(kp) < 4:
+                    continue
+                k0, k1, k2, k3 = int(kp[0]), int(kp[1]), int(kp[2]), int(kp[3])
+                # two tris of the vertical quad
+                for a, b, c in ((k0, k1, k2), (k0, k2, k3)):
+                    local_i = len(tri_kp)
+                    if max_tris > 0 and local_i >= max_tris:
+                        stopped = True
+                        break
+                    tri_kp.append((a, b, c))
+                    tri_panel.append(panel)
+                    tri_parent.append(parent)
+                    tri_unit.append(unit)
+                    tri_layer.append(layer)
+                    tri_layer_h.append(lh)
+                    tri_h_lo.append(h_lo)
+                    tri_h_hi.append(h_hi)
+                    tri_id.append(int(s["side_id"]) * 4096 + local_i)
+                    idx_flat.extend([a, b, c])
+                if stopped:
+                    break
+                edge_pairs.extend([(k0, k1), (k1, k2), (k2, k3), (k3, k0)])
+
+        n_tris = len(tri_kp)
+        n_edges = len(edge_pairs)
+        n_idx = len(idx_flat)
+        if stopped:
+            print(
+                f"[Contact] side tris clamped to {max_tris}; "
+                "increase mesh budget if needed."
+            )
+        if max_edges > 0 and n_edges > max_edges:
+            edge_pairs = edge_pairs[:max_edges]
+            n_edges = max_edges
+        if max_idx > 0 and n_idx > max_idx:
+            idx_flat = idx_flat[: max_idx - (max_idx % 3)]
+            n_idx = len(idx_flat)
+            n_tris = n_idx // 3
+
+        self._side_panel_index_count = int(n_idx)
+        self._side_panel_edge_vert_count = int(n_edges * 2)
+        # Host mirror of tri kp for flat design-xy mapping after kernel hits
+        self._side_tri_kp_host = (
+            np.asarray(tri_kp[:n_tris], dtype=np.int32)
+            if n_tris > 0 else np.zeros((0, 3), dtype=np.int32)
+        )
+
+        # --- fill Taichi fields ---
+        self.side_n_tris[None] = int(n_tris)
+        self.side_n_edges[None] = int(n_edges)
+
+        kp_buf = np.zeros((max_tris, 3), dtype=np.int32)
+        panel_buf = np.full(max_tris, -1, dtype=np.int32)
+        parent_buf = np.full(max_tris, -1, dtype=np.int32)
+        unit_buf = np.full(max_tris, -1, dtype=np.int32)
+        layer_buf = np.full(max_tris, -1, dtype=np.int32)
+        lh_buf = np.zeros(max_tris, dtype=numpy_data_type)
+        hlo_buf = np.zeros(max_tris, dtype=numpy_data_type)
+        hhi_buf = np.zeros(max_tris, dtype=numpy_data_type)
+        id_buf = np.full(max_tris, -1, dtype=np.int32)
+        if n_tris > 0:
+            arr = np.asarray(tri_kp[:n_tris], dtype=np.int32)
+            kp_buf[:n_tris] = arr
+            panel_buf[:n_tris] = np.asarray(tri_panel[:n_tris], dtype=np.int32)
+            parent_buf[:n_tris] = np.asarray(tri_parent[:n_tris], dtype=np.int32)
+            unit_buf[:n_tris] = np.asarray(tri_unit[:n_tris], dtype=np.int32)
+            layer_buf[:n_tris] = np.asarray(tri_layer[:n_tris], dtype=np.int32)
+            lh_buf[:n_tris] = np.asarray(tri_layer_h[:n_tris], dtype=numpy_data_type)
+            hlo_buf[:n_tris] = np.asarray(tri_h_lo[:n_tris], dtype=numpy_data_type)
+            hhi_buf[:n_tris] = np.asarray(tri_h_hi[:n_tris], dtype=numpy_data_type)
+            id_buf[:n_tris] = np.asarray(tri_id[:n_tris], dtype=np.int32)
+        self.side_tri_kp.from_numpy(kp_buf)
+        self.side_tri_panel.from_numpy(panel_buf)
+        self.side_tri_parent.from_numpy(parent_buf)
+        self.side_tri_unit.from_numpy(unit_buf)
+        self.side_tri_layer.from_numpy(layer_buf)
+        self.side_tri_layer_h.from_numpy(lh_buf)
+        self.side_tri_h_lo.from_numpy(hlo_buf)
+        self.side_tri_h_hi.from_numpy(hhi_buf)
+        self.side_tri_id.from_numpy(id_buf)
+
+        idx_buf = np.zeros(max_idx, dtype=np.int32)
+        if n_idx > 0:
+            idx_buf[:n_idx] = np.asarray(idx_flat[:n_idx], dtype=np.int32)
+        self.side_panel_indices.from_numpy(idx_buf)
+
+        edge_buf = np.zeros((max_edges, 2), dtype=np.int32)
+        if n_edges > 0:
+            edge_buf[:n_edges] = np.asarray(edge_pairs[:n_edges], dtype=np.int32)
+        self.side_edge_kp.from_numpy(edge_buf)
+        self.side_panel_edge_verts.fill(0)
+        self.side_hit_count[None] = 0
+
+    @ti.kernel
+    def _kernel_update_side_panel_edge_lines(self):
+        """Taichi: copy live self.x → side wall outline line verts (f32)."""
+        n = self.side_n_edges[None]
+        for i in range(n):
+            a = self.side_edge_kp[i, 0]
+            b = self.side_edge_kp[i, 1]
+            self.side_panel_edge_verts[2 * i] = ti.cast(self.x[a], ti.f32)
+            self.side_panel_edge_verts[2 * i + 1] = ti.cast(self.x[b], ti.f32)
+
+    @ti.kernel
+    def _kernel_detect_side_side_contacts(
+        self, hit_eps: data_type, aabb_pad: data_type, prox_eps: data_type,
+    ):
+        """
+        Taichi narrowphase: side panel ↔ side panel (different parents).
+        Sensitive: allow coplanar, expanded AABB, proximity fallback.
+        Resets side_hit_* then writes hits.
+        """
+        self.side_hit_count[None] = 0
+        n = self.side_n_tris[None]
+        max_hits = self.side_hit_kind.shape[0]
+        for ta, tb in ti.ndrange(n, n):
+            if tb <= ta:
+                continue
+            parent_a = self.side_tri_parent[ta]
+            parent_b = self.side_tri_parent[tb]
+            if parent_a < 0 or parent_b < 0 or parent_a == parent_b:
+                continue
+            panel_a = self.side_tri_panel[ta]
+            panel_b = self.side_tri_panel[tb]
+            if panel_a == panel_b:
+                continue
+            i0 = self.side_tri_kp[ta, 0]
+            i1 = self.side_tri_kp[ta, 1]
+            i2 = self.side_tri_kp[ta, 2]
+            j0 = self.side_tri_kp[tb, 0]
+            j1 = self.side_tri_kp[tb, 1]
+            j2 = self.side_tri_kp[tb, 2]
+            # Skip any shared vertex (same as physical shells)
+            if self._ti_share_vert(i0, i1, i2, j0, j1, j2) == 1:
+                continue
+            a0 = self.x[i0]
+            a1 = self.x[i1]
+            a2 = self.x[i2]
+            b0 = self.x[j0]
+            b1 = self.x[j1]
+            b2 = self.x[j2]
+            # Strict: no coplanar, no proximity (match physical panel kernel)
+            kind, p0, p1 = self._ti_tri_tri_contact_ex(
+                a0, a1, a2, b0, b1, b2, hit_eps,
+                aabb_pad, 0, prox_eps,
+            )
+            if kind == 0:
+                continue
+            idx = ti.atomic_add(self.side_hit_count[None], 1)
+            if idx < max_hits:
+                # stable order by panel index
+                if panel_a <= panel_b:
+                    self.side_hit_kind[idx] = kind
+                    self.side_hit_p0[idx] = p0
+                    self.side_hit_p1[idx] = p1
+                    self.side_hit_tri_a[idx] = ta
+                    self.side_hit_tri_b[idx] = tb
+                    self.side_hit_unit_a[idx] = self.side_tri_unit[ta]
+                    self.side_hit_unit_b[idx] = self.side_tri_unit[tb]
+                    self.side_hit_panel_a[idx] = panel_a
+                    self.side_hit_panel_b[idx] = panel_b
+                    self.side_hit_parent_a[idx] = parent_a
+                    self.side_hit_parent_b[idx] = parent_b
+                    self.side_hit_layer_a[idx] = self.side_tri_layer[ta]
+                    self.side_hit_layer_b[idx] = self.side_tri_layer[tb]
+                    self.side_hit_layer_h_a[idx] = self.side_tri_layer_h[ta]
+                    self.side_hit_layer_h_b[idx] = self.side_tri_layer_h[tb]
+                    self.side_hit_h_lo_a[idx] = self.side_tri_h_lo[ta]
+                    self.side_hit_h_hi_a[idx] = self.side_tri_h_hi[ta]
+                else:
+                    self.side_hit_kind[idx] = kind
+                    self.side_hit_p0[idx] = p0
+                    self.side_hit_p1[idx] = p1
+                    self.side_hit_tri_a[idx] = tb
+                    self.side_hit_tri_b[idx] = ta
+                    self.side_hit_unit_a[idx] = self.side_tri_unit[tb]
+                    self.side_hit_unit_b[idx] = self.side_tri_unit[ta]
+                    self.side_hit_panel_a[idx] = panel_b
+                    self.side_hit_panel_b[idx] = panel_a
+                    self.side_hit_parent_a[idx] = parent_b
+                    self.side_hit_parent_b[idx] = parent_a
+                    self.side_hit_layer_a[idx] = self.side_tri_layer[tb]
+                    self.side_hit_layer_b[idx] = self.side_tri_layer[ta]
+                    self.side_hit_layer_h_a[idx] = self.side_tri_layer_h[tb]
+                    self.side_hit_layer_h_b[idx] = self.side_tri_layer_h[ta]
+                    self.side_hit_h_lo_a[idx] = self.side_tri_h_lo[tb]
+                    self.side_hit_h_hi_a[idx] = self.side_tri_h_hi[tb]
+                self.side_hit_partner_kind[idx] = 0  # side↔side
+
+    @ti.kernel
+    def _kernel_detect_side_phys_contacts(
+        self, hit_eps: data_type, aabb_pad: data_type, prox_eps: data_type,
+    ):
+        """
+        Taichi narrowphase: side panel ↔ physical shells (other parents).
+        Sensitive: allow coplanar, expanded Z band, proximity fallback.
+        Appends into side_hit_* (does not reset count).
+        """
+        n_s = self.side_n_tris[None]
+        n_p = self.coll_n_tris[None]
+        max_hits = self.side_hit_kind.shape[0]
+        for ta, tb in ti.ndrange(n_s, n_p):
+            parent = self.side_tri_parent[ta]
+            panel_p = self.coll_tri_panel[tb]
+            if parent < 0 or panel_p < 0 or panel_p == parent:
+                continue
+            # Z-band: only physical shells that sit in the wall height span
+            lh = self.coll_tri_h[tb]
+            h_lo = self.side_tri_h_lo[ta]
+            h_hi = self.side_tri_h_hi[ta]
+            zmin = ti.min(h_lo, h_hi)
+            zmax = ti.max(h_lo, h_hi)
+            margin = data_type(1e-3)
+            if lh < zmin - margin or lh > zmax + margin:
+                continue
+            i0 = self.side_tri_kp[ta, 0]
+            i1 = self.side_tri_kp[ta, 1]
+            i2 = self.side_tri_kp[ta, 2]
+            j0 = self.coll_tri_kp[tb, 0]
+            j1 = self.coll_tri_kp[tb, 1]
+            j2 = self.coll_tri_kp[tb, 2]
+            # Skip any shared vertex (same as physical shells)
+            if self._ti_share_vert(i0, i1, i2, j0, j1, j2) == 1:
+                continue
+            a0 = self.x[i0]
+            a1 = self.x[i1]
+            a2 = self.x[i2]
+            b0 = self.x[j0]
+            b1 = self.x[j1]
+            b2 = self.x[j2]
+            # Strict: no coplanar, no proximity (match physical panel kernel)
+            kind, p0, p1 = self._ti_tri_tri_contact_ex(
+                a0, a1, a2, b0, b1, b2, hit_eps,
+                aabb_pad, 0, prox_eps,
+            )
+            if kind == 0:
+                continue
+            idx = ti.atomic_add(self.side_hit_count[None], 1)
+            if idx < max_hits:
+                self.side_hit_kind[idx] = kind
+                self.side_hit_p0[idx] = p0
+                self.side_hit_p1[idx] = p1
+                self.side_hit_tri_a[idx] = ta
+                self.side_hit_tri_b[idx] = tb
+                self.side_hit_unit_a[idx] = self.side_tri_unit[ta]
+                self.side_hit_unit_b[idx] = self.coll_tri_unit[tb]
+                self.side_hit_panel_a[idx] = self.side_tri_panel[ta]
+                self.side_hit_panel_b[idx] = panel_p
+                self.side_hit_parent_a[idx] = parent
+                self.side_hit_parent_b[idx] = panel_p
+                self.side_hit_layer_a[idx] = self.side_tri_layer[ta]
+                self.side_hit_layer_b[idx] = self.coll_tri_layer[tb]
+                self.side_hit_layer_h_a[idx] = self.side_tri_layer_h[ta]
+                self.side_hit_layer_h_b[idx] = lh
+                self.side_hit_h_lo_a[idx] = h_lo
+                self.side_hit_h_hi_a[idx] = h_hi
+                self.side_hit_partner_kind[idx] = 1  # side↔physical
+
+    def _flat_from_side_kp(self, p3d, k0, k1, k2, positions, flat_kps):
+        """Map 3D point on a side tri (kp indices) → design xy + bary loc."""
+        verts3 = positions[[int(k0), int(k1), int(k2)]]
+        verts2 = flat_kps[[int(k0), int(k1), int(k2)]][:, :2]
+        xy, bary = _map_point_3d_to_flat_2d(p3d, verts3, verts2, return_bary=True)
+        if xy is None or bary is None:
+            return None
+        return {
+            "p": [float(xy[0]), float(xy[1])],
+            "loc": (
+                int(k0), int(k1), int(k2),
+                float(bary[0]), float(bary[1]), float(bary[2]),
+            ),
+        }
+
+    def _detect_side_panel_contacts(
+        self,
+        positions,
+        flat_kps,
+        contact_points,
+        contact_segments,
+        contact_points_flat,
+        contact_segments_flat,
+        max_pts,
+        max_segs,
+    ):
+        """
+        Side-panel contacts via Taichi kernels; Python only maps hits → design xy.
+
+        Tests:
+          1) side ↔ side (different parents)
+          2) side ↔ physical shells of other design panels (Z-band overlap)
+        """
+        if not hasattr(self, "side_n_tris"):
+            return
+        if not bool(getattr(self, "thick_side_panels", True)):
+            return
+        n_side = int(self.side_n_tris[None])
+        if n_side <= 0:
+            return
+
+        # --- Taichi narrowphase: same strictness as physical panel contacts ---
+        hit_eps = 1e-4
+        aabb_pad = 1e-9
+        prox_eps = 0.0
+        self._kernel_detect_side_side_contacts(hit_eps, aabb_pad, prox_eps)
+        if hasattr(self, "coll_n_tris") and int(self.coll_n_tris[None]) > 0:
+            self._kernel_detect_side_phys_contacts(hit_eps, aabb_pad, prox_eps)
+
+        n_hits_raw = int(self.side_hit_count[None])
+        max_hits = int(self.side_hit_kind.shape[0])
+        n_hits = min(n_hits_raw, max_hits)
+        if n_hits <= 0:
+            return
+
+        kinds = np.asarray(self.side_hit_kind.to_numpy()[:n_hits], dtype=np.int32)
+        p0s = np.asarray(self.side_hit_p0.to_numpy()[:n_hits], dtype=numpy_data_type)
+        p1s = np.asarray(self.side_hit_p1.to_numpy()[:n_hits], dtype=numpy_data_type)
+        tri_as = np.asarray(self.side_hit_tri_a.to_numpy()[:n_hits], dtype=np.int32)
+        tri_bs = np.asarray(self.side_hit_tri_b.to_numpy()[:n_hits], dtype=np.int32)
+        unit_as = np.asarray(self.side_hit_unit_a.to_numpy()[:n_hits], dtype=np.int32)
+        unit_bs = np.asarray(self.side_hit_unit_b.to_numpy()[:n_hits], dtype=np.int32)
+        panel_as = np.asarray(self.side_hit_panel_a.to_numpy()[:n_hits], dtype=np.int32)
+        panel_bs = np.asarray(self.side_hit_panel_b.to_numpy()[:n_hits], dtype=np.int32)
+        parent_as = np.asarray(self.side_hit_parent_a.to_numpy()[:n_hits], dtype=np.int32)
+        parent_bs = np.asarray(self.side_hit_parent_b.to_numpy()[:n_hits], dtype=np.int32)
+        layer_as = np.asarray(self.side_hit_layer_a.to_numpy()[:n_hits], dtype=np.int32)
+        layer_bs = np.asarray(self.side_hit_layer_b.to_numpy()[:n_hits], dtype=np.int32)
+        lh_as = np.asarray(self.side_hit_layer_h_a.to_numpy()[:n_hits], dtype=numpy_data_type)
+        lh_bs = np.asarray(self.side_hit_layer_h_b.to_numpy()[:n_hits], dtype=numpy_data_type)
+        hlo_as = np.asarray(self.side_hit_h_lo_a.to_numpy()[:n_hits], dtype=numpy_data_type)
+        hhi_as = np.asarray(self.side_hit_h_hi_a.to_numpy()[:n_hits], dtype=numpy_data_type)
+        pkinds = np.asarray(self.side_hit_partner_kind.to_numpy()[:n_hits], dtype=np.int32)
+
+        side_kp = getattr(self, "_side_tri_kp_host", None)
+        if side_kp is None:
+            side_kp = np.asarray(self.side_tri_kp.to_numpy(), dtype=np.int32)
+        phys_kp = getattr(self, "_collision_tri_kp_indices", None)
+        side_id_host = np.asarray(self.side_tri_id.to_numpy(), dtype=np.int32)
+
+        for hi in range(n_hits):
+            kind = int(kinds[hi])
+            if kind <= 0:
+                continue
+            ta = int(tri_as[hi])
+            tb = int(tri_bs[hi])
+            partner = int(pkinds[hi])  # 0=side, 1=phys
+            p_side = int(panel_as[hi])
+            p_other = int(panel_bs[hi])
+            parent = int(parent_as[hi])
+            parent_b = int(parent_bs[hi])
+            u_a = int(unit_as[hi])
+            u_b = int(unit_bs[hi])
+            li_a = int(layer_as[hi])
+            li_b = int(layer_bs[hi])
+            lh_a = float(lh_as[hi])
+            lh_b = float(lh_bs[hi])
+            h_lo = float(hlo_as[hi])
+            h_hi = float(hhi_as[hi])
+            p_lo = min(p_side, p_other)
+            p_hi = max(p_side, p_other)
+
+            if ta < 0 or ta >= len(side_kp):
+                continue
+            ka = side_kp[ta]
+            # synthetic tri id for tracking keys
+            id_a = int(side_id_host[ta]) if ta < len(side_id_host) else ta
+            if partner == 0:
+                if tb < 0 or tb >= len(side_kp):
+                    continue
+                kb = side_kp[tb]
+                id_b = int(side_id_host[tb]) if tb < len(side_id_host) else tb
+                sk_b = "side"
+            else:
+                if phys_kp is None or tb < 0 or tb >= len(phys_kp):
+                    continue
+                kb = phys_kp[tb]
+                id_b = int(tb)
+                sk_b = "physical"
+
+            pair_meta = {
+                "unit_a": u_a,
+                "unit_b": u_b,
+                "panel_of_unit_a": p_side,
+                "panel_of_unit_b": p_other,
+                "panel_a": p_lo,
+                "panel_b": p_hi,
+                "layer_idx": li_a,
+                "layer_h": lh_a,
+                "layer_idx_a": li_a,
+                "layer_h_a": lh_a,
+                "layer_idx_b": li_b,
+                "layer_h_b": lh_b,
+                "tri_a": id_a,
+                "tri_b": id_b,
+                "tri_lo": id_a,
+                "tri_hi": id_b,
+                "shell_kind": "side",
+                "shell_kind_a": "side",
+                "shell_kind_b": sk_b,
+                "parent_panel_a": parent,
+                "parent_panel_b": parent_b,
+            }
+
+            def _side_entry(p3d, ktri, unit, panel, parent_p, li, lh, hlo, hhi, sk):
+                flat = self._flat_from_side_kp(
+                    p3d, int(ktri[0]), int(ktri[1]), int(ktri[2]),
+                    positions, flat_kps,
+                )
+                if flat is None:
+                    return None
+                side = {
+                    "unit": int(unit),
+                    "panel": int(panel),
+                    "parent_panel": int(parent_p),
+                    "layer_idx": int(li),
+                    "layer_h": float(lh),
+                    "shell_kind": sk,
+                    "h_lo": float(hlo),
+                    "h_hi": float(hhi),
+                    "p": flat["p"],
+                    "loc": flat["loc"],
+                }
+                depth_panel = int(parent_p) if sk == "side" else int(panel)
+                self._annotate_side_depth(side, depth_panel, lh, sk)
+                return side
+
+            def _side_entry_seg(p3d0, p3d1, ktri, unit, panel, parent_p, li, lh, hlo, hhi, sk):
+                f0 = self._flat_from_side_kp(
+                    p3d0, int(ktri[0]), int(ktri[1]), int(ktri[2]),
+                    positions, flat_kps,
+                )
+                f1 = self._flat_from_side_kp(
+                    p3d1, int(ktri[0]), int(ktri[1]), int(ktri[2]),
+                    positions, flat_kps,
+                )
+                if f0 is None or f1 is None:
+                    return None
+                side = {
+                    "unit": int(unit),
+                    "panel": int(panel),
+                    "parent_panel": int(parent_p),
+                    "layer_idx": int(li),
+                    "layer_h": float(lh),
+                    "shell_kind": sk,
+                    "h_lo": float(hlo),
+                    "h_hi": float(hhi),
+                    "p0": f0["p"],
+                    "p1": f1["p"],
+                    "loc0": f0["loc"],
+                    "loc1": f1["loc"],
+                }
+                depth_panel = int(parent_p) if sk == "side" else int(panel)
+                self._annotate_side_depth(side, depth_panel, lh, sk)
+                return side
+
+            if kind == 1:
+                p0 = [float(p0s[hi, 0]), float(p0s[hi, 1]), float(p0s[hi, 2])]
+                if len(contact_points) >= max_pts:
+                    continue
+                contact_points.append(p0)
+                ent = dict(pair_meta)
+                sa = _side_entry(
+                    p0, ka, u_a, p_side, parent, li_a, lh_a, h_lo, h_hi, "side"
+                )
+                sb = _side_entry(
+                    p0, kb, u_b, p_other, parent_b, li_b, lh_b,
+                    h_lo if partner == 0 else lh_b,
+                    h_hi if partner == 0 else lh_b,
+                    sk_b,
+                )
+                if sa is not None:
+                    ent["side_a"] = sa
+                    ent["p"] = sa["p"]
+                if sb is not None:
+                    ent["side_b"] = sb
+                    if "p" not in ent:
+                        ent["p"] = sb["p"]
+                ent["p_3d"] = p0
+                ent.update(self._stack_depth_fields(parent, lh_a))
+                contact_points_flat.append(ent)
+            else:
+                p0 = [float(p0s[hi, 0]), float(p0s[hi, 1]), float(p0s[hi, 2])]
+                p1 = [float(p1s[hi, 0]), float(p1s[hi, 1]), float(p1s[hi, 2])]
+                if len(contact_segments) >= max_segs:
+                    continue
+                contact_segments.append((p0, p1))
+                ent = dict(pair_meta)
+                sa = _side_entry_seg(
+                    p0, p1, ka, u_a, p_side, parent, li_a, lh_a, h_lo, h_hi, "side"
+                )
+                sb = _side_entry_seg(
+                    p0, p1, kb, u_b, p_other, parent_b, li_b, lh_b,
+                    h_lo if partner == 0 else lh_b,
+                    h_hi if partner == 0 else lh_b,
+                    sk_b,
+                )
+                if sa is not None:
+                    ent["side_a"] = sa
+                    ent["p0"], ent["p1"] = sa["p0"], sa["p1"]
+                if sb is not None:
+                    ent["side_b"] = sb
+                    if "p0" not in ent:
+                        ent["p0"], ent["p1"] = sb["p0"], sb["p1"]
+                ent["p0_3d"] = p0
+                ent["p1_3d"] = p1
+                ent.update(self._stack_depth_fields(parent, lh_a))
+                contact_segments_flat.append(ent)
+                if len(contact_points) < max_pts:
+                    contact_points.append(p0)
+                if len(contact_points) < max_pts:
+                    contact_points.append(p1)
 
     def _ghost_shell_live_verts(self, ghost, positions):
         """Blend live physical shell verts → ghost shell vertex array (n,3)."""
@@ -3833,6 +4633,61 @@ class PD_Origami_Simulator:
         return out_n, out0, out1
 
     @ti.func
+    def _ti_closest_on_triangle(
+        self, p: ti.template(), a: ti.template(), b: ti.template(), c: ti.template(),
+    ):
+        """Closest point on triangle abc to p (Ericson). Returns (q, dist)."""
+        ab = b - a
+        ac = c - a
+        ap = p - a
+        d1 = ab.dot(ap)
+        d2 = ac.dot(ap)
+        q = a
+        if d1 <= 0.0 and d2 <= 0.0:
+            q = a
+        else:
+            bp = p - b
+            d3 = ab.dot(bp)
+            d4 = ac.dot(bp)
+            if d3 >= 0.0 and d4 <= d3:
+                q = b
+            else:
+                vc = d1 * d4 - d3 * d2
+                if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+                    v = d1 / (d1 - d3) if ti.abs(d1 - d3) > 1e-18 else data_type(0.0)
+                    q = a + v * ab
+                else:
+                    cp = p - c
+                    d5 = ab.dot(cp)
+                    d6 = ac.dot(cp)
+                    if d6 >= 0.0 and d5 <= d6:
+                        q = c
+                    else:
+                        vb = d5 * d2 - d1 * d6
+                        if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+                            w = d2 / (d2 - d6) if ti.abs(d2 - d6) > 1e-18 else data_type(0.0)
+                            q = a + w * ac
+                        else:
+                            va = d3 * d6 - d5 * d4
+                            if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+                                denom_bc = (d4 - d3) + (d5 - d6)
+                                w = (
+                                    (d4 - d3) / denom_bc
+                                    if ti.abs(denom_bc) > 1e-18
+                                    else data_type(0.0)
+                                )
+                                q = b + w * (c - b)
+                            else:
+                                denom = va + vb + vc
+                                if ti.abs(denom) < 1e-18:
+                                    q = a
+                                else:
+                                    v = vb / denom
+                                    w = vc / denom
+                                    q = a + ab * v + ac * w
+        return q, (p - q).norm()
+
+    @ti.func
     def _ti_tri_tri_contact(
         self, a0: ti.template(), a1: ti.template(), a2: ti.template(),
         b0: ti.template(), b1: ti.template(), b2: ti.template(),
@@ -3840,16 +4695,44 @@ class PD_Origami_Simulator:
     ):
         """
         Returns (kind, p0, p1): kind 0=none, 1=point, 2=segment.
+        Strict mode: rejects coplanar pairs (used by physical shells).
+        """
+        return self._ti_tri_tri_contact_ex(
+            a0, a1, a2, b0, b1, b2, eps,
+            data_type(1e-9),  # aabb pad
+            0,               # allow_coplanar
+            data_type(0.0),  # prox_eps (off)
+        )
+
+    @ti.func
+    def _ti_tri_tri_contact_ex(
+        self, a0: ti.template(), a1: ti.template(), a2: ti.template(),
+        b0: ti.template(), b1: ti.template(), b2: ti.template(),
+        eps: data_type,
+        aabb_pad: data_type,
+        allow_coplanar: ti.i32,
+        prox_eps: data_type,
+    ):
+        """
+        Returns (kind, p0, p1): kind 0=none, 1=point, 2=segment.
+
+        Side-panel sensitive mode: larger AABB pad, allow coplanar, optional
+        proximity fallback when faces approach within prox_eps without crossing.
         """
         kind = 0
         p0 = self._ti_v3(0.0, 0.0, 0.0)
         p1 = self._ti_v3(0.0, 0.0, 0.0)
         do_test = 1
-        if self._ti_aabb_overlap_tris(a0, a1, a2, b0, b1, b2, data_type(1e-9)) == 0:
+        pad = ti.max(aabb_pad, eps)
+        if self._ti_aabb_overlap_tris(a0, a1, a2, b0, b1, b2, pad) == 0:
             do_test = 0
-        if do_test == 1 and self._ti_tris_coplanar(
-            a0, a1, a2, b0, b1, b2, data_type(1e-2)
-        ) == 1:
+        if (
+            do_test == 1
+            and allow_coplanar == 0
+            and self._ti_tris_coplanar(
+                a0, a1, a2, b0, b1, b2, data_type(1e-2)
+            ) == 1
+        ):
             do_test = 0
 
         if do_test == 1:
@@ -3879,18 +4762,19 @@ class PD_Origami_Simulator:
             if h == 1:
                 n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, p, dedupe)
 
-            # Vertex-in-triangle (touching cases)
-            if self._ti_point_in_triangle(a0, b0, b1, b2, eps) == 1:
+            # Vertex-in-triangle (touching cases) — looser in-plane eps
+            pin_eps = ti.max(eps * data_type(10.0), data_type(1e-5))
+            if self._ti_point_in_triangle(a0, b0, b1, b2, pin_eps) == 1:
                 n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, a0, dedupe)
-            if self._ti_point_in_triangle(a1, b0, b1, b2, eps) == 1:
+            if self._ti_point_in_triangle(a1, b0, b1, b2, pin_eps) == 1:
                 n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, a1, dedupe)
-            if self._ti_point_in_triangle(a2, b0, b1, b2, eps) == 1:
+            if self._ti_point_in_triangle(a2, b0, b1, b2, pin_eps) == 1:
                 n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, a2, dedupe)
-            if self._ti_point_in_triangle(b0, a0, a1, a2, eps) == 1:
+            if self._ti_point_in_triangle(b0, a0, a1, a2, pin_eps) == 1:
                 n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, b0, dedupe)
-            if self._ti_point_in_triangle(b1, a0, a1, a2, eps) == 1:
+            if self._ti_point_in_triangle(b1, a0, a1, a2, pin_eps) == 1:
                 n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, b1, dedupe)
-            if self._ti_point_in_triangle(b2, a0, a1, a2, eps) == 1:
+            if self._ti_point_in_triangle(b2, a0, a1, a2, pin_eps) == 1:
                 n_hits, q0, q1 = self._ti_push_contact_pt(n_hits, q0, q1, b2, dedupe)
 
             if n_hits == 1:
@@ -3901,6 +4785,32 @@ class PD_Origami_Simulator:
                 kind = 2
                 p0 = q0
                 p1 = q1
+            elif prox_eps > data_type(1e-12):
+                # Proximity fallback: nearest vertex→triangle within prox_eps
+                best_d = prox_eps + data_type(1.0)
+                best_q = self._ti_v3(0.0, 0.0, 0.0)
+                q, d = self._ti_closest_on_triangle(a0, b0, b1, b2)
+                if d < best_d:
+                    best_d, best_q = d, q
+                q, d = self._ti_closest_on_triangle(a1, b0, b1, b2)
+                if d < best_d:
+                    best_d, best_q = d, q
+                q, d = self._ti_closest_on_triangle(a2, b0, b1, b2)
+                if d < best_d:
+                    best_d, best_q = d, q
+                q, d = self._ti_closest_on_triangle(b0, a0, a1, a2)
+                if d < best_d:
+                    best_d, best_q = d, q
+                q, d = self._ti_closest_on_triangle(b1, a0, a1, a2)
+                if d < best_d:
+                    best_d, best_q = d, q
+                q, d = self._ti_closest_on_triangle(b2, a0, a1, a2)
+                if d < best_d:
+                    best_d, best_q = d, q
+                if best_d <= prox_eps:
+                    kind = 1
+                    p0 = best_q
+                    p1 = best_q
         return kind, p0, p1
 
     @ti.kernel
@@ -4261,6 +5171,23 @@ class PD_Origami_Simulator:
                 self._ghost_contact_error_logged = True
                 print(f"[Contact] ghost shell detect failed: {exc}")
 
+        # Collision-only vertical side panels (unique indices, no physics)
+        try:
+            self._detect_side_panel_contacts(
+                positions,
+                flat_kps,
+                contact_points,
+                contact_segments,
+                contact_points_flat,
+                contact_segments_flat,
+                max_pts,
+                max_segs,
+            )
+        except Exception as exc:
+            if not getattr(self, "_side_contact_error_logged", False):
+                self._side_contact_error_logged = True
+                print(f"[Contact] side panel detect failed: {exc}")
+
         self._collision_contact_count = len(contact_points)
         self._collision_segment_count = len(contact_segments)
         self._collision_contact_points_list = list(contact_points)
@@ -4616,7 +5543,7 @@ class PD_Origami_Simulator:
                 if getattr(self, "verbose", False):
                     print(f"[Contact] seal@π failed: {exc}")
                 self._collision_coords_exported = True
-        # Always write trimmedData/<name>-trimmed.json once θ hits π
+        # Always write panel_trimming/trimmedData/<name>-trimmed.json once θ hits π
         try:
             self.export_trimmed_json(reason="fold_pi")
         except Exception as exc:
@@ -4849,9 +5776,13 @@ class PD_Origami_Simulator:
                     side_layer_idx = int(seg.get("layer_idx", -1))
                 panel_id = int(side.get("panel", seg.get("panel_a", -1)))
                 shell_kind = side.get("shell_kind") or seg.get("shell_kind") or "physical"
+                shell_kind_s = str(shell_kind).strip().lower()
+                parent_panel = side.get("parent_panel")
+                if parent_panel is None:
+                    parent_panel = seg.get("parent_panel_a") if side_key == "side_a" else seg.get("parent_panel_b")
                 # Authoritative physical height from registry — but never for ghost
-                # sides: unit_lo is only a kinematics parent; layer_h is the ghost Z.
-                if shell_kind != "ghost":
+                # or side shells: those keep their stamped layer_h / unique panel id.
+                if shell_kind_s not in ("ghost", "side"):
                     su = side.get("unit")
                     if su is not None:
                         try:
@@ -4868,6 +5799,11 @@ class PD_Origami_Simulator:
                         except Exception:
                             pass
 
+                # Depth uses parent design panel for side walls (unique panel id
+                # is not in the stock-span registry).
+                depth_panel = int(parent_panel) if parent_panel is not None else panel_id
+                if shell_kind_s == "side" and parent_panel is not None:
+                    depth_panel = int(parent_panel)
                 # Depth: prefer values stamped on the side; recompute if missing
                 if side.get("stock_span_mm") is not None and side.get("depth_from_top_mm") is not None:
                     depth_fields = {
@@ -4878,21 +5814,20 @@ class PD_Origami_Simulator:
                         ),
                     }
                 else:
-                    depth_fields = self._stack_depth_fields(panel_id, side_layer_h)
+                    depth_fields = self._stack_depth_fields(depth_panel, side_layer_h)
                 # Keep layer_h consistent with depth if side carried stamped depths
-                # (ghost: side_layer_h already correct; recompute depths from it if
-                # stamped values were from a stale overwrite in older runs).
-                if shell_kind == "ghost":
-                    depth_fields = self._stack_depth_fields(panel_id, side_layer_h)
+                # (ghost/side: side_layer_h already correct; recompute depths).
+                if shell_kind_s in ("ghost", "side"):
+                    depth_fields = self._stack_depth_fields(depth_panel, side_layer_h)
 
-                regions.append({
+                region = {
                     # identity
                     "panel": panel_id,
                     "unit": int(side.get("unit", -1)),
                     "side": side_key,
                     "layer_idx": side_layer_idx,
                     "layer_h": side_layer_h,
-                    "shell_kind": shell_kind,
+                    "shell_kind": shell_kind_s if shell_kind_s in ("ghost", "side") else "physical",
                     "unit_a": int(seg.get("unit_a", -1)),
                     "unit_b": int(seg.get("unit_b", -1)),
                     "tri_a": int(seg.get("tri_a", -1)),
@@ -4909,9 +5844,17 @@ class PD_Origami_Simulator:
                     "folding_angle": float(
                         seg.get("folding_angle", getattr(self, "folding_angle", 0.0))
                     ),
-                    # stack depth (physical + ghost shells share the same fields)
+                    # stack depth (physical + ghost + side shells share fields)
                     **depth_fields,
-                })
+                }
+                if shell_kind_s == "side":
+                    if parent_panel is not None:
+                        region["parent_panel"] = int(parent_panel)
+                    if side.get("h_lo") is not None:
+                        region["h_lo"] = float(side["h_lo"])
+                    if side.get("h_hi") is not None:
+                        region["h_hi"] = float(side["h_hi"])
+                regions.append(region)
         return regions
 
     def _append_shaded_export_to_json(self):
@@ -4933,7 +5876,11 @@ class PD_Origami_Simulator:
         n_pts = len(getattr(self, "_collision_fixed_points", {}) or {})
         n_sweep = sum(1 for r in regions if r.get("kind") == "sweep")
         n_ghost = sum(1 for r in regions if r.get("shell_kind") == "ghost")
-        n_phys = sum(1 for r in regions if r.get("shell_kind") != "ghost")
+        n_side = sum(1 for r in regions if r.get("shell_kind") == "side")
+        n_phys = sum(
+            1 for r in regions
+            if r.get("shell_kind") not in ("ghost", "side")
+        )
         depth_tops = [
             float(r["depth_from_top_mm"])
             for r in regions
@@ -4944,6 +5891,24 @@ class PD_Origami_Simulator:
             for r in regions
             if r.get("depth_from_bottom_mm") is not None
         ]
+        # Compact side-panel registry (unique indices, geometry for viz)
+        side_reg = []
+        for s in getattr(self, "_collision_side_panels", None) or []:
+            side_reg.append({
+                "panel": int(s["panel_idx"]),
+                "parent_panel": int(s["parent_panel_idx"]),
+                "h_lo": float(s["h_lo"]),
+                "h_hi": float(s["h_hi"]),
+                "layer_h": float(s["layer_h"]),
+                "layer_idx": int(s.get("layer_idx", -1)),
+                "unit_lo": int(s.get("unit_lo", -1)),
+                "unit_hi": int(s.get("unit_hi", -1)),
+                "outline_xy": s.get("outline_xy") or [],
+                "n_edges": len(s.get("edges") or []),
+                "shell_kind": "side",
+            })
+        if side_reg:
+            self.input_json["side_panels"] = side_reg
         self.input_json["collision_stats"] = {
             "schema": "dual_curve_v1",
             "depth_schema": "stack_shell_v1",
@@ -4955,10 +5920,12 @@ class PD_Origami_Simulator:
             "n_closed_polygons": n_sweep,
             "n_physical_regions": n_phys,
             "n_ghost_regions": n_ghost,
+            "n_side_regions": n_side,
             "thick_ghost_spacing_mm": float(
                 getattr(self, "thick_ghost_spacing_mm", 0.0) or 0.0
             ),
             "n_ghost_shells": len(getattr(self, "_collision_ghost_shells", None) or []),
+            "n_side_panels": len(side_reg),
             "depth_global_max_from_top": float(max(depth_tops) if depth_tops else 0.0),
             "depth_global_max_from_bottom": float(max(depth_bots) if depth_bots else 0.0),
             "folding_angle": float(getattr(self, "folding_angle", 0.0)),
@@ -4969,7 +5936,7 @@ class PD_Origami_Simulator:
             print(
                 f"[Contact] shaded export: {len(regions)} region(s) "
                 f"(sweep={n_sweep}, sealed_lines={n_fixed}, "
-                f"physical={n_phys}, ghost={n_ghost}) "
+                f"physical={n_phys}, ghost={n_ghost}, side={n_side}) "
                 f"schema=dual_curve_v1 depth=stack_shell_v1 → input_json['shaded_regions']"
             )
 
@@ -5356,7 +6323,7 @@ class PD_Origami_Simulator:
 
     def _render_panel_meshes(self, scene):
         """
-        Draw base mesh + surface sweep paint (design-xy mapped onto panels)
+        Draw base mesh + translucent side walls + surface sweep paint
         + red contact markers. (af0a695 non-Taichi draw path)
         """
         scene.mesh(
@@ -5365,6 +6332,46 @@ class PD_Origami_Simulator:
             color=(0.80, 0.82, 0.93),
             two_sided=True,
         )
+
+        # Collision-only vertical side panels (pale green, two-sided).
+        # GGUI mesh has no true alpha; light mint fill + green outline.
+        # Topology/contact/edge-copy are all Taichi; draw uses live vertices.
+        n_side_idx = int(getattr(self, "_side_panel_index_count", 0) or 0)
+        if (
+            self.collision_shading
+            and n_side_idx >= 3
+            and hasattr(self, "side_panel_indices")
+        ):
+            try:
+                scene.mesh(
+                    self.vertices,
+                    indices=self.side_panel_indices,
+                    color=(0.55, 0.88, 0.58),
+                    two_sided=True,
+                    index_count=n_side_idx,
+                )
+            except Exception as exc:
+                if not getattr(self, "_side_mesh_error_logged", False):
+                    self._side_mesh_error_logged = True
+                    print(f"[Contact] side panel mesh draw failed: {exc}")
+            n_edge_v = int(getattr(self, "_side_panel_edge_vert_count", 0) or 0)
+            if (
+                n_edge_v >= 2
+                and hasattr(self, "side_panel_edge_verts")
+                and hasattr(self, "_kernel_update_side_panel_edge_lines")
+            ):
+                try:
+                    self._kernel_update_side_panel_edge_lines()
+                    scene.lines(
+                        self.side_panel_edge_verts,
+                        width=1.8,
+                        color=(0.18, 0.52, 0.28),
+                        vertex_count=n_edge_v,
+                    )
+                except Exception as exc:
+                    if not getattr(self, "_side_edge_error_logged", False):
+                        self._side_edge_error_logged = True
+                        print(f"[Contact] side panel edge draw failed: {exc}")
 
         n_pts = self._collision_contact_count
         n_segs = self._collision_segment_count

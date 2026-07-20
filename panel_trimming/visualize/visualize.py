@@ -7,6 +7,7 @@ Primary shade (design plane only, no 3D) = **dual-curve export** (preferred):
 
 Shell classification (stack depth):
   shell_kind == "ghost"     → collision-only intermediate Z shell (no PD)
+  shell_kind == "side"      → collision-only vertical side panel (unique idx, no PD)
   shell_kind == "physical"  → real thick-panel shell (default if missing)
 
 Legacy shade keys still accepted:
@@ -33,14 +34,15 @@ Usage:
   python panel-trimming/visualize/visualize.py
   python panel-trimming/visualize/visualize.py --name mountain-thick-trimmed
 
-Trimmed JSON is read from project trimmedData/ (sim export folder);
-source designs still resolve from descriptionData/.
+Trimmed and cleaned JSON are read from panel_trimming/trimmedData/;
+source designs from descriptionData/.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -76,19 +78,39 @@ GHOST_POLY_FACE = "#4c78a8"
 GHOST_POLY_ALPHA = 0.45
 GHOST_POLY_EDGE = "#1f4e79"
 GHOST_STROKE_COLOR = "#5b8db8"
+# Vertical side panels (collision-only, unique panel indices)
+SIDE_POLY_FACE = "#59a14f"
+SIDE_POLY_ALPHA = 0.42
+SIDE_POLY_EDGE = "#2d6a2d"
+SIDE_STROKE_COLOR = "#6bb86b"
+SIDE_PANEL_FACE = "#dcefd8"
+SIDE_PANEL_EDGE = "#5a9a52"
 FIRST_LINE_COLOR = "#2ca02c"
 LAST_LINE_COLOR = "#d62728"
 CUT_LINE_COLOR = "#c41e3a"
 CREASE_COLOR = "#888888"
 BORDER_LINE_COLOR = "#bbbbbb"
 TEXT_COLOR = "#222222"
+# Closed-polygon sample nodes (all dual-curve vertices)
+POLY_NODE_COLOR = "#1f77b4"
+POLY_NODE_EDGE = "#0a3a6a"
+# Straight-cut corner vertices
+OUTER_NODE_COLOR = "#f0c000"
+OUTER_NODE_EDGE = "#a67c00"
+# Fabrication offset outline (outward cut allowance)
+FABRIC_EDGE_COLOR = "#9b59b6"
+FABRIC_NODE_COLOR = "#bb8fce"
+FABRIC_NODE_EDGE = "#6c3483"
+# Collapse tip multi-nodes: one outermost yellow; hide blue/red under it
+NODE_CLUSTER_TOL = 4.0
+BLUE_MIN_SPACING = 3.5
 
 TYPE_MOUNTAIN = 0
 TYPE_VALLEY = 1
 
 DESCRIPTION_DIR = os.path.join(_PROJECT_ROOT, "descriptionData")
-# Sim export target (phys_sim_pd14.export_trimmed_json)
-TRIMMED_DIR = os.path.join(_PROJECT_ROOT, "trimmedData")
+# Sim + clean exports: panel_trimming/trimmedData/*-{trimmed,cleaned}.json
+TRIMMED_DIR = os.path.join(_VIS_DIR, "trimmedData")
 DEFAULT_CONFIG = os.path.join(_THIS_DIR, "config.yml")
 DEFAULT_OUTPUT_DIR = os.path.join(_THIS_DIR, "output")
 
@@ -130,13 +152,29 @@ def _resolve_json_path(name: str, *, prefer_trimmed: bool = False) -> str:
     """
     Find a design JSON.
 
-    prefer_trimmed=True  → trimmedData first, then descriptionData (exports)
-    prefer_trimmed=False → descriptionData first, then trimmedData (source / original)
+    prefer_trimmed=True  → panel_trimming/trimmedData, then descriptionData
+    prefer_trimmed=False → descriptionData first, then trimmedData
     """
+    # Legacy folders (pre-move)
+    legacy_trimmed = os.path.join(_PROJECT_ROOT, "trimmedData")
+    legacy_cleaned = os.path.join(_VIS_DIR, "cleanedData")
+    legacy_root_cleaned = os.path.join(_PROJECT_ROOT, "cleanedData")
     if prefer_trimmed:
-        dirs = [TRIMMED_DIR, DESCRIPTION_DIR]
+        dirs = [
+            TRIMMED_DIR,
+            legacy_cleaned,
+            legacy_root_cleaned,
+            legacy_trimmed,
+            DESCRIPTION_DIR,
+        ]
     else:
-        dirs = [DESCRIPTION_DIR, TRIMMED_DIR]
+        dirs = [
+            DESCRIPTION_DIR,
+            TRIMMED_DIR,
+            legacy_cleaned,
+            legacy_root_cleaned,
+            legacy_trimmed,
+        ]
     path = _resolve_in_dirs(name, dirs)
     if path is not None:
         return path
@@ -297,6 +335,164 @@ def _poly_area(poly: np.ndarray) -> float:
         return 0.0
     x, y = poly[:, 0], poly[:, 1]
     return 0.5 * float(np.abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def _convex_hull_indices(pts: Sequence) -> List[int]:
+    """
+    Indices of outermost vertices (convex hull) via monotone chain.
+    Collinear mid-edge points are dropped from the hull.
+    """
+    raw = []
+    for p in pts or []:
+        try:
+            raw.append((float(p[0]), float(p[1])))
+        except (TypeError, IndexError, ValueError):
+            continue
+    n = len(raw)
+    if n == 0:
+        return []
+    if n <= 2:
+        return list(range(n))
+
+    order = sorted(range(n), key=lambda i: (raw[i][0], raw[i][1]))
+
+    def cross(o, a, b) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[int] = []
+    for i in order:
+        while len(lower) >= 2 and cross(
+            raw[lower[-2]], raw[lower[-1]], raw[i]
+        ) <= 0.0:
+            lower.pop()
+        lower.append(i)
+    upper: List[int] = []
+    for i in reversed(order):
+        while len(upper) >= 2 and cross(
+            raw[upper[-2]], raw[upper[-1]], raw[i]
+        ) <= 0.0:
+            upper.pop()
+        upper.append(i)
+    hull = lower[:-1] + upper[:-1]
+    seen = set()
+    out: List[int] = []
+    for i in hull:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out if out else list(range(n))
+
+
+def _collapse_nodes_outermost(
+    pts: Sequence,
+    *,
+    tol: float = NODE_CLUSTER_TOL,
+    origin: Optional[Sequence] = None,
+) -> List[List[float]]:
+    """Cluster nodes within tol; keep the single outermost (farthest from origin)."""
+    raw: List[List[float]] = []
+    for p in pts or []:
+        try:
+            raw.append([float(p[0]), float(p[1])])
+        except (TypeError, IndexError, ValueError):
+            continue
+    n = len(raw)
+    if n <= 1 or float(tol) <= 0.0:
+        return raw
+    if origin is None:
+        ox = sum(p[0] for p in raw) / n
+        oy = sum(p[1] for p in raw) / n
+    else:
+        ox, oy = float(origin[0]), float(origin[1])
+
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    tol2 = float(tol) * float(tol)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = raw[i][0] - raw[j][0]
+            dy = raw[i][1] - raw[j][1]
+            if dx * dx + dy * dy <= tol2:
+                union(i, j)
+
+    clusters: Dict[int, List[int]] = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+
+    def outer_key(i: int) -> float:
+        return (raw[i][0] - ox) ** 2 + (raw[i][1] - oy) ** 2
+
+    winners: List[Tuple[int, List[float]]] = []
+    for members in clusters.values():
+        first = min(members)
+        win = max(members, key=outer_key)
+        winners.append((first, list(raw[win])))
+    winners.sort(key=lambda t: t[0])
+    return [p for _, p in winners]
+
+
+def _near_any(pt: Sequence, nodes: Sequence, tol: float) -> bool:
+    try:
+        px, py = float(pt[0]), float(pt[1])
+    except (TypeError, IndexError, ValueError):
+        return False
+    tol2 = float(tol) * float(tol)
+    for n in nodes or []:
+        try:
+            dx = float(n[0]) - px
+            dy = float(n[1]) - py
+        except (TypeError, IndexError, ValueError):
+            continue
+        if dx * dx + dy * dy <= tol2:
+            return True
+    return False
+
+
+def _space_nodes(
+    pts: Sequence,
+    *,
+    min_spacing: float,
+    origin: Optional[Sequence] = None,
+) -> List[List[float]]:
+    """Greedy keep nodes ≥ min_spacing apart; prefer more-outer when choosing."""
+    raw: List[List[float]] = []
+    for p in pts or []:
+        try:
+            raw.append([float(p[0]), float(p[1])])
+        except (TypeError, IndexError, ValueError):
+            continue
+    if not raw or float(min_spacing) <= 0:
+        return raw
+    if origin is None:
+        ox = sum(p[0] for p in raw) / len(raw)
+        oy = sum(p[1] for p in raw) / len(raw)
+    else:
+        ox, oy = float(origin[0]), float(origin[1])
+
+    def outer_key(p):
+        return (p[0] - ox) ** 2 + (p[1] - oy) ** 2
+
+    ordered = sorted(range(len(raw)), key=lambda i: outer_key(raw[i]), reverse=True)
+    kept: List[List[float]] = []
+    min2 = float(min_spacing) * float(min_spacing)
+    for i in ordered:
+        p = raw[i]
+        if any((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 <= min2 for q in kept):
+            continue
+        kept.append(p)
+    kept.sort(key=lambda p: math.atan2(p[1] - oy, p[0] - ox))
+    return kept
 
 
 def _polygons_differ(a: np.ndarray, b: np.ndarray) -> bool:
@@ -650,7 +846,7 @@ def _samples_from_dual_curves(
 
 
 def _shell_kind_of(entry: Optional[dict]) -> str:
-    """Normalize shell_kind: 'ghost' | 'physical' (legacy / missing → physical)."""
+    """Normalize shell_kind: 'ghost' | 'side' | 'physical' (legacy → physical)."""
     if not entry:
         return "physical"
     raw = entry.get("shell_kind")
@@ -659,6 +855,8 @@ def _shell_kind_of(entry: Optional[dict]) -> str:
     s = str(raw).strip().lower()
     if s in ("ghost", "g", "intermediate", "collision_only"):
         return "ghost"
+    if s in ("side", "s", "vertical", "wall"):
+        return "side"
     return "physical"
 
 
@@ -678,9 +876,35 @@ def _entries_from_shaded_regions(
         theta = sh.get("theta") or []
         ring = _ribbon_from_dual_curves(c0, c1)
         samples = _samples_from_dual_curves(theta, c0, c1)
-        coords = ring.tolist() if ring is not None else sh.get("coordinates")
-        kind = sh.get("kind") or ("sweep" if ring is not None else "line")
+        # Geometric cut (clean.py cut_ring); paint fill uses this, not fabric
+        cut_raw = sh.get("cut_ring")
+        if not cut_raw or len(cut_raw) < 3:
+            # coordinates may already be fabric after offset; prefer dual ribbon
+            if ring is not None:
+                cut_raw = ring.tolist()
+            else:
+                cut_raw = sh.get("coordinates")
+        if cut_raw and len(cut_raw) >= 3:
+            coords = [[float(p[0]), float(p[1])] for p in cut_raw]
+        else:
+            coords = None
+        # Fabrication offset outline (optional outward allowance)
+        fabric_raw = sh.get("fabric_ring")
+        fabric_coords = None
+        if fabric_raw and len(fabric_raw) >= 3:
+            fabric_coords = [[float(p[0]), float(p[1])] for p in fabric_raw]
+        kind = sh.get("kind") or ("sweep" if coords is not None else "line")
         shell_kind = _shell_kind_of(sh)
+        # All dual-curve sample nodes for blue/yellow viz
+        clean_ring = sh.get("clean_ring")
+        if clean_ring and len(clean_ring) >= 2:
+            ring_nodes = [[float(p[0]), float(p[1])] for p in clean_ring]
+        elif ring is not None:
+            ring_nodes = ring.tolist()
+        elif coords is not None:
+            ring_nodes = list(coords)
+        else:
+            ring_nodes = []
         entries.append({
             "layer_h": sh.get("layer_h"),
             "layer_idx": sh.get("layer_idx"),
@@ -691,11 +915,16 @@ def _entries_from_shaded_regions(
             "coordinates": coords,
             "shaded_polygon": coords,
             "paint_polygon": coords,
+            "fabric_polygon": fabric_coords,
+            "fabric_offset": sh.get("fabric_offset"),
             "paint_kind": kind,
             "shaded_kind": kind,
             "paint_area": sh.get("area"),
             "shaded_area": sh.get("area"),
             "panel": sh.get("panel"),
+            "parent_panel": sh.get("parent_panel"),
+            "h_lo": sh.get("h_lo"),
+            "h_hi": sh.get("h_hi"),
             "unit": sh.get("unit"),
             "side": sh.get("side"),
             "intruder_panel": sh.get("intruder_panel"),
@@ -711,6 +940,9 @@ def _entries_from_shaded_regions(
             "c0": c0,
             "c1": c1,
             "theta": theta,
+            "clean_ring": ring_nodes,
+            "clean_edges": sh.get("clean_edges") or [],
+            "cut_kind": sh.get("cut_kind"),
         })
     return entries
 
@@ -835,8 +1067,17 @@ def _items_from_collision_stats(
             if len(sweep_samples) >= 1 and "p0" in sweep_samples[0]:
                 f0 = np.asarray(sweep_samples[0]["p0"], dtype=float)[:2]
                 f1 = np.asarray(sweep_samples[0]["p1"], dtype=float)[:2]
+        ring_nodes = cp.get("clean_ring")
+        if not ring_nodes and poly is not None and len(poly) >= 2:
+            ring_nodes = poly.tolist()
+        fabric_poly = None
+        fab_raw = cp.get("fabric_polygon")
+        if fab_raw and len(fab_raw) >= 3:
+            fabric_poly = np.asarray(fab_raw, dtype=float)[:, :2]
         out.append({
             "poly": poly,
+            "fabric_poly": fabric_poly,
+            "fabric_offset": cp.get("fabric_offset"),
             "first": (f0, f1) if f0 is not None and f1 is not None else None,
             "last": last_both if last_both is not None else (
                 (apex, apex) if apex is not None else None
@@ -859,6 +1100,8 @@ def _items_from_collision_stats(
             "depth_from_top_mm": cp.get("depth_from_top_mm"),
             "depth_from_bottom_mm": cp.get("depth_from_bottom_mm"),
             "stock_span_mm": cp.get("stock_span_mm"),
+            "clean_ring": ring_nodes or [],
+            "clean_edges": cp.get("clean_edges") or [],
         })
 
     if out:
@@ -1050,6 +1293,8 @@ def _draw_layer(
     show_panel_ids: bool = True,
     show_closed_polys: bool = True,
     show_first_last_edges: bool = True,
+    show_polygon_nodes: bool = True,
+    show_fabric_offset: bool = True,
     panels_on_layer: Optional[set] = None,
 ):
     """
@@ -1058,6 +1303,8 @@ def _draw_layer(
     ``panels_on_layer``: design panel indices that exist at this layer_h
     (thick-panel offset). If None, all panels in layer_units are drawn
     (legacy behaviour).
+    ``show_polygon_nodes``: mark every vertex of each closed dual-curve ribbon.
+    ``show_fabric_offset``: outline fabric_ring (fabrication allowance) in purple.
     """
     # Prefer full design unit count so panel index == design panel index
     n = max(len(orig_units), len(layer_units))
@@ -1142,6 +1389,7 @@ def _draw_layer(
 
     n_shaded = 0
     n_ghost = 0
+    n_side = 0
     n_physical = 0
     if show_closed_polys:
         for item in closed_polys:
@@ -1149,21 +1397,30 @@ def _draw_layer(
             if poly is None or len(poly) < 3:
                 continue
             n_shaded += 1
-            is_ghost = _shell_kind_of(item) == "ghost"
+            sk = _shell_kind_of(item)
+            is_ghost = sk == "ghost"
+            is_side = sk == "side"
             if is_ghost:
                 n_ghost += 1
+            elif is_side:
+                n_side += 1
             else:
                 n_physical += 1
             is_sweep = (
                 item.get("paint_kind") == "sweep"
                 or str(item.get("source", "")).endswith("sweep")
             )
-            face = GHOST_POLY_FACE if is_ghost else TRIM_POLY_FACE
-            edge = GHOST_POLY_EDGE if is_ghost else TRIM_POLY_EDGE
-            alpha = GHOST_POLY_ALPHA if is_ghost else TRIM_POLY_ALPHA
-            # Ghost: dotted hatch; physical non-sweep: diagonal hatch
+            if is_ghost:
+                face, edge, alpha = GHOST_POLY_FACE, GHOST_POLY_EDGE, GHOST_POLY_ALPHA
+            elif is_side:
+                face, edge, alpha = SIDE_POLY_FACE, SIDE_POLY_EDGE, SIDE_POLY_ALPHA
+            else:
+                face, edge, alpha = TRIM_POLY_FACE, TRIM_POLY_EDGE, TRIM_POLY_ALPHA
+            # Ghost: dotted; side: x hatch; physical non-sweep: diagonal
             if is_ghost:
                 hatch = "..."
+            elif is_side:
+                hatch = "xxx"
             elif is_sweep:
                 hatch = None
             else:
@@ -1175,20 +1432,51 @@ def _draw_layer(
                 hatch=hatch,
                 zorder=6,
             )
-            # Panel tag on shade (export association); ·G = ghost shell
+            # Fabrication offset outline (outside geometric cut)
+            if show_fabric_offset:
+                fab = item.get("fabric_poly")
+                if fab is not None and len(fab) >= 3:
+                    fx = [float(p[0]) for p in fab]
+                    fy = [float(p[1]) for p in fab]
+                    ax.plot(
+                        fx + [fx[0]], fy + [fy[0]],
+                        color=FABRIC_EDGE_COLOR, linewidth=1.8,
+                        linestyle="--", alpha=0.95, zorder=7.2,
+                        solid_capstyle="butt", solid_joinstyle="miter",
+                    )
+            # Panel tag on shade; ·G = ghost, ·S = side (unique idx)
             pid = item.get("panel")
             if pid is not None and len(poly) >= 1:
                 c = poly.mean(axis=0)
-                tag = f"P{int(pid)}·G" if is_ghost else f"P{int(pid)}"
+                if is_ghost:
+                    tag = f"P{int(pid)}·G"
+                    tag_color = "#0a2a5a"
+                elif is_side:
+                    parent = item.get("parent_panel")
+                    tag = f"P{int(pid)}·S"
+                    if parent is not None:
+                        tag = f"{tag}←{int(parent)}"
+                    tag_color = "#1a4a1a"
+                else:
+                    tag = f"P{int(pid)}"
+                    tag_color = "#5a0a0a"
+                fo = item.get("fabric_offset")
+                if fo is not None and float(fo) > 1e-12:
+                    tag = f"{tag}·f{float(fo):g}"
                 ax.text(
                     float(c[0]), float(c[1]), tag,
                     ha="center", va="center", fontsize=6.5,
-                    color="#0a2a5a" if is_ghost else "#5a0a0a",
+                    color=tag_color,
                     fontweight="bold", zorder=11,
                 )
             # Draw intermediate two-node line samples (the actual sweep stroke)
             samples = item.get("sweep_samples") or []
-            stroke = GHOST_STROKE_COLOR if is_ghost else "#e45756"
+            if is_ghost:
+                stroke = GHOST_STROKE_COLOR
+            elif is_side:
+                stroke = SIDE_STROKE_COLOR
+            else:
+                stroke = "#e45756"
             if is_sweep and len(samples) >= 2:
                 for s in samples:
                     if "p0" not in s or "p1" not in s:
@@ -1199,18 +1487,114 @@ def _draw_layer(
                         zorder=7, solid_capstyle="round",
                     )
 
+    item_cut_corners: List[List[List[float]]] = [[] for _ in closed_polys]
+
+    if show_polygon_nodes:
+        # Yellow = one outermost cut corner per cluster.
+        # Blue = samples not under a yellow tip; spaced along edges.
+        for ii, item in enumerate(closed_polys):
+            nodes = item.get("clean_ring") or []
+            if not nodes and item.get("poly") is not None:
+                nodes = item["poly"]
+            if nodes is None or len(nodes) < 1:
+                continue
+            pts: List[List[float]] = []
+            for pt in nodes:
+                try:
+                    pts.append([float(pt[0]), float(pt[1])])
+                except (TypeError, IndexError, ValueError):
+                    continue
+            if not pts:
+                continue
+            origin = (
+                sum(p[0] for p in pts) / len(pts),
+                sum(p[1] for p in pts) / len(pts),
+            )
+            cut_pts: List[List[float]] = []
+            poly = item.get("poly")
+            if poly is not None and len(poly) >= 3:
+                for pt in poly:
+                    try:
+                        cut_pts.append([float(pt[0]), float(pt[1])])
+                    except (TypeError, IndexError, ValueError):
+                        continue
+            if not cut_pts:
+                hull_idx = _convex_hull_indices(pts)
+                cut_pts = [pts[i] for i in hull_idx]
+            cut_pts = _collapse_nodes_outermost(
+                cut_pts, tol=NODE_CLUSTER_TOL, origin=origin
+            )
+            item_cut_corners[ii] = cut_pts
+            item["_plot_cut_corners"] = cut_pts
+
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            ax.plot(
+                xs + [xs[0]], ys + [ys[0]],
+                color=POLY_NODE_COLOR, linewidth=0.45, alpha=0.3,
+                zorder=7.5, solid_capstyle="round",
+            )
+            blue = [
+                p for p in pts
+                if not _near_any(p, cut_pts, NODE_CLUSTER_TOL)
+            ]
+            blue = _collapse_nodes_outermost(
+                blue, tol=NODE_CLUSTER_TOL * 0.75, origin=origin
+            )
+            blue = _space_nodes(
+                blue, min_spacing=BLUE_MIN_SPACING, origin=origin
+            )
+            if blue:
+                ax.plot(
+                    [p[0] for p in blue], [p[1] for p in blue], "o",
+                    color=POLY_NODE_COLOR, markersize=2.5,
+                    markeredgecolor=POLY_NODE_EDGE, markeredgewidth=0.3,
+                    zorder=9, alpha=0.7,
+                )
+            if cut_pts:
+                yx = [p[0] for p in cut_pts]
+                yy = [p[1] for p in cut_pts]
+                ax.plot(
+                    yx + [yx[0]], yy + [yy[0]],
+                    color=OUTER_NODE_COLOR, linewidth=1.4, alpha=0.9,
+                    zorder=8, solid_capstyle="butt", solid_joinstyle="miter",
+                )
+                ax.plot(
+                    yx, yy, "o",
+                    color=OUTER_NODE_COLOR, markersize=5.2,
+                    markeredgecolor=OUTER_NODE_EDGE, markeredgewidth=0.65,
+                    zorder=10, alpha=0.98,
+                )
+            # Fabrication offset corners (purple)
+            if show_fabric_offset:
+                fab = item.get("fabric_poly")
+                if fab is not None and len(fab) >= 3:
+                    fpts = [[float(p[0]), float(p[1])] for p in fab]
+                    fpts = _collapse_nodes_outermost(
+                        fpts, tol=NODE_CLUSTER_TOL, origin=origin
+                    )
+                    if fpts:
+                        ax.plot(
+                            [p[0] for p in fpts], [p[1] for p in fpts], "s",
+                            color=FABRIC_NODE_COLOR, markersize=4.2,
+                            markeredgecolor=FABRIC_NODE_EDGE,
+                            markeredgewidth=0.55, zorder=10.2, alpha=0.95,
+                        )
+
     if show_first_last_edges:
-        for item in closed_polys:
+        for ii, item in enumerate(closed_polys):
             fr = item.get("first")
             la = item.get("last")
             apex = item.get("apex")
+            yellow = item.get("_plot_cut_corners") or (
+                item_cut_corners[ii] if ii < len(item_cut_corners) else []
+            )
             if fr is not None:
                 _draw_seg(
                     ax, fr[0], fr[1], color=FIRST_LINE_COLOR,
-                    linewidth=2.4, zorder=8, solid_capstyle="round",
+                    linewidth=2.4, zorder=8, solid_capstyle="butt",
                 )
             if la is not None:
-                # Full last (cut) segment when both ends differ
                 try:
                     same = (
                         abs(float(la[0][0]) - float(la[1][0])) < 1e-12
@@ -1221,20 +1605,24 @@ def _draw_layer(
                 if not same:
                     _draw_seg(
                         ax, la[0], la[1], color=LAST_LINE_COLOR,
-                        linewidth=2.4, zorder=8, solid_capstyle="round",
+                        linewidth=2.4, zorder=8, solid_capstyle="butt",
                     )
                 for pt in la:
+                    if show_polygon_nodes and _near_any(pt, yellow, NODE_CLUSTER_TOL):
+                        continue
                     ax.plot(
                         float(pt[0]), float(pt[1]), "o",
                         color=LAST_LINE_COLOR, markersize=4.5, zorder=9,
                     )
-            # Highlight the last apex chosen for the max-area triangle
             if apex is not None:
-                ax.plot(
-                    float(apex[0]), float(apex[1]), "o",
-                    color=LAST_LINE_COLOR, markersize=7.0,
-                    markeredgecolor="#5a0a0a", markeredgewidth=0.8, zorder=10,
-                )
+                if show_polygon_nodes and _near_any(apex, yellow, NODE_CLUSTER_TOL):
+                    pass
+                else:
+                    ax.plot(
+                        float(apex[0]), float(apex[1]), "o",
+                        color=LAST_LINE_COLOR, markersize=7.0,
+                        markeredgecolor="#5a0a0a", markeredgewidth=0.8, zorder=10,
+                    )
 
     if show_panel_ids:
         for i in sorted(draw_ids):
@@ -1261,7 +1649,7 @@ def _draw_layer(
             or str(it.get("source", "")).endswith("sweep")
         )
         kind = f"{n_sw} sweeps" if n_sw else "tris/quads"
-        shell_bits = f"phys={n_physical} ghost={n_ghost}"
+        shell_bits = f"phys={n_physical} ghost={n_ghost} side={n_side}"
         ax.set_title(
             f"offset h = {layer_h:g}   "
             f"({n_panels} panels, {n_shaded} paints [{shell_bits}], "
@@ -1345,6 +1733,8 @@ def visualize_trimmed(
     show_panel_ids: bool = True,
     show_closed_polys: bool = True,
     show_first_last_edges: bool = True,
+    show_polygon_nodes: bool = True,
+    show_fabric_offset: bool = True,
     title: Optional[str] = None,
 ) -> plt.Figure:
     base = original or trimmed
@@ -1458,6 +1848,8 @@ def visualize_trimmed(
             show_panel_ids=show_panel_ids,
             show_closed_polys=show_closed_polys,
             show_first_last_edges=show_first_last_edges,
+            show_polygon_nodes=show_polygon_nodes,
+            show_fabric_offset=show_fabric_offset,
             panels_on_layer=panels_on_layer,
         )
         n_g_draw = sum(
@@ -1465,10 +1857,15 @@ def visualize_trimmed(
             if p.get("poly") is not None and len(p["poly"]) >= 3
             and _shell_kind_of(p) == "ghost"
         )
+        n_s_draw = sum(
+            1 for p in closed
+            if p.get("poly") is not None and len(p["poly"]) >= 3
+            and _shell_kind_of(p) == "side"
+        )
         n_p_draw = sum(
             1 for p in closed
             if p.get("poly") is not None and len(p["poly"]) >= 3
-            and _shell_kind_of(p) != "ghost"
+            and _shell_kind_of(p) == "physical"
         )
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
@@ -1476,8 +1873,8 @@ def visualize_trimmed(
         ax.text(
             0.02, 0.98,
             f"panels @ h: [{panel_list}]\n"
-            f"shades: {n_sh}  (phys={n_p_draw} · ghost={n_g_draw})\n"
-            f"P# = physical · P#·G = ghost shell\n"
+            f"shades: {n_sh}  (phys={n_p_draw} · ghost={n_g_draw} · side={n_s_draw})\n"
+            f"P# = physical · P#·G = ghost · P#·S = side\n"
             f"first=green · last=red",
             transform=ax.transAxes, ha="left", va="top",
             fontsize=7.5, color="#333333",
@@ -1498,8 +1895,30 @@ def visualize_trimmed(
             facecolor=GHOST_POLY_FACE, edgecolor=GHOST_POLY_EDGE, alpha=GHOST_POLY_ALPHA,
             hatch="...", label="Ghost shell shade (P#·G)",
         ),
+        Patch(
+            facecolor=SIDE_POLY_FACE, edgecolor=SIDE_POLY_EDGE, alpha=SIDE_POLY_ALPHA,
+            hatch="xxx", label="Side panel shade (P#·S)",
+        ),
         Line2D([0], [0], color=FIRST_LINE_COLOR, lw=2.4, label="first"),
         Line2D([0], [0], color=LAST_LINE_COLOR, lw=2.4, label="last (cut / contact)"),
+        Line2D(
+            [0], [0], color=POLY_NODE_COLOR, marker="o", linestyle="None",
+            markersize=5, label="polygon sample nodes",
+        ),
+        Line2D(
+            [0], [0], color=OUTER_NODE_COLOR, marker="o", linestyle="None",
+            markersize=6, markeredgecolor=OUTER_NODE_EDGE,
+            label="straight-cut corners",
+        ),
+        Line2D(
+            [0], [0], color=FABRIC_EDGE_COLOR, lw=1.8, linestyle="--",
+            label="fabric offset outline",
+        ),
+        Line2D(
+            [0], [0], color=FABRIC_NODE_COLOR, marker="s", linestyle="None",
+            markersize=5, markeredgecolor=FABRIC_NODE_EDGE,
+            label="fabric offset corners",
+        ),
     ]
     fig.legend(
         handles=legend_handles, loc="lower center", ncol=3,
@@ -1508,20 +1927,24 @@ def visualize_trimmed(
 
     fig_title = title or "Panel trimming"
     fig_title += (
-        "\nshaded = dual-curve ribbon · red=physical · blue=ghost intermediate · "
-        "subplots top→bottom = highest→lowest thickness offset"
+        "\nshaded = geometric cut · purple dashed = fabric offset · "
+        "red=physical · blue=ghost · green=side · top→bottom = highest→lowest offset"
     )
     meta = trimmed.get("trim_3d_metadata") or {}
     bits = [f"shaded={total_polys}"]
     n_ghost_all = sum(
         1 for sh in (shaded_regions or []) if _shell_kind_of(sh) == "ghost"
     )
+    n_side_all = sum(
+        1 for sh in (shaded_regions or []) if _shell_kind_of(sh) == "side"
+    )
     n_phys_all = sum(
-        1 for sh in (shaded_regions or []) if _shell_kind_of(sh) != "ghost"
+        1 for sh in (shaded_regions or []) if _shell_kind_of(sh) == "physical"
     )
     if shaded_regions:
         bits.append(f"phys={n_phys_all}")
         bits.append(f"ghost={n_ghost_all}")
+        bits.append(f"side={n_side_all}")
     if meta:
         bits.append(f"trimmer_cuts={meta.get('n_cuts', '?')}")
     n_dual = len(shaded_regions or [])
@@ -1534,6 +1957,10 @@ def visualize_trimmed(
         )
         if stats.get("n_ghost_regions") is not None:
             bits.append(f"stats_ghost={stats.get('n_ghost_regions')}")
+        if stats.get("n_side_regions") is not None:
+            bits.append(f"stats_side={stats.get('n_side_regions')}")
+        if stats.get("n_side_panels") is not None:
+            bits.append(f"side_panels={stats.get('n_side_panels')}")
     if sources:
         bits.append("src=" + ",".join(sorted(s.split(".")[0] for s in sources)))
     fig_title += "  (" + ", ".join(bits) + ")"
@@ -1548,7 +1975,7 @@ def visualize_trimmed(
 
 def _run_one(sim: dict, output_dir: str) -> str:
     name = sim["name"]
-    # Prefer trimmedData/ for exported *-trimmed.json
+    # Prefer panel_trimming/trimmedData for exports
     trimmed_path = _resolve_json_path(name, prefer_trimmed=True)
     trimmed = _load_json(trimmed_path)
 
@@ -1576,13 +2003,24 @@ def _run_one(sim: dict, output_dir: str) -> str:
         1 for sh in (trimmed.get("shaded_regions") or [])
         if _shell_kind_of(sh) == "ghost"
     )
-    n_phys = n_dual - n_ghost
+    n_side = sum(
+        1 for sh in (trimmed.get("shaded_regions") or [])
+        if _shell_kind_of(sh) == "side"
+    )
+    n_phys = sum(
+        1 for sh in (trimmed.get("shaded_regions") or [])
+        if _shell_kind_of(sh) == "physical"
+    )
+    n_side_panels = len(trimmed.get("side_panels") or [])
+    if not n_side_panels:
+        n_side_panels = int(stats.get("n_side_panels") or 0)
     has_ubl = bool(trimmed.get("units_by_layer"))
     print(
         f"[panel-trimming] {os.path.basename(trimmed_path)}  "
         f"collision_stats={'yes' if has_stats else 'no'}  "
         f"segs={n_segs} shaded={n_poly} dual_curve={n_dual}  "
-        f"phys={n_phys} ghost={n_ghost}  "
+        f"phys={n_phys} ghost={n_ghost} side={n_side}  "
+        f"side_panels={n_side_panels}  "
         f"units_by_layer={'yes' if has_ubl else 'synth-from-units'}"
     )
 
@@ -1595,12 +2033,14 @@ def _run_one(sim: dict, output_dir: str) -> str:
         show_panel_ids=bool(sim.get("show_panel_ids", True)),
         show_closed_polys=bool(sim.get("show_closed_polys", True)),
         show_first_last_edges=bool(sim.get("show_first_last_edges", True)),
+        show_polygon_nodes=bool(sim.get("show_polygon_nodes", True)),
+        show_fabric_offset=bool(sim.get("show_fabric_offset", True)),
         title=os.path.basename(trimmed_path),
     )
 
     os.makedirs(output_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(trimmed_path))[0]
-    out_path = os.path.join(output_dir, f"{stem}_panel_trimming.png")
+    out_path = os.path.join(output_dir, f"{stem}.png")
     fig.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     print(f"[panel-trimming] wrote {out_path}")

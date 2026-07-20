@@ -12,4 +12,7 @@ simulations:
     show_panel_ids: true
     show_closed_polys: true
     show_first_last_edges: true
+    show_polygon_nodes: true
+    # Purple dashed = fabric_ring fabrication offset from clean
+    show_fabric_offset: true
     show_host_polys: false

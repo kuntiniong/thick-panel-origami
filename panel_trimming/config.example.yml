@@ -15,3 +15,7 @@ simulations:
     # thick heights (no PD / springs). 0 = off.
     # Example: physical shells at -6 and 2 with spacing 2 → ghosts at -4, -2, 0.
     thick_ghost_spacing_mm: 2.0
+    # Vertical side panels between consecutive layer heights (unique indices,
+    # collision-only, no PD). Exported as side_panels[] + shell_kind "side".
+    # false = disable side walls entirely.
+    thick_side_panels: true
