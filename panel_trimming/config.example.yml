@@ -1,21 +1,8 @@
-
 simulations:
-  - name: mountain-thick
-
-    # true  = no GUI (phys run() drives 0→π, then export trimmed JSON)
-    # false = GUI
+  - name: miura-thick
+    thick_side_panels: true
+    thick_ghost_spacing_mm: 0
     headless: false
 
-    fast: true
-    material_type: 1
-    ref_target: false
+    use_gpu: auto
     thick_mode: true
-    unit_edge_max: 4
-    # Collision-only ghost Z shells: one every this many mm between physical
-    # thick heights (no PD / springs). 0 = off.
-    # Example: physical shells at -6 and 2 with spacing 2 → ghosts at -4, -2, 0.
-    thick_ghost_spacing_mm: 2.0
-    # Vertical side panels between consecutive layer heights (unique indices,
-    # collision-only, no PD). Exported as side_panels[] + shell_kind "side".
-    # false = disable side walls entirely.
-    thick_side_panels: true
