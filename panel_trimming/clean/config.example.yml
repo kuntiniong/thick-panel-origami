@@ -1,5 +1,27 @@
+# panel_trimming/clean config example
+#
+# Pipeline per shaded region:
+#   1) round coords to round_dp
+#   2) Union-Find group messy nodes (group_tol) → outermost each
+#   3) convex-hull → straight_slack inflate → simplify to long straight edges
+#      (never undershoot; cap overshoot via max_overshoot_ratio)
+#   4) fabric_offset outward from cut polygon
+
+min_area: 0
+straight_cut: true
+cut_tol: 3.5              # larger → fewer, longer straight edges
+straight_slack: 0.6       # outward room before simplify (anti-undershoot)
+max_overshoot_ratio: 1.35 # reject expand/simplify if cut grows too much vs hull
+fabric_offset: 0
+group_tol: 3.0
+round_dp: 6
+uf_respect_barriers: false
+
 jobs:
   - name: miura-thick-trimmed
     fabric_offset: 0.5
-    corner_merge_tol: 3.0
-
+    group_tol: 3.0
+    cut_tol: 3.5
+    straight_slack: 0.6
+    max_overshoot_ratio: 1.35
+    round_dp: 6

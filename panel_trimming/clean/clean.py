@@ -1,36 +1,37 @@
 """
-Clean trimmed collision shades: drop collapsed / free-standing line paints.
+Clean trimmed collision shades: drop collapsed paints, UF-clean nodes, cut, offset.
 
 Reads  panel_trimming/trimmedData/<name>-trimmed.json  (or a path)
 Writes panel_trimming/trimmedData/<name>-cleaned.json  (-trimmed → -cleaned suffix)
 
-Drops:
+Pipeline (per kept shaded region):
+  1) Round all dual-curve coords to 6 d.p. (float noise → stable grouping)
+  2) Union-Find group messy nodes (esp. vertex clouds) under custom
+     constraints; keep the outermost node per cluster (farthest from the
+     region sample centroid — never the cluster mean)
+  3) Straight containing cut = convex hull of UF winners (panel-clipped),
+     residual re-hull if any original sample is outside, optional RDP only
+     when containment is preserved → never undershoot shaded region
+  4) Manual fabrication offset outward from the step-3 polygon (barrier /
+     panel clamped)
+
+Also drops:
   - kind == "line"  (exporter collapsed-contact flag)
   - recomputed ribbon area ~ 0  (c0/c1 reverse-trace; shoelace cancels)
   - optional: area < min_area (default 0 = off; keeps small pink fills)
 
-Straight containing cut (default on):
-  1) Convex hull of all dual-curve samples (works for concave ribbons)
-  2) Simplify dense / near-convex hulls to few straight edges (RDP)
-  3) Expand cut from centroid until samples are inside again, but each
-     vertex ray stops at the nearest crease / border / panel edge
-     → prefer greater enclosure without crossing design walls
-
 Viz helpers:
-  clean_ring   = all dual-curve sample nodes (c0 + reverse c1)
-  coordinates  = straight containing cut polygon
-  cut_ring     = same as coordinates
-  clean_edges  = straight cut edges
-
-Fabrication offset (optional, config / --fabric-offset):
-  Outward offset of cut_ring for kerf / tool allowance. Each vertex is pushed
-  along the outward normal, then clamped so it cannot cross a crease, border,
-  or host-panel edge (same barrier model as cut expand).
+  clean_ring   = dual-curve sample nodes (c0 + reverse c1), rounded
+  coordinates  = cut_ring, or fabric_ring when offset > 0
+  cut_ring     = step-3 straight containing cut
+  fabric_ring  = step-4 offset outline
+  clean_edges  = straight cut / fabric edges
 
 YAML (panel_trimming/clean/config.yml):
   jobs:
     - name: miura-thick-trimmed
       fabric_offset: 0.5
+      group_tol: 3.0
 
 Usage:
   python panel_trimming/clean/clean.py
@@ -38,13 +39,16 @@ Usage:
   python panel_trimming/clean/clean.py --name miura-thick-trimmed --fabric-offset 0.8
   python panel_trimming/clean/clean.py --name mountain-thick-trimmed --min-area 20
   python panel_trimming/clean/clean.py --name miura-thick-trimmed --cut-tol 2.0
+  python panel_trimming/clean/clean.py --name miura-thick-trimmed --group-tol 3.0
   python panel_trimming/clean/clean.py --name miura-thick-trimmed --no-straight-cut
+  python panel_trimming/clean/clean.py --name miura-thick-trimmed --no-viz
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import importlib.util
 import json
 import math
 import os
@@ -73,8 +77,14 @@ DEFAULT_MIN_AREA = 0.0
 COLLAPSED_AREA_EPS = 1e-6
 # Near-duplicate vertex eps when building hull / ring
 VERTEX_EPS = 1e-9
-# Max perpendicular deviation when simplifying dense convex hulls (design units)
-DEFAULT_CUT_TOL = 1.5
+# Max perpendicular deviation when simplifying dense convex hulls (design units).
+# Larger → fewer, longer straight edges (still containment-checked).
+DEFAULT_CUT_TOL = 3.5
+# Small outward slack before simplify so aggressive straight cuts don't undershoot.
+# Clamped by panel / barriers; keeps overshoot modest.
+DEFAULT_STRAIGHT_SLACK = 0.6
+# Reject simplified cuts that grow area by more than this factor vs hull
+DEFAULT_MAX_OVERSHOOT_RATIO = 1.35
 # Outward fabrication offset (design units / mm). 0 = off.
 DEFAULT_FABRIC_OFFSET = 0.0
 # line_features.type: mountain / valley / border — expansion may not cross these
@@ -84,8 +94,14 @@ TYPE_BORDER = 2
 BARRIER_TYPES = (TYPE_MOUNTAIN, TYPE_VALLEY, TYPE_BORDER)
 # Stop a short epsilon before the barrier so we don't sit on top of creases
 BARRIER_STOP_EPS = 1e-4
-# Merge near-coincident cut corners into one outermost node (design units)
-DEFAULT_CORNER_MERGE_TOL = 3.0
+# Union-Find cluster distance for messy nodes (design units)
+DEFAULT_GROUP_TOL = 3.0
+# Alias kept for older config keys
+DEFAULT_CORNER_MERGE_TOL = DEFAULT_GROUP_TOL
+# Quantize geometry before UF / hull (decimal places)
+DEFAULT_ROUND_DP = 6
+# Whether UF refuses to merge pairs whose segment crosses a crease/border
+DEFAULT_UF_RESPECT_BARRIERS = False
 
 
 def _load_json(path: str) -> dict:
@@ -345,6 +361,29 @@ def _xy(p) -> List[float]:
     return [float(p[0]), float(p[1])]
 
 
+def _round_coord(x: float, *, dp: int = DEFAULT_ROUND_DP) -> float:
+    return round(float(x), int(dp))
+
+
+def _round_pt(p, *, dp: int = DEFAULT_ROUND_DP) -> List[float]:
+    return [_round_coord(p[0], dp=dp), _round_coord(p[1], dp=dp)]
+
+
+def _round_poly(pts: Sequence, *, dp: int = DEFAULT_ROUND_DP) -> List[List[float]]:
+    return [_round_pt(p, dp=dp) for p in (pts or [])]
+
+
+def round_region_geometry(region: dict, *, dp: int = DEFAULT_ROUND_DP) -> None:
+    """In-place: quantize dual-curve (and residual poly) coords to ``dp`` d.p."""
+    if region.get("c0") is not None:
+        region["c0"] = _round_poly(region["c0"], dp=dp)
+    if region.get("c1") is not None:
+        region["c1"] = _round_poly(region["c1"], dp=dp)
+    for key in ("coordinates", "cut_ring", "fabric_ring", "clean_ring"):
+        if region.get(key) is not None:
+            region[key] = _round_poly(region[key], dp=dp)
+
+
 def _dist2(a: Sequence, b: Sequence) -> float:
     dx = float(a[0]) - float(b[0])
     dy = float(a[1]) - float(b[1])
@@ -413,7 +452,15 @@ def _point_in_or_on_polygon(p: Sequence, poly: Sequence, eps: float = 1e-7) -> b
         return False
     x, y = float(p[0]), float(p[1])
     n = len(poly)
-    # On boundary?
+    eps = max(float(eps), 1e-9)
+    eps2 = eps * eps
+    # Near a vertex? (avoids false outs after 6 d.p. rounding / clamps)
+    for i in range(n):
+        dx = x - float(poly[i][0])
+        dy = y - float(poly[i][1])
+        if dx * dx + dy * dy <= eps2:
+            return True
+    # On boundary edge?
     for i in range(n):
         ax, ay = float(poly[i][0]), float(poly[i][1])
         bx, by = float(poly[(i + 1) % n][0]), float(poly[(i + 1) % n][1])
@@ -421,14 +468,21 @@ def _point_in_or_on_polygon(p: Sequence, poly: Sequence, eps: float = 1e-7) -> b
         apx, apy = x - ax, y - ay
         lab2 = abx * abx + aby * aby
         if lab2 < 1e-24:
-            if abs(apx) <= eps and abs(apy) <= eps:
-                return True
             continue
+        # Perp distance to infinite line, then clamp to segment
+        t = (apx * abx + apy * aby) / lab2
+        if t < -1e-9 or t > 1.0 + 1e-9:
+            continue
+        projx = ax + t * abx
+        projy = ay + t * aby
+        ddx = x - projx
+        ddy = y - projy
+        if ddx * ddx + ddy * ddy <= eps2:
+            return True
+        # Also accept classic cross-product boundary test
         cross = abx * apy - aby * apx
         if abs(cross) <= eps * math.sqrt(lab2):
-            t = (apx * abx + apy * aby) / lab2
-            if -1e-9 <= t <= 1.0 + 1e-9:
-                return True
+            return True
     # Interior (even-odd)
     inside = False
     j = n - 1
@@ -985,6 +1039,154 @@ def drop_near_collinear(
     return raw
 
 
+def _all_samples_inside(
+    poly: Sequence,
+    samples: Sequence,
+    *,
+    eps: float = 1e-3,
+) -> bool:
+    if len(poly) < 3:
+        return False
+    return all(_point_in_or_on_polygon(p, poly, eps=eps) for p in samples or [])
+
+
+def simplify_containing_polygon(
+    pts: Sequence,
+    samples: Sequence,
+    *,
+    tol: float,
+    min_verts: int = 3,
+) -> List[List[float]]:
+    """
+    Aggressive straight-edge simplify that **never undershoots** ``samples``.
+
+    1) RDP + collinear drop at ``tol``
+    2) Greedy vertex drop (largest chord deviation first among removable)
+       while every sample stays inside
+
+    If a candidate would leave any sample outside, that vertex is kept.
+    """
+    raw = [_xy(p) for p in pts or []]
+    if len(raw) <= min_verts or float(tol) <= 0.0:
+        return raw
+    samp = [_xy(p) for p in samples or []]
+    if not samp:
+        return drop_near_collinear(
+            simplify_closed_polygon(raw, tol=float(tol)),
+            max_dev=float(tol),
+        )
+
+    # Stage 1: classical simplify if still containing
+    cand = simplify_closed_polygon(raw, tol=float(tol))
+    cand = drop_near_collinear(cand, max_dev=float(tol))
+    if len(cand) >= min_verts and _all_samples_inside(cand, samp):
+        raw = cand
+
+    # Stage 2: greedy drop near-collinear / low-deviation verts (forgiving)
+    # Prefer dropping the flattest verts first so long straight edges win.
+    changed = True
+    while changed and len(raw) > min_verts:
+        changed = False
+        m = len(raw)
+        # score each vertex by chord deviation (low = safer to drop)
+        scores: List[Tuple[float, int]] = []
+        for i in range(m):
+            j = (i - 1) % m
+            k = (i + 1) % m
+            dev = _point_seg_dist(raw[i], raw[j], raw[k])
+            scores.append((dev, i))
+        scores.sort(key=lambda t: t[0])  # flattest first
+        for dev, i in scores:
+            if len(raw) <= min_verts:
+                break
+            # Only drop if within forgiving tol (or very flat)
+            if dev > float(tol) * 1.25 and dev > 1e-9:
+                continue
+            trial = [raw[j] for j in range(len(raw)) if j != i]
+            if len(trial) < min_verts:
+                continue
+            if _poly_signed_area(trial) < 0:
+                trial = list(reversed(trial))
+            if _all_samples_inside(trial, samp):
+                raw = trial
+                changed = True
+                break
+    return raw if len(raw) >= min_verts else [_xy(p) for p in pts or []]
+
+
+def inflate_polygon_slack(
+    poly: Sequence,
+    slack: float,
+    *,
+    barriers: Optional[Sequence[Tuple[Sequence, Sequence]]] = None,
+    panel_poly: Optional[Sequence] = None,
+    samples: Optional[Sequence] = None,
+    max_area_ratio: float = DEFAULT_MAX_OVERSHOOT_RATIO,
+) -> Tuple[List[List[float]], Dict[str, Any]]:
+    """
+    Small outward inflate so later straight-edge simplify has room without
+    undershooting. Barrier/panel clamped. Rejects if area grows too much.
+    """
+    raw = _ensure_ccw(poly)
+    info: Dict[str, Any] = {
+        "slack": float(slack),
+        "applied": False,
+        "area_in": float(_polygon_area_2d(raw)) if len(raw) >= 3 else 0.0,
+    }
+    if len(raw) < 3 or float(slack) <= 1e-12:
+        return [list(p) for p in raw], info
+
+    expanded, oinfo = offset_polygon_outward(
+        raw,
+        float(slack),
+        barriers=barriers,
+        panel_poly=panel_poly,
+    )
+    if len(expanded) < 3:
+        return [list(p) for p in raw], {**info, **oinfo, "reverted": True}
+
+    a0 = info["area_in"]
+    a1 = float(_polygon_area_2d(expanded))
+    info["area_out"] = a1
+    # Containment: inflated poly must still hold samples (should; outward)
+    if samples and not _all_samples_inside(expanded, samples, eps=1e-4):
+        # Rare numerical case — keep original
+        return [list(p) for p in raw], {**info, "reverted": True, "reason": "lost_samples"}
+
+    if a0 > 1e-9 and a1 > a0 * float(max_area_ratio):
+        # Too much overshoot — try half slack once
+        half = float(slack) * 0.5
+        if half > 1e-12:
+            mid, minfo = offset_polygon_outward(
+                raw, half, barriers=barriers, panel_poly=panel_poly
+            )
+            if len(mid) >= 3:
+                am = float(_polygon_area_2d(mid))
+                if (
+                    (samples is None or _all_samples_inside(mid, samples, eps=1e-4))
+                    and (a0 <= 1e-9 or am <= a0 * float(max_area_ratio))
+                ):
+                    info.update({
+                        "applied": True,
+                        "slack": half,
+                        "area_out": am,
+                        "halved": True,
+                        **{k: minfo.get(k) for k in ("clamped", "panel_clipped")},
+                    })
+                    return mid, info
+        return [list(p) for p in raw], {
+            **info,
+            "reverted": True,
+            "reason": "overshoot_ratio",
+            "ratio": a1 / max(a0, 1e-18),
+        }
+
+    info["applied"] = True
+    info["clamped"] = bool(oinfo.get("clamped"))
+    info["panel_clipped"] = bool(oinfo.get("panel_clipped"))
+    return expanded, info
+
+
 def _panel_polygon(data: Optional[dict], region: Optional[dict]) -> Optional[List[List[float]]]:
     if not data or not region:
         return None
@@ -1012,238 +1214,463 @@ def straight_containing_cut(
     tol: float = DEFAULT_CUT_TOL,
     barriers: Optional[Sequence[Tuple[Sequence, Sequence]]] = None,
     panel_poly: Optional[Sequence] = None,
+    hull_samples: Optional[Sequence] = None,
+    contain_samples: Optional[Sequence] = None,
+    round_dp: int = DEFAULT_ROUND_DP,
+    straight_slack: float = DEFAULT_STRAIGHT_SLACK,
+    max_overshoot_ratio: float = DEFAULT_MAX_OVERSHOOT_RATIO,
 ) -> Tuple[List[List[float]], Dict[str, Any]]:
     """
-    Straight-edged cut that contains every dual-curve sample.
+    Straight-edged cut that contains every dual-curve sample (never undershoot).
 
     Pipeline:
-      1) Convex hull of {c0 ∪ c1}  — outer enclosure for **concave** ribbons.
-      2) Simplify dense / **convex** hulls (RDP + collinear drop).
-      3) Expand from centroid until samples are inside, but **never past the
-         nearest crease / border** along each vertex ray (incl. verts on wall).
-      4) Hard-clip to host panel polygon so nothing exceeds the border.
+      1) Convex hull of dual-curve samples (UF winners + all samples)
+      2) Small outward ``straight_slack`` (barrier/panel clamped) so simplify
+         has room — fewer long straight edges without cutting into the shade
+      3) Containment-preserving simplify (RDP + greedy flat-vertex drop)
+         with forgiving ``tol``; reject any candidate that loses a sample
+      4) Cap overshoot via ``max_overshoot_ratio`` vs hull area
+
+    Prefer more straight lines (forgiving tol + slack) while refusing both
+    undershoot (sample outside) and large overshoot (area explosion).
     """
-    samples: List[List[float]] = []
+    all_samples: List[List[float]] = []
     for p in c0 or []:
-        samples.append(_xy(p))
+        all_samples.append(_round_pt(p, dp=round_dp))
     for p in c1 or []:
-        samples.append(_xy(p))
+        all_samples.append(_round_pt(p, dp=round_dp))
+
+    if hull_samples is not None and len(hull_samples) > 0:
+        samples = [_round_pt(p, dp=round_dp) for p in hull_samples]
+    else:
+        samples = list(all_samples)
+
+    if contain_samples is not None and len(contain_samples) > 0:
+        must_contain_all = [_round_pt(p, dp=round_dp) for p in contain_samples]
+    else:
+        must_contain_all = list(all_samples)
+
     ribbon = _ribbon_ring(c0, c1)
     ribbon_a = _polygon_area_2d(ribbon) if ribbon else 0.0
     bars = list(barriers or [])
-    panel = [_xy(p) for p in panel_poly] if panel_poly and len(panel_poly) >= 3 else None
+    panel = (
+        _round_poly(panel_poly, dp=round_dp)
+        if panel_poly and len(panel_poly) >= 3
+        else None
+    )
 
-    hull = convex_hull(samples)
+    # Containment target: all dual-curve samples. Points outside the panel are
+    # projected in so the cut covers the shaded region without needing to leave
+    # the panel when the shade only grazes a border.
+    if panel is not None:
+        must_contain = []
+        for p in must_contain_all:
+            if _point_in_or_on_polygon(p, panel, eps=1e-3):
+                must_contain.append(p)
+            else:
+                must_contain.append(_clamp_point_to_convex(p, panel))
+        # Dedupe projected stack-ups
+        must_contain = _dedupe_points(must_contain, eps=10 ** (-int(round_dp)))
+    else:
+        must_contain = list(must_contain_all)
+
+    def _count_out(poly_pts: Sequence, pts: Sequence, *, eps: float = 1e-3) -> int:
+        """Count samples outside poly. Slightly forgiving eps for border grazing."""
+        if len(poly_pts) < 3:
+            return len(pts)
+        return sum(
+            1 for p in pts
+            if not _point_in_or_on_polygon(p, poly_pts, eps=eps)
+        )
+
+    exp_info: Dict[str, Any] = {
+        "barrier_clamped": False,
+        "n_barriers": len(bars),
+        "panel_clipped": False,
+    }
+    n_expand, scale = 0, 1.0
+
+    # Always contain the (possibly panel-projected) dual-curve samples
+    target = list(must_contain) if must_contain else list(must_contain_all)
+
+    # Hull seeds: UF winners + every target sample (never drop a sample)
+    hull_pts: List[List[float]] = []
+    for p in samples:
+        if panel is None or _point_in_or_on_polygon(p, panel, eps=1e-3):
+            hull_pts.append(p)
+        elif panel is not None:
+            hull_pts.append(_clamp_point_to_convex(p, panel))
+    for p in target:
+        hull_pts.append(p)
+    if not hull_pts:
+        hull_pts = list(must_contain_all)
+
+    hull = convex_hull(hull_pts)
     n_hull_raw = len(hull)
     hull_a = _polygon_area_2d(hull) if len(hull) >= 3 else 0.0
-    if ribbon is not None and hull_a + 1e-9 < ribbon_a:
-        hull = convex_hull(ribbon)
-        hull_a = _polygon_area_2d(hull)
-        n_hull_raw = len(hull)
+    cut = [list(p) for p in hull]
+
+    # Degenerate projected hull → full unclipped sample hull
+    if hull_a < max(1e-4, 0.05 * max(ribbon_a, 1e-9)) and must_contain_all:
+        full_all = convex_hull(must_contain_all)
+        fa = _polygon_area_2d(full_all) if len(full_all) >= 3 else 0.0
+        if fa > hull_a + 1e-9:
+            cut = full_all
+            target = list(must_contain_all)
+            hull_a = fa
+            n_hull_raw = len(cut)
+            exp_info["panel_overflow"] = True
+            exp_info["fell_back_to_unclipped_hull"] = True
+
+    n_out = _count_out(cut, target)
+    if n_out > 0:
+        fixed = convex_hull(target)
+        if len(fixed) >= 3:
+            cut = fixed
+            hull_a = _polygon_area_2d(cut)
+            n_out = _count_out(cut, target)
+            exp_info["fell_back_to_full_hull"] = True
 
     t = float(tol)
-    simplified = simplify_closed_polygon(hull, tol=t) if t > 0.0 else [list(p) for p in hull]
-    simplified = drop_near_collinear(simplified, max_dev=t)
-    if len(simplified) < 3:
-        simplified = [list(p) for p in hull]
+    slack = float(straight_slack)
+    # Adaptive slack: small ribbons need less room; dense hulls need more
+    if hull_a > 1e-6 and n_hull_raw >= 8:
+        slack = max(slack, min(1.25, 0.02 * math.sqrt(hull_a)))
+    if hull_a < 5.0:
+        slack = min(slack, 0.35)
 
-    # Clip simplified hull to panel first (hull can sit on border; expand must not leave)
-    if panel is not None and len(simplified) >= 3:
-        clipped0 = clip_polygon_to_convex(simplified, panel)
-        if len(clipped0) >= 3:
-            simplified = clipped0
-
-    # Tiny ribbons: do not edge-push (can runaway along panel); keep hull only
-    use_push = ribbon_a >= 5.0 or n_hull_raw >= 8
-    if use_push:
-        cut, n_expand, scale, exp_info = expand_polygon_to_contain(
-            simplified, samples, barriers=bars, panel_poly=panel
+    # --- Expand-then-simplify: forgiving straight edges, no undershoot ---
+    base = [list(p) for p in cut]
+    if slack > 1e-12 and len(base) >= 3 and n_out == 0:
+        inflated, iinfo = inflate_polygon_slack(
+            base,
+            slack,
+            barriers=bars,
+            panel_poly=None if exp_info.get("panel_overflow") else panel,
+            samples=target,
+            max_area_ratio=float(max_overshoot_ratio),
         )
-    else:
-        cut = [list(p) for p in simplified]
-        n_expand, scale = 0, 1.0
-        exp_info = {
-            "barrier_clamped": False,
-            "n_barriers": len(bars),
-            "skip_push_tiny": True,
-        }
-    if len(cut) < 3:
-        cut = [list(p) for p in (clip_polygon_to_convex(hull, panel) if panel else hull)]
-        n_expand, scale = 0, 1.0
-        exp_info = {"barrier_clamped": False, "n_barriers": len(bars)}
+        exp_info["slack_info"] = iinfo
+        if iinfo.get("applied") and _all_samples_inside(inflated, target):
+            cut = inflated
+            exp_info["straight_slack"] = float(iinfo.get("slack") or slack)
+            exp_info["barrier_clamped"] = bool(
+                exp_info.get("barrier_clamped") or iinfo.get("clamped")
+            )
 
-    # Final panel clip (hard guarantee — cut must never leave the host panel)
-    if panel is not None and len(cut) >= 3:
-        clipped = clip_polygon_to_convex(cut, panel)
-        if len(clipped) >= 3:
-            cut = clipped
-            exp_info = dict(exp_info)
-            exp_info["panel_clipped"] = True
+    n_simplified = len(cut)
+    if t > 0.0 and len(cut) > 3 and _all_samples_inside(cut, target):
+        # Multi-level tol: try base, then more forgiving, keep fewest verts
+        # that still contain samples and respect overshoot cap
+        best = [list(p) for p in cut]
+        best_n = len(best)
+        base_area = max(hull_a, 1e-12)
+        for scale_t in (1.0, 1.5, 2.0):
+            trial_tol = t * scale_t
+            simp = simplify_containing_polygon(cut, target, tol=trial_tol)
+            if len(simp) < 3 or not _all_samples_inside(simp, target):
+                continue
+            sa = _polygon_area_2d(simp)
+            if sa > base_area * float(max_overshoot_ratio) * 1.15:
+                # Simplified shape grew too much relative to hull — skip
+                continue
+            if len(simp) < best_n:
+                best = simp
+                best_n = len(simp)
+                exp_info["simplified"] = True
+                exp_info["simplify_tol_used"] = float(trial_tol)
+        cut = best
+        n_simplified = len(cut)
+        if not exp_info.get("simplified") and len(cut) == len(base):
+            exp_info["simplify_rejected_undershoot"] = True
 
-    def _count_out(poly_pts: Sequence) -> int:
-        return sum(
-            1 for p in samples
-            if len(poly_pts) >= 3 and not _point_in_or_on_polygon(p, poly_pts, eps=1e-6)
+    # Round, then repair containment if needed
+    cut = _round_poly(cut, dp=round_dp)
+    cut = _dedupe_points(cut, eps=10 ** (-int(round_dp)))
+    if len(cut) >= 3 and _poly_signed_area(cut) < 0:
+        cut = list(reversed(cut))
+
+    n_out = _count_out(cut, target)
+    if n_out > 0 and target:
+        repaired = convex_hull(
+            _round_poly(list(cut) + list(target), dp=round_dp)
         )
-
-    cut_a = _polygon_area_2d(cut)
-    n_out = _count_out(cut)
-
-    # If a few samples remain outside after edge-push, re-hull cut ∪ those
-    # samples (adds only the needed extremes), then panel-clip. Avoids falling
-    # back to the full dense 50+ vertex hull.
-    if n_out > 0:
-        outside_pts = [
-            p for p in samples
-            if not _point_in_or_on_polygon(p, cut, eps=1e-6)
-        ]
-        if outside_pts:
-            merged = convex_hull(list(cut) + outside_pts)
-            if panel is not None:
-                merged = clip_polygon_to_convex(merged, panel)
-            if len(merged) >= 3:
-                n_out_m = _count_out(merged)
-                # Prefer merged if better containment or fewer verts than full hull
-                if n_out_m < n_out or (
-                    n_out_m <= n_out and len(merged) <= max(len(cut) + len(outside_pts), 8)
+        repaired = _dedupe_points(repaired, eps=10 ** (-int(round_dp)))
+        if len(repaired) >= 3:
+            # One more forgiving simplify on the repaired hull
+            if t > 0.0:
+                repaired2 = simplify_containing_polygon(
+                    repaired, target, tol=t
+                )
+                if (
+                    len(repaired2) >= 3
+                    and _all_samples_inside(repaired2, target)
                 ):
-                    cut = merged
-                    cut_a = _polygon_area_2d(cut)
-                    n_out = n_out_m
-                    exp_info = dict(exp_info)
-                    exp_info["merged_outside_samples"] = True
+                    repaired = repaired2
+            cut = repaired
+            if _poly_signed_area(cut) < 0:
+                cut = list(reversed(cut))
+            n_out = _count_out(cut, target)
+            exp_info["final_containment_repair"] = True
 
-    # Only fall back to full hull if still many samples outside
-    if n_out > max(2, int(0.02 * max(len(samples), 1))):
-        hull_clip = (
-            clip_polygon_to_convex(hull, panel) if panel else [list(p) for p in hull]
-        )
-        if len(hull_clip) >= 3:
-            n_out_h = _count_out(hull_clip)
-            if n_out_h < n_out:
-                cut = hull_clip
-                cut_a = _polygon_area_2d(cut)
-                n_out = n_out_h
-                n_expand, scale = 0, 1.0
-                exp_info = {
-                    "barrier_clamped": bool(exp_info.get("barrier_clamped")),
-                    "n_barriers": len(bars),
-                    "fell_back_to_hull": True,
-                    "panel_clipped": bool(panel is not None),
-                }
-
-    # Final hard clamp: every cut vertex must lie in the host panel
-    if panel is not None and len(cut) >= 3:
-        cut = [_clamp_point_to_convex(p, panel) for p in cut]
-        cut = clip_polygon_to_convex(cut, panel) if len(cut) >= 3 else cut
-        if len(cut) >= 3:
-            cut_a = _polygon_area_2d(cut)
-            exp_info = dict(exp_info)
-            exp_info["panel_clipped"] = True
-
-    # Collinear cleanup only if containment preserved
-    if n_out == 0 and t > 0.0 and len(cut) > 4:
-        simp2 = drop_near_collinear(cut, max_dev=max(t, 0.5))
-        if panel is not None and len(simp2) >= 3:
-            simp2 = clip_polygon_to_convex(simp2, panel)
-        if len(simp2) >= 3 and _count_out(simp2) == 0:
-            cut = simp2
-            cut_a = _polygon_area_2d(cut)
-
-    n_out = _count_out(cut)
+    exp_info["panel_clipped"] = bool(
+        panel is not None and not exp_info.get("panel_overflow")
+    )
+    cut_a = _polygon_area_2d(cut) if len(cut) >= 3 else 0.0
+    n_out = _count_out(cut, target)
     n_out_panel = 0
     if panel is not None:
         n_out_panel = sum(
             1 for p in cut
             if not _point_in_or_on_polygon(p, panel, eps=1e-3)
         )
+    n_in_panel = sum(
+        1 for p in must_contain_all
+        if panel is None or _point_in_or_on_polygon(p, panel, eps=1e-3)
+    )
     shape = "convex_dense" if n_hull_raw >= 12 else "concave_or_simple"
+    overshoot = (cut_a / hull_a) if hull_a > 1e-12 else 1.0
 
     info = {
-        "n_samples": len(samples),
+        "n_samples": len(must_contain_all),
+        "n_samples_in_panel": int(n_in_panel),
+        "n_samples_outside_panel": int(len(must_contain_all) - n_in_panel),
+        "n_hull_samples": len(samples),
         "n_hull": int(n_hull_raw),
         "n_cut": len(cut),
-        "n_simplified": len(simplified),
+        "n_simplified": int(n_simplified),
         "ribbon_area": float(ribbon_a),
         "cut_area": float(cut_a),
+        "hull_area": float(hull_a),
+        "overshoot_ratio": float(overshoot),
         "n_outside": int(n_out),
         "n_outside_panel": int(n_out_panel),
         "n_expand_iters": int(n_expand),
         "expand_scale": float(scale),
         "cut_tol": float(t),
+        "straight_slack": float(exp_info.get("straight_slack") or 0.0),
         "shape": shape,
         "n_barriers": int(exp_info.get("n_barriers") or len(bars)),
         "barrier_clamped": bool(exp_info.get("barrier_clamped")),
         "panel_clipped": bool(exp_info.get("panel_clipped")),
-        "containment_incomplete": bool(exp_info.get("containment_incomplete")),
+        "containment_incomplete": bool(n_out > 0),
+        "merged_outside_samples": bool(exp_info.get("merged_outside_samples")),
+        "fell_back_to_full_hull": bool(exp_info.get("fell_back_to_full_hull")),
+        "simplified": bool(exp_info.get("simplified")),
+        "simplify_tol_used": exp_info.get("simplify_tol_used"),
     }
     return cut, info
 
 
-def collapse_nodes_keep_outermost(
+# ---------------------------------------------------------------------------
+# Union-Find: group messy nodes → outermost representative
+# ---------------------------------------------------------------------------
+
+def _segments_properly_intersect(
+    a: Sequence, b: Sequence, c: Sequence, d: Sequence,
+) -> bool:
+    """True if open segment AB properly crosses open segment CD."""
+    def orient(p, q, r) -> float:
+        return (float(q[0]) - float(p[0])) * (float(r[1]) - float(p[1])) - (
+            float(q[1]) - float(p[1])
+        ) * (float(r[0]) - float(p[0]))
+
+    o1 = orient(a, b, c)
+    o2 = orient(a, b, d)
+    o3 = orient(c, d, a)
+    o4 = orient(c, d, b)
+    if o1 * o2 < 0.0 and o3 * o4 < 0.0:
+        return True
+    return False
+
+
+def can_union(
+    i: int,
+    j: int,
     pts: Sequence,
     *,
-    tol: float = DEFAULT_CORNER_MERGE_TOL,
+    tol: float,
+    barriers: Optional[Sequence[Tuple[Sequence, Sequence]]] = None,
+    respect_barriers: bool = False,
+    members_i: Optional[Sequence[int]] = None,
+    members_j: Optional[Sequence[int]] = None,
+) -> bool:
+    """
+    Custom UF constraints. Union only if **all** pass:
+
+      C1 pairwise |pi - pj| <= tol (seed edge)
+      C2 complete-linkage: diameter of merged cluster <= tol
+          (prevents single-linkage chains along dense dual curves)
+      C3 optional: segment between cluster reps does not cross a barrier
+    """
+    if i == j:
+        return True
+    tol2 = float(tol) * float(tol)
+    if _dist2(pts[i], pts[j]) > tol2:
+        return False
+
+    mi = list(members_i) if members_i is not None else [i]
+    mj = list(members_j) if members_j is not None else [j]
+    for a in mi:
+        for b in mj:
+            if _dist2(pts[a], pts[b]) > tol2:
+                return False
+
+    if respect_barriers and barriers:
+        a, b = pts[i], pts[j]
+        for ba, bb in barriers:
+            if _segments_properly_intersect(a, b, ba, bb):
+                return False
+    return True
+
+
+def group_nodes_outermost(
+    pts: Sequence,
+    *,
+    tol: float = DEFAULT_GROUP_TOL,
     origin: Optional[Sequence] = None,
-) -> List[List[float]]:
+    barriers: Optional[Sequence[Tuple[Sequence, Sequence]]] = None,
+    respect_barriers: bool = False,
+    adaptive_tol: bool = True,
+    round_dp: int = DEFAULT_ROUND_DP,
+) -> Tuple[List[List[float]], Dict[str, Any]]:
     """
-    Collapse near-coincident corner clusters to one outermost node each.
+    Union-Find cluster of near-coincident / messy nodes; one outermost each.
 
-    Walks the closed ring and merges **consecutive** vertices within ``tol``
-    into a single outermost point (farthest from ``origin`` / centroid).
-    Adaptive tol for tiny polygons so they do not collapse to one point.
+    Clustering is **complete-linkage** (cluster diameter ≤ tol) so dense dual-
+    curve chains do not collapse into one giant component.
+
+    **Outermost** = member maximizing squared distance to the *global* sample
+    centroid ``origin`` (default: mean of all input points — not the cluster
+    mean). Ties: higher x, then higher y.
+
+    Rationale: tip clouds at outer vertices should collapse to the true extreme
+    so a later convex hull never pulls inward. Cluster means / first-index
+    picks are undershoot-prone.
     """
-    raw = [_xy(p) for p in pts or []]
+    raw = [_round_pt(p, dp=round_dp) for p in (pts or [])]
     n = len(raw)
+    info: Dict[str, Any] = {
+        "n_in": n,
+        "n_out": n,
+        "n_groups": n,
+        "group_tol": float(tol),
+        "respect_barriers": bool(respect_barriers),
+        "linkage": "complete",
+    }
     if n <= 1 or float(tol) <= 0.0:
-        return raw
+        return raw, info
 
-    xs = [p[0] for p in raw]
-    ys = [p[1] for p in raw]
-    diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
     use_tol = float(tol)
-    if diag > 1e-9:
-        use_tol = min(use_tol, max(0.35, 0.15 * diag))
-    tol2 = use_tol * use_tol
+    if adaptive_tol and n >= 2:
+        xs = [p[0] for p in raw]
+        ys = [p[1] for p in raw]
+        diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        if diag > 1e-9:
+            # Cap so tiny ribbons cannot wipe out to one point; never raise tol
+            use_tol = min(use_tol, max(0.35, 0.15 * diag))
+    info["group_tol_used"] = use_tol
 
     if origin is None:
         ox = sum(p[0] for p in raw) / n
         oy = sum(p[1] for p in raw) / n
     else:
         ox, oy = float(origin[0]), float(origin[1])
+    info["origin"] = [ox, oy]
 
-    def outer_score(p: Sequence) -> float:
-        return (float(p[0]) - ox) ** 2 + (float(p[1]) - oy) ** 2
+    parent = list(range(n))
+    rank = [0] * n
+    members: List[List[int]] = [[i] for i in range(n)]
 
-    start = max(range(n), key=lambda i: outer_score(raw[i]))
-    order = [(start + k) % n for k in range(n)]
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
 
-    runs: List[List[int]] = []
-    cur_run = [order[0]]
-    for k in range(1, n):
-        i_prev, i = order[k - 1], order[k]
-        if _dist2(raw[i_prev], raw[i]) <= tol2:
-            cur_run.append(i)
+    def union_roots(ri: int, rj: int) -> None:
+        if ri == rj:
+            return
+        if rank[ri] < rank[rj]:
+            parent[ri] = rj
+            members[rj].extend(members[ri])
+            members[ri] = []
+        elif rank[ri] > rank[rj]:
+            parent[rj] = ri
+            members[ri].extend(members[rj])
+            members[rj] = []
         else:
-            runs.append(cur_run)
-            cur_run = [i]
-    runs.append(cur_run)
-    if len(runs) >= 2 and _dist2(raw[runs[0][0]], raw[runs[-1][-1]]) <= tol2:
-        runs[0] = runs[-1] + runs[0]
-        runs.pop()
+            parent[rj] = ri
+            rank[ri] += 1
+            members[ri].extend(members[rj])
+            members[rj] = []
 
-    out: List[List[float]] = []
-    for run in runs:
-        win = max(run, key=lambda i: outer_score(raw[i]))
-        p = list(raw[win])
-        if not out or _dist2(out[-1], p) > tol2:
-            out.append(p)
-    if len(out) >= 2 and _dist2(out[0], out[-1]) <= tol2:
-        if outer_score(out[0]) >= outer_score(out[-1]):
-            out = out[:-1]
-        else:
-            out = out[1:]
-    return out if len(out) >= 3 else raw
+    bars = list(barriers or [])
+    # Sort candidate pairs by distance (nearest first) for stable complete-linkage
+    pairs: List[Tuple[float, int, int]] = []
+    tol2 = use_tol * use_tol
+    for i in range(n):
+        for j in range(i + 1, n):
+            d2 = _dist2(raw[i], raw[j])
+            if d2 <= tol2:
+                pairs.append((d2, i, j))
+    pairs.sort(key=lambda t: t[0])
+
+    for _d2, i, j in pairs:
+        ri, rj = find(i), find(j)
+        if ri == rj:
+            continue
+        if can_union(
+            i, j, raw,
+            tol=use_tol,
+            barriers=bars,
+            respect_barriers=respect_barriers,
+            members_i=members[ri],
+            members_j=members[rj],
+        ):
+            union_roots(ri, rj)
+
+    clusters: Dict[int, List[int]] = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+
+    def outer_key(i: int) -> Tuple[float, float, float]:
+        # max distance to global centroid; tie-break higher x, higher y
+        dx = raw[i][0] - ox
+        dy = raw[i][1] - oy
+        return (dx * dx + dy * dy, raw[i][0], raw[i][1])
+
+    winners: List[Tuple[int, List[float]]] = []
+    for mems in clusters.values():
+        first = min(mems)
+        win = max(mems, key=outer_key)
+        winners.append((first, list(raw[win])))
+    winners.sort(key=lambda t: t[0])
+    out = [p for _, p in winners]
+    deduped = _dedupe_points(out, eps=10 ** (-int(round_dp)))
+    info["n_out"] = len(deduped)
+    info["n_groups"] = len(clusters)
+    info["n_merged"] = max(0, n - len(deduped))
+    return deduped, info
+
+
+def collapse_nodes_keep_outermost(
+    pts: Sequence,
+    *,
+    tol: float = DEFAULT_GROUP_TOL,
+    origin: Optional[Sequence] = None,
+    barriers: Optional[Sequence[Tuple[Sequence, Sequence]]] = None,
+    respect_barriers: bool = False,
+) -> List[List[float]]:
+    """Backward-compatible wrapper → :func:`group_nodes_outermost`."""
+    out, _ = group_nodes_outermost(
+        pts,
+        tol=tol,
+        origin=origin,
+        barriers=barriers,
+        respect_barriers=respect_barriers,
+    )
+    return out
 
 
 def apply_straight_containing_cut(
@@ -1252,15 +1679,22 @@ def apply_straight_containing_cut(
     tol: float = DEFAULT_CUT_TOL,
     barriers: Optional[Sequence[Tuple[Sequence, Sequence]]] = None,
     data: Optional[dict] = None,
-    corner_merge_tol: float = DEFAULT_CORNER_MERGE_TOL,
+    group_tol: float = DEFAULT_GROUP_TOL,
+    corner_merge_tol: Optional[float] = None,
+    uf_respect_barriers: bool = DEFAULT_UF_RESPECT_BARRIERS,
+    round_dp: int = DEFAULT_ROUND_DP,
+    straight_slack: float = DEFAULT_STRAIGHT_SLACK,
+    max_overshoot_ratio: float = DEFAULT_MAX_OVERSHOOT_RATIO,
 ) -> Dict[str, Any]:
     """
-    In-place: set coordinates / cut_ring to a straight containing cut.
-    Keeps original c0/c1 (sample trail + red/green first-last).
+    In-place: round → UF outermost samples → straight containing cut.
 
-    Expansion is limited by creases / borders; result is clipped to host panel.
-    Near-coincident cut corners collapse to one outermost node each.
+    Keeps original dual curves (rounded) as c0/c1 for trails / clean_ring.
+    Cut is a few long straight edges containing the shade (never undershoot).
     """
+    gtol = float(group_tol if corner_merge_tol is None else corner_merge_tol)
+
+    round_region_geometry(region, dp=round_dp)
     c0 = region.get("c0") or []
     c1 = region.get("c1") or []
     if not c0 or not c1 or len(c0) < 2 or len(c1) < 2:
@@ -1270,31 +1704,154 @@ def apply_straight_containing_cut(
         data, region=region
     )
     panel = _panel_polygon(data, region)
+    if panel is not None:
+        panel = _round_poly(panel, dp=round_dp)
+
+    originals: List[List[float]] = []
+    for p in c0:
+        originals.append(_round_pt(p, dp=round_dp))
+    for p in c1:
+        originals.append(_round_pt(p, dp=round_dp))
+
+    # Containment set: project out-of-panel samples onto panel (matches cut)
+    if panel is not None:
+        contain_check = []
+        for p in originals:
+            if _point_in_or_on_polygon(p, panel, eps=1e-3):
+                contain_check.append(p)
+            else:
+                contain_check.append(_clamp_point_to_convex(p, panel))
+        contain_check = _dedupe_points(contain_check, eps=10 ** (-int(round_dp)))
+    else:
+        contain_check = list(originals)
+
+    ox = sum(p[0] for p in originals) / len(originals)
+    oy = sum(p[1] for p in originals) / len(originals)
+
+    winners, uf_info = group_nodes_outermost(
+        originals,
+        tol=gtol,
+        origin=(ox, oy),
+        barriers=bars,
+        respect_barriers=bool(uf_respect_barriers),
+        round_dp=round_dp,
+    )
+
     cut, info = straight_containing_cut(
-        c0, c1, tol=tol, barriers=bars, panel_poly=panel
+        c0,
+        c1,
+        tol=tol,
+        barriers=bars,
+        panel_poly=panel,
+        hull_samples=winners,
+        contain_samples=originals,
+        round_dp=round_dp,
+        straight_slack=float(straight_slack),
+        max_overshoot_ratio=float(max_overshoot_ratio),
     )
     if len(cut) < 3:
-        return {"skipped": True, "reason": "cut < 3 verts", **info}
+        return {
+            "skipped": True,
+            "reason": "cut < 3 verts",
+            **info,
+            "uf": uf_info,
+        }
 
+    # Corner UF only if containment preserved (prefer fewer nodes)
     n_before = len(cut)
-    cut = collapse_nodes_keep_outermost(cut, tol=float(corner_merge_tol))
-    if len(cut) < 3:
-        cut, info = straight_containing_cut(
-            c0, c1, tol=tol, barriers=bars, panel_poly=panel
-        )
+    cut2, cut_uf = group_nodes_outermost(
+        cut,
+        tol=min(gtol, max(0.5, float(tol))),
+        origin=(ox, oy),
+        barriers=bars,
+        respect_barriers=bool(uf_respect_barriers),
+        round_dp=round_dp,
+    )
+    if len(cut2) >= 3 and (
+        not contain_check
+        or all(_point_in_or_on_polygon(p, cut2, eps=1e-4) for p in contain_check)
+    ):
+        # Prefer fewer verts when containment holds
+        if len(cut2) <= len(cut):
+            cut = cut2
+            info = dict(info)
+            info["n_cut"] = len(cut)
+            info["n_corners_merged"] = max(0, n_before - len(cut))
+            info["cut_area"] = float(_polygon_area_2d(cut))
+            info["cut_uf"] = cut_uf
+        else:
+            info = dict(info)
+            info["n_corners_merged"] = 0
     else:
         info = dict(info)
+        info["n_corners_merged"] = 0
+
+    cut = _round_poly(cut, dp=round_dp)
+
+    def _n_out_check(poly: Sequence, pts: Sequence, *, eps: float = 1e-3) -> int:
+        if len(poly) < 3:
+            return len(pts)
+        return sum(
+            1 for p in pts
+            if not _point_in_or_on_polygon(p, poly, eps=eps)
+        )
+
+    if contain_check and _n_out_check(cut, contain_check) > 0:
+        # Force containment: hull of cut ∪ samples, then re-simplify only if safe
+        fixed = convex_hull(
+            _round_poly(list(cut) + list(contain_check), dp=round_dp)
+        )
+        fixed = _dedupe_points(fixed, eps=10 ** (-int(round_dp)))
+        if len(fixed) >= 3 and _poly_signed_area(fixed) < 0:
+            fixed = list(reversed(fixed))
+        simp = simplify_containing_polygon(fixed, contain_check, tol=float(tol))
+        simp = _round_poly(simp, dp=round_dp)
+        if len(simp) >= 3 and _n_out_check(simp, contain_check) == 0:
+            cut = simp
+        else:
+            cut = fixed
+        info = dict(info)
         info["n_cut"] = len(cut)
-        info["n_corners_merged"] = max(0, n_before - len(cut))
         info["cut_area"] = float(_polygon_area_2d(cut))
+        info["n_outside"] = _n_out_check(cut, contain_check)
+        info["containment_incomplete"] = bool(info["n_outside"] > 0)
+        info["post_round_repair"] = True
+
+    # Last-resort: if still short, tiny outward slack then hull with samples
+    if contain_check and _n_out_check(cut, contain_check) > 0:
+        bumped, _ = inflate_polygon_slack(
+            cut,
+            max(0.15, float(straight_slack) * 0.5),
+            barriers=bars,
+            panel_poly=panel,
+            samples=None,
+            max_area_ratio=float(max_overshoot_ratio) * 1.1,
+        )
+        fixed = convex_hull(
+            _round_poly(list(bumped) + list(contain_check), dp=round_dp)
+        )
+        if len(fixed) >= 3:
+            cut = fixed
+            if _poly_signed_area(cut) < 0:
+                cut = list(reversed(cut))
+            cut = _round_poly(cut, dp=round_dp)
+            info = dict(info)
+            info["n_cut"] = len(cut)
+            info["cut_area"] = float(_polygon_area_2d(cut))
+            info["n_outside"] = _n_out_check(cut, contain_check)
+            info["containment_incomplete"] = bool(info["n_outside"] > 0)
+            info["last_resort_inflate"] = True
 
     region["coordinates"] = [list(p) for p in cut]
     region["cut_ring"] = [list(p) for p in cut]
     region["area"] = float(info.get("cut_area") or _polygon_area_2d(cut))
-    region["ribbon_area"] = float(info["ribbon_area"])
+    region["ribbon_area"] = float(info.get("ribbon_area") or 0.0)
     region["cut_kind"] = "straight_containing"
     region["cut_tol"] = float(tol)
-    region["corner_merge_tol"] = float(corner_merge_tol)
+    region["straight_slack"] = float(info.get("straight_slack") or straight_slack)
+    region["group_tol"] = float(gtol)
+    region["corner_merge_tol"] = float(gtol)
+    region["round_dp"] = int(round_dp)
     region["approx_type"] = "linear"
     region["boundary_order"] = 1
     region["curve_order"] = 1
@@ -1303,7 +1860,7 @@ def apply_straight_containing_cut(
     if str(region.get("kind") or "").lower() in ("line", "empty", ""):
         if float(region["area"]) > COLLAPSED_AREA_EPS:
             region["kind"] = "sweep"
-    return {"skipped": False, **info}
+    return {"skipped": False, **info, "uf": uf_info}
 
 
 # ---------------------------------------------------------------------------
@@ -1435,15 +1992,21 @@ def apply_fabric_offset(
     offset: float,
     barriers: Optional[Sequence[Tuple[Sequence, Sequence]]] = None,
     data: Optional[dict] = None,
+    group_tol: float = DEFAULT_GROUP_TOL,
+    round_dp: int = DEFAULT_ROUND_DP,
+    cut_tol: float = DEFAULT_CUT_TOL,
 ) -> Dict[str, Any]:
     """
-    In-place: offset cut_ring / coordinates outward for fabrication.
+    In-place: offset step-3 cut_ring outward for fabrication (manual offset).
+
+    Guarantees fabric contains the geometric cut and dual-curve samples
+    (never undershoot the shade). Keeps long straight edges.
 
     Stores:
-      fabric_ring      — offset polygon (clamped)
+      fabric_ring      — offset polygon (straight, containing)
       fabric_offset    — requested distance
       cut_ring         — geometric cut (unchanged if already set)
-      coordinates      — set to fabric_ring when offset > 0 (paint/export cut)
+      coordinates      — set to fabric_ring when offset > 0 (export paint)
     """
     d = float(offset)
     if d <= 1e-12:
@@ -1451,41 +2014,113 @@ def apply_fabric_offset(
         region.pop("fabric_offset", None)
         return {"skipped": True, "reason": "fabric_offset<=0", "fabric_offset": d}
 
-    poly = region.get("cut_ring") or region.get("coordinates")
+    # Prefer pure geometric cut from step 3; do not use a prior fabric ring
+    poly = region.get("cut_ring")
     if not poly or len(poly) < 3:
-        # fall back to dual-curve ribbon
+        poly = region.get("coordinates")
+    if not poly or len(poly) < 3:
         ring = _ribbon_ring(region.get("c0") or [], region.get("c1") or [])
         poly = ring
     if not poly or len(poly) < 3:
         return {"skipped": True, "reason": "no polygon to offset", "fabric_offset": d}
 
+    poly = _round_poly(poly, dp=round_dp)
     bars = list(barriers) if barriers is not None else collect_barrier_segments(
         data, region=region
     )
     panel = _panel_polygon(data, region)
-    fab, info = offset_polygon_outward(
-        poly, d, barriers=bars, panel_poly=panel
-    )
-    if len(fab) < 3:
-        return {"skipped": True, "reason": "offset collapsed", **info}
+    if panel is not None:
+        panel = _round_poly(panel, dp=round_dp)
 
-    # Keep geometric cut separate from fabrication outline
-    if not region.get("cut_ring") and region.get("coordinates"):
-        region["cut_ring"] = [list(p) for p in region["coordinates"]]
-    # Group near-coincident fab corners → one outermost each
-    n_before = len(fab)
-    fab = collapse_nodes_keep_outermost(
-        fab, tol=float(DEFAULT_CORNER_MERGE_TOL)
+    # Samples that fabric must cover (cut verts + dual curves, panel-projected)
+    must: List[List[float]] = [list(p) for p in poly]
+    for p in (region.get("c0") or []) + (region.get("c1") or []):
+        q = _round_pt(p, dp=round_dp)
+        if panel is not None and not _point_in_or_on_polygon(q, panel, eps=1e-3):
+            q = _clamp_point_to_convex(q, panel)
+        must.append(q)
+    must = _dedupe_points(must, eps=10 ** (-int(round_dp)))
+
+    # Offset without barrier clamp first so we don't pull inward past the shade;
+    # then panel-clip only if it still contains must.
+    fab, info = offset_polygon_outward(
+        poly, d, barriers=None, panel_poly=None
     )
     if len(fab) < 3:
         fab, info = offset_polygon_outward(
             poly, d, barriers=bars, panel_poly=panel
         )
-    else:
+    if len(fab) < 3:
+        return {"skipped": True, "reason": "offset collapsed", **info}
+
+    # Keep geometric cut separate from fabrication outline
+    if not region.get("cut_ring"):
+        region["cut_ring"] = [list(p) for p in poly]
+
+    # Never undershoot: re-hull with anything still outside
+    def _n_out(poly_pts: Sequence, pts: Sequence) -> int:
+        if len(poly_pts) < 3:
+            return len(pts)
+        return sum(
+            1 for p in pts
+            if not _point_in_or_on_polygon(p, poly_pts, eps=1e-3)
+        )
+
+    if _n_out(fab, must) > 0:
+        fab = convex_hull(list(fab) + list(must))
+        info = dict(info)
+        info["containment_repair"] = True
+
+    # Optional panel clip only when containment preserved
+    if panel is not None and len(fab) >= 3:
+        clipped = clip_polygon_to_convex(fab, panel)
+        if len(clipped) >= 3 and _n_out(clipped, must) == 0:
+            fab = clipped
+            info = dict(info)
+            info["panel_clipped"] = True
+        else:
+            # Soft clamp verts only
+            clamped = [_clamp_point_to_convex(p, panel) for p in fab]
+            if _n_out(clamped, must) == 0 and len(clamped) >= 3:
+                fab = clamped
+                info = dict(info)
+                info["panel_clamped_verts"] = True
+
+    # Straighten: containment-preserving simplify (no heavy UF corner wipe)
+    n_before = len(fab)
+    fab_s = simplify_containing_polygon(
+        fab, must, tol=max(float(cut_tol), float(group_tol) * 0.5)
+    )
+    if len(fab_s) >= 3 and _n_out(fab_s, must) == 0:
+        fab = fab_s
         info = dict(info)
         info["n_corners_merged"] = max(0, n_before - len(fab))
-        info["area_out"] = float(_polygon_area_2d(fab))
-        info["n_out"] = len(fab)
+        info["simplified"] = True
+    else:
+        info = dict(info)
+        info["n_corners_merged"] = 0
+
+    # Final containment guarantee
+    if _n_out(fab, must) > 0:
+        fab = convex_hull(list(fab) + list(must))
+        info = dict(info)
+        info["final_hull_repair"] = True
+
+    fab = _round_poly(fab, dp=round_dp)
+    fab = _dedupe_points(fab, eps=10 ** (-int(round_dp)))
+    if len(fab) >= 3 and _poly_signed_area(fab) < 0:
+        fab = list(reversed(fab))
+
+    # Drop near-duplicates only (tiny tol) — keep real corners
+    if len(fab) > 3:
+        fab_d = _dedupe_points(fab, eps=max(1e-6, 10 ** (-int(round_dp))))
+        if len(fab_d) >= 3 and _n_out(fab_d, must) == 0:
+            fab = fab_d
+
+    info["area_out"] = float(_polygon_area_2d(fab))
+    info["n_out"] = len(fab)
+    info["n_outside_samples"] = _n_out(fab, must)
+    info["containment_incomplete"] = bool(info["n_outside_samples"] > 0)
 
     region["fabric_ring"] = [list(p) for p in fab]
     region["fabric_offset"] = float(d)
@@ -1620,7 +2255,12 @@ def clean_data(
     straight_cut: bool = True,
     cut_tol: float = DEFAULT_CUT_TOL,
     fabric_offset: float = DEFAULT_FABRIC_OFFSET,
-    corner_merge_tol: float = DEFAULT_CORNER_MERGE_TOL,
+    group_tol: float = DEFAULT_GROUP_TOL,
+    corner_merge_tol: Optional[float] = None,
+    uf_respect_barriers: bool = DEFAULT_UF_RESPECT_BARRIERS,
+    round_dp: int = DEFAULT_ROUND_DP,
+    straight_slack: float = DEFAULT_STRAIGHT_SLACK,
+    max_overshoot_ratio: float = DEFAULT_MAX_OVERSHOOT_RATIO,
     source_path: Optional[str] = None,
 ) -> Tuple[dict, Dict[str, Any]]:
     """
@@ -1628,16 +2268,23 @@ def clean_data(
 
     Pipeline:
       1) filter collapsed / too-small
-      2) straight containing cut (hull → simplify → expand, barrier-clamped)
-      3) group near-coincident cut corners → one outermost each
-      4) optional fabric_offset (outward, barrier/panel-clamped)
-      5) attach clean_ring (all samples) + clean_edges (fabric or cut)
+      2) round coords to ``round_dp`` d.p.
+      3) Union-Find group messy nodes → outermost each
+      4) straight containing cut (hull → slack → simplify, never undershoot)
+      5) optional fabric_offset from step-4 polygon
+      6) attach clean_ring + clean_edges
     """
+    gtol = float(group_tol if corner_merge_tol is None else corner_merge_tol)
+    rdp = int(round_dp)
     out = copy.deepcopy(data)
     regions = list(out.get("shaded_regions") or [])
     kept, dropped_log = filter_shaded_regions(
         regions, min_area=min_area, drop_line_kind=drop_line_kind
     )
+
+    # Step 1: quantize dual curves on every kept region
+    for r in kept:
+        round_region_geometry(r, dp=rdp)
 
     cut_log: List[Dict[str, Any]] = []
     if straight_cut:
@@ -1648,13 +2295,21 @@ def clean_data(
                 tol=float(cut_tol),
                 barriers=bars,
                 data=out,
-                corner_merge_tol=float(corner_merge_tol),
+                group_tol=gtol,
+                uf_respect_barriers=bool(uf_respect_barriers),
+                round_dp=rdp,
+                straight_slack=float(straight_slack),
+                max_overshoot_ratio=float(max_overshoot_ratio),
             )
             cut_log.append({
                 "panel": r.get("panel"),
                 "layer_h": r.get("layer_h"),
                 **info,
             })
+    else:
+        # Still round; no cut polygon
+        for r in kept:
+            round_region_geometry(r, dp=rdp)
 
     fabric_log: List[Dict[str, Any]] = []
     fo = float(fabric_offset)
@@ -1662,7 +2317,13 @@ def clean_data(
         for r in kept:
             bars = collect_barrier_segments(out, region=r)
             finfo = apply_fabric_offset(
-                r, offset=fo, barriers=bars, data=out
+                r,
+                offset=fo,
+                barriers=bars,
+                data=out,
+                group_tol=gtol,
+                round_dp=rdp,
+                cut_tol=float(cut_tol),
             )
             fabric_log.append({
                 "panel": r.get("panel"),
@@ -1673,6 +2334,8 @@ def clean_data(
     if attach_polygon_meta:
         for r in kept:
             attach_closed_polygon_meta(r)
+            # Final quantize of viz helpers
+            round_region_geometry(r, dp=rdp)
 
     out["shaded_regions"] = kept
     _refresh_collision_stats(out, kept)
@@ -1683,7 +2346,12 @@ def clean_data(
         "drop_line_kind": bool(drop_line_kind),
         "straight_cut": bool(straight_cut),
         "cut_tol": float(cut_tol),
+        "straight_slack": float(straight_slack),
+        "max_overshoot_ratio": float(max_overshoot_ratio),
         "fabric_offset": fo,
+        "group_tol": gtol,
+        "round_dp": rdp,
+        "uf_respect_barriers": bool(uf_respect_barriers),
         "n_in": len(regions),
         "n_out": len(kept),
         "n_dropped": len(dropped_log),
@@ -1702,14 +2370,18 @@ def clean_data(
     meta["clean_n_dropped"] = len(dropped_log)
     meta["clean_straight_cut"] = bool(straight_cut)
     meta["clean_cut_tol"] = float(cut_tol)
+    meta["clean_straight_slack"] = float(straight_slack)
+    meta["clean_max_overshoot_ratio"] = float(max_overshoot_ratio)
     meta["clean_cut_kind"] = "straight_containing" if straight_cut else None
     meta["clean_fabric_offset"] = fo
-    meta["clean_corner_merge_tol"] = float(corner_merge_tol)
+    meta["clean_group_tol"] = gtol
+    meta["clean_corner_merge_tol"] = gtol  # legacy
+    meta["clean_round_dp"] = rdp
+    meta["clean_uf_respect_barriers"] = bool(uf_respect_barriers)
     meta["approx_type"] = "linear" if straight_cut else meta.get("approx_type")
     meta["boundary_order"] = 1 if straight_cut else meta.get("boundary_order")
     meta["curved_boundary"] = False if straight_cut else meta.get("curved_boundary")
     for k in (
-        "clean_group_tol",
         "clean_vertex_tol",
         "clean_edge_tol",
         "clean_n_grouped",
@@ -1737,7 +2409,12 @@ def clean_file(
     straight_cut: bool = True,
     cut_tol: float = DEFAULT_CUT_TOL,
     fabric_offset: float = DEFAULT_FABRIC_OFFSET,
-    corner_merge_tol: float = DEFAULT_CORNER_MERGE_TOL,
+    group_tol: float = DEFAULT_GROUP_TOL,
+    corner_merge_tol: Optional[float] = None,
+    uf_respect_barriers: bool = DEFAULT_UF_RESPECT_BARRIERS,
+    round_dp: int = DEFAULT_ROUND_DP,
+    straight_slack: float = DEFAULT_STRAIGHT_SLACK,
+    max_overshoot_ratio: float = DEFAULT_MAX_OVERSHOOT_RATIO,
 ) -> Dict[str, Any]:
     data = _load_json(input_path)
     cleaned, report = clean_data(
@@ -1748,7 +2425,12 @@ def clean_file(
         straight_cut=straight_cut,
         cut_tol=cut_tol,
         fabric_offset=fabric_offset,
+        group_tol=group_tol,
         corner_merge_tol=corner_merge_tol,
+        uf_respect_barriers=uf_respect_barriers,
+        round_dp=round_dp,
+        straight_slack=straight_slack,
+        max_overshoot_ratio=max_overshoot_ratio,
         source_path=input_path,
     )
     _write_json(output_path, cleaned)
@@ -1758,6 +2440,50 @@ def clean_file(
 
 def _default_output_path(input_path: str, output_dir: str) -> str:
     return os.path.join(output_dir, _cleaned_basename(input_path))
+
+
+def _visualize_module():
+    """Load panel_trimming/visualize/visualize.py (not necessarily a package)."""
+    viz_py = os.path.join(_PANEL_TRIM_DIR, "visualize", "visualize.py")
+    if not os.path.isfile(viz_py):
+        raise FileNotFoundError(f"visualize.py not found: {viz_py}")
+    spec = importlib.util.spec_from_file_location(
+        "panel_trimming_visualize_clean_hook", viz_py
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load visualize from {viz_py}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def run_visualize_cleaned(
+    cleaned_path: str,
+    *,
+    quiet: bool = False,
+) -> int:
+    """
+    Render the cleaned JSON via panel_trimming/visualize/visualize.py.
+
+    Writes PNG under panel_trimming/visualize/output/ (same as standalone viz).
+    """
+    path = os.path.abspath(cleaned_path)
+    if not os.path.isfile(path):
+        print(f"[clean] viz skip — missing {path}", file=sys.stderr)
+        return 1
+    stem = os.path.splitext(os.path.basename(path))[0]
+    try:
+        viz = _visualize_module()
+    except Exception as exc:
+        print(f"[clean] viz import failed: {exc}", file=sys.stderr)
+        return 1
+    if not quiet:
+        print(f"[clean] visualize --name {stem}")
+    try:
+        return int(viz.main(["--name", stem]) or 0)
+    except Exception as exc:
+        print(f"[clean] viz FAILED {stem}: {exc}", file=sys.stderr)
+        return 1
 
 
 def _resolve_output_dir(path: Optional[str] = None) -> str:
@@ -1797,8 +2523,13 @@ def _job_settings_from_cfg(job: dict, defaults: dict) -> dict:
         "min_area",
         "straight_cut",
         "cut_tol",
+        "straight_slack",
+        "max_overshoot_ratio",
         "fabric_offset",
+        "group_tol",
         "corner_merge_tol",
+        "uf_respect_barriers",
+        "round_dp",
         "attach_polygon_meta",
         "drop_line_kind",
         "output",
@@ -1806,6 +2537,9 @@ def _job_settings_from_cfg(job: dict, defaults: dict) -> dict:
     ):
         if k in job and job[k] is not None:
             out[k] = job[k]
+    # Legacy alias: corner_merge_tol → group_tol when group_tol omitted
+    if "group_tol" not in job and job.get("corner_merge_tol") is not None:
+        out["group_tol"] = job["corner_merge_tol"]
     if "output_dir" in job and job["output_dir"] is not None:
         out["output_dir"] = _resolve_output_dir(job["output_dir"])
     return out
@@ -1870,8 +2604,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         type=float,
         default=None,
         help=(
-            "Max edge deviation when simplifying dense/convex hull chains "
-            f"(default from config or {DEFAULT_CUT_TOL:g})"
+            "Forgiving max edge deviation for straight-edge simplify "
+            f"(larger → fewer longer lines; default {DEFAULT_CUT_TOL:g})"
+        ),
+    )
+    parser.add_argument(
+        "--straight-slack",
+        type=float,
+        default=None,
+        help=(
+            "Outward slack before simplify so straight cuts don't undershoot "
+            f"(default {DEFAULT_STRAIGHT_SLACK:g}; 0 = off)"
+        ),
+    )
+    parser.add_argument(
+        "--max-overshoot-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Max cut_area / hull_area allowed when expanding for straight edges "
+            f"(default {DEFAULT_MAX_OVERSHOOT_RATIO:g})"
         ),
     )
     parser.add_argument(
@@ -1883,6 +2635,32 @@ def main(argv: Optional[List[str]] = None) -> int:
             "clamped so it cannot cross crease/border/panel "
             f"(default from config or {DEFAULT_FABRIC_OFFSET:g} = off)"
         ),
+    )
+    parser.add_argument(
+        "--group-tol",
+        type=float,
+        default=None,
+        help=(
+            "Union-Find cluster distance for messy nodes "
+            f"(default from config or {DEFAULT_GROUP_TOL:g})"
+        ),
+    )
+    parser.add_argument(
+        "--corner-merge-tol",
+        type=float,
+        default=None,
+        help="Deprecated alias for --group-tol",
+    )
+    parser.add_argument(
+        "--round-dp",
+        type=int,
+        default=None,
+        help=f"Round geometry to this many decimal places (default {DEFAULT_ROUND_DP})",
+    )
+    parser.add_argument(
+        "--uf-respect-barriers",
+        action="store_true",
+        help="Do not UF-merge pairs whose segment crosses a crease/border",
     )
     parser.add_argument(
         "-o",
@@ -1906,6 +2684,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Less logging",
     )
+    parser.add_argument(
+        "--no-viz",
+        action="store_true",
+        help="Do not auto-run panel_trimming/visualize/visualize.py after clean",
+    )
     args = parser.parse_args(argv)
 
     cfg_path = _resolve_config_path(args.config)
@@ -1919,14 +2702,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.quiet:
             print(f"[clean] config {cfg_path}")
 
+    _cfg_group = cfg.get("group_tol", cfg.get("corner_merge_tol", DEFAULT_GROUP_TOL))
     cfg_defaults = {
         "min_area": float(cfg.get("min_area", DEFAULT_MIN_AREA)),
         "straight_cut": bool(cfg.get("straight_cut", True)),
         "cut_tol": float(cfg.get("cut_tol", DEFAULT_CUT_TOL)),
-        "fabric_offset": float(cfg.get("fabric_offset", DEFAULT_FABRIC_OFFSET)),
-        "corner_merge_tol": float(
-            cfg.get("corner_merge_tol", DEFAULT_CORNER_MERGE_TOL)
+        "straight_slack": float(cfg.get("straight_slack", DEFAULT_STRAIGHT_SLACK)),
+        "max_overshoot_ratio": float(
+            cfg.get("max_overshoot_ratio", DEFAULT_MAX_OVERSHOOT_RATIO)
         ),
+        "fabric_offset": float(cfg.get("fabric_offset", DEFAULT_FABRIC_OFFSET)),
+        "group_tol": float(_cfg_group),
+        "corner_merge_tol": float(
+            cfg.get("corner_merge_tol", cfg.get("group_tol", DEFAULT_GROUP_TOL))
+        ),
+        "uf_respect_barriers": bool(
+            cfg.get("uf_respect_barriers", DEFAULT_UF_RESPECT_BARRIERS)
+        ),
+        "round_dp": int(cfg.get("round_dp", DEFAULT_ROUND_DP)),
         "attach_polygon_meta": bool(cfg.get("attach_polygon_meta", True)),
         "drop_line_kind": bool(cfg.get("drop_line_kind", True)),
         "output_dir": _resolve_output_dir(cfg.get("output_dir")),
@@ -1937,8 +2730,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg_defaults["min_area"] = float(args.min_area)
     if args.cut_tol is not None:
         cfg_defaults["cut_tol"] = float(args.cut_tol)
+    if args.straight_slack is not None:
+        cfg_defaults["straight_slack"] = float(args.straight_slack)
+    if args.max_overshoot_ratio is not None:
+        cfg_defaults["max_overshoot_ratio"] = float(args.max_overshoot_ratio)
     if args.fabric_offset is not None:
         cfg_defaults["fabric_offset"] = float(args.fabric_offset)
+    if args.group_tol is not None:
+        cfg_defaults["group_tol"] = float(args.group_tol)
+    elif args.corner_merge_tol is not None:
+        cfg_defaults["group_tol"] = float(args.corner_merge_tol)
+    if args.round_dp is not None:
+        cfg_defaults["round_dp"] = int(args.round_dp)
+    if args.uf_respect_barriers:
+        cfg_defaults["uf_respect_barriers"] = True
     if args.no_straight_cut:
         cfg_defaults["straight_cut"] = False
     if args.no_polygon_meta:
@@ -1980,8 +2785,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                     settings["min_area"] = float(args.min_area)
                 if args.cut_tol is not None:
                     settings["cut_tol"] = float(args.cut_tol)
+                if args.straight_slack is not None:
+                    settings["straight_slack"] = float(args.straight_slack)
+                if args.max_overshoot_ratio is not None:
+                    settings["max_overshoot_ratio"] = float(args.max_overshoot_ratio)
                 if args.fabric_offset is not None:
                     settings["fabric_offset"] = float(args.fabric_offset)
+                if args.group_tol is not None:
+                    settings["group_tol"] = float(args.group_tol)
+                elif args.corner_merge_tol is not None:
+                    settings["group_tol"] = float(args.corner_merge_tol)
+                if args.round_dp is not None:
+                    settings["round_dp"] = int(args.round_dp)
+                if args.uf_respect_barriers:
+                    settings["uf_respect_barriers"] = True
                 if args.no_straight_cut:
                     settings["straight_cut"] = False
                 if args.no_polygon_meta:
@@ -2027,6 +2844,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             out_path = _default_output_path(in_path, out_dir)
         try:
+            _gt = settings.get("group_tol", settings.get(
+                "corner_merge_tol", DEFAULT_GROUP_TOL
+            ))
             report = clean_file(
                 in_path,
                 out_path,
@@ -2036,8 +2856,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                 straight_cut=bool(settings.get("straight_cut", True)),
                 cut_tol=float(settings.get("cut_tol", DEFAULT_CUT_TOL)),
                 fabric_offset=float(settings.get("fabric_offset", DEFAULT_FABRIC_OFFSET)),
-                corner_merge_tol=float(
-                    settings.get("corner_merge_tol", DEFAULT_CORNER_MERGE_TOL)
+                group_tol=float(_gt),
+                uf_respect_barriers=bool(
+                    settings.get("uf_respect_barriers", DEFAULT_UF_RESPECT_BARRIERS)
+                ),
+                round_dp=int(settings.get("round_dp", DEFAULT_ROUND_DP)),
+                straight_slack=float(
+                    settings.get("straight_slack", DEFAULT_STRAIGHT_SLACK)
+                ),
+                max_overshoot_ratio=float(
+                    settings.get("max_overshoot_ratio", DEFAULT_MAX_OVERSHOOT_RATIO)
                 ),
             )
         except Exception as exc:
@@ -2047,6 +2875,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if not args.quiet:
             fo = float(settings.get("fabric_offset", DEFAULT_FABRIC_OFFSET))
+            gt = float(settings.get("group_tol", DEFAULT_GROUP_TOL))
             print(
                 f"[clean] {os.path.basename(in_path)}: "
                 f"{report['n_in']} → {report['n_out']} "
@@ -2054,6 +2883,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"min_area={float(settings.get('min_area', 0)):g}, "
                 f"straight_cut={bool(settings.get('straight_cut', True))}, "
                 f"cut_tol={float(settings.get('cut_tol', DEFAULT_CUT_TOL)):g}, "
+                f"slack={float(settings.get('straight_slack', DEFAULT_STRAIGHT_SLACK)):g}, "
+                f"group_tol={gt:g}, "
+                f"round_dp={int(settings.get('round_dp', DEFAULT_ROUND_DP))}, "
                 f"fabric_offset={fo:g})"
             )
             for d in report["dropped"][:12]:
@@ -2073,13 +2905,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                     clamp = " clamp" if C.get("barrier_clamped") else ""
                     pclip = " panel_clip" if C.get("panel_clipped") else ""
                     inc = " incomplete" if C.get("containment_incomplete") else ""
+                    uf = C.get("uf") or {}
+                    uf_m = uf.get("n_merged", 0)
+                    ov = float(C.get("overshoot_ratio") or 1.0)
                     print(
                         f"    cut panel={C.get('panel')} "
                         f"[{C.get('shape')}] "
+                        f"uf_merge={uf_m} "
                         f"hull={C.get('n_hull')}→cut={C.get('n_cut')} "
                         f"ribbon={float(C.get('ribbon_area') or 0):.4g}→"
                         f"cut_area={float(C.get('cut_area') or 0):.4g} "
-                        f"barriers={C.get('n_barriers', 0)} "
+                        f"ov={ov:.2f} "
+                        f"out={C.get('n_outside', 0)} "
                         f"out_panel={C.get('n_outside_panel', 0)}"
                         f"{clamp}{pclip}{inc}"
                     )
@@ -2106,6 +2943,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             if n_fab > 12:
                 print(f"    ... +{n_fab - 12} more fabric")
             print(f"[clean] wrote {out_path}")
+
+        # Auto-visualize cleaned JSON (default on)
+        do_viz = not bool(args.no_viz)
+        if do_viz:
+            vrc = run_visualize_cleaned(out_path, quiet=bool(args.quiet))
+            if vrc != 0:
+                rc = rc or vrc
     return rc
 
 

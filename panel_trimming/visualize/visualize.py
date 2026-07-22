@@ -943,6 +943,7 @@ def _entries_from_shaded_regions(
             "clean_ring": ring_nodes,
             "clean_edges": sh.get("clean_edges") or [],
             "cut_kind": sh.get("cut_kind"),
+            "cut_ring": coords,
         })
     return entries
 
@@ -1102,6 +1103,7 @@ def _items_from_collision_stats(
             "stock_span_mm": cp.get("stock_span_mm"),
             "clean_ring": ring_nodes or [],
             "clean_edges": cp.get("clean_edges") or [],
+            "cut_kind": cp.get("cut_kind"),
         })
 
     if out:
@@ -1389,21 +1391,20 @@ def _draw_layer(
 
     n_shaded = 0
     n_ghost = 0
-    n_side = 0
     n_physical = 0
     if show_closed_polys:
         for item in closed_polys:
             poly = item["poly"]
             if poly is None or len(poly) < 3:
                 continue
-            n_shaded += 1
             sk = _shell_kind_of(item)
+            # Side panel shades not drawn (physical + ghost only)
+            if sk == "side":
+                continue
+            n_shaded += 1
             is_ghost = sk == "ghost"
-            is_side = sk == "side"
             if is_ghost:
                 n_ghost += 1
-            elif is_side:
-                n_side += 1
             else:
                 n_physical += 1
             is_sweep = (
@@ -1412,15 +1413,10 @@ def _draw_layer(
             )
             if is_ghost:
                 face, edge, alpha = GHOST_POLY_FACE, GHOST_POLY_EDGE, GHOST_POLY_ALPHA
-            elif is_side:
-                face, edge, alpha = SIDE_POLY_FACE, SIDE_POLY_EDGE, SIDE_POLY_ALPHA
             else:
                 face, edge, alpha = TRIM_POLY_FACE, TRIM_POLY_EDGE, TRIM_POLY_ALPHA
-            # Ghost: dotted; side: x hatch; physical non-sweep: diagonal
             if is_ghost:
                 hatch = "..."
-            elif is_side:
-                hatch = "xxx"
             elif is_sweep:
                 hatch = None
             else:
@@ -1432,31 +1428,41 @@ def _draw_layer(
                 hatch=hatch,
                 zorder=6,
             )
-            # Fabrication offset outline (outside geometric cut)
+            # Geometric cut outline (solid straight edges) when cleaned
+            cut_kind = str(item.get("cut_kind") or "")
+            poly_is_cut = bool(cut_kind) or item.get("fabric_poly") is not None
+            if poly_is_cut and poly is not None and len(poly) >= 3:
+                cx = [float(p[0]) for p in poly]
+                cy = [float(p[1]) for p in poly]
+                ax.plot(
+                    cx + [cx[0]], cy + [cy[0]],
+                    color=OUTER_NODE_EDGE, linewidth=1.6,
+                    linestyle="-", alpha=0.95, zorder=7.1,
+                    solid_capstyle="butt", solid_joinstyle="miter",
+                )
+            # Fabrication offset outline (purple): straight segments only
             if show_fabric_offset:
                 fab = item.get("fabric_poly")
                 if fab is not None and len(fab) >= 3:
-                    fx = [float(p[0]) for p in fab]
-                    fy = [float(p[1]) for p in fab]
-                    ax.plot(
-                        fx + [fx[0]], fy + [fy[0]],
-                        color=FABRIC_EDGE_COLOR, linewidth=1.8,
-                        linestyle="--", alpha=0.95, zorder=7.2,
-                        solid_capstyle="butt", solid_joinstyle="miter",
-                    )
-            # Panel tag on shade; ·G = ghost, ·S = side (unique idx)
+                    # Draw each edge as an explicit straight segment (no curve)
+                    m = len(fab)
+                    for i in range(m):
+                        a = fab[i]
+                        b = fab[(i + 1) % m]
+                        ax.plot(
+                            [float(a[0]), float(b[0])],
+                            [float(a[1]), float(b[1])],
+                            color=FABRIC_EDGE_COLOR, linewidth=2.0,
+                            linestyle="-", alpha=0.98, zorder=7.3,
+                            solid_capstyle="butt", solid_joinstyle="miter",
+                        )
+            # Panel tag on shade; ·G = ghost
             pid = item.get("panel")
             if pid is not None and len(poly) >= 1:
                 c = poly.mean(axis=0)
                 if is_ghost:
                     tag = f"P{int(pid)}·G"
                     tag_color = "#0a2a5a"
-                elif is_side:
-                    parent = item.get("parent_panel")
-                    tag = f"P{int(pid)}·S"
-                    if parent is not None:
-                        tag = f"{tag}←{int(parent)}"
-                    tag_color = "#1a4a1a"
                 else:
                     tag = f"P{int(pid)}"
                     tag_color = "#5a0a0a"
@@ -1471,12 +1477,7 @@ def _draw_layer(
                 )
             # Draw intermediate two-node line samples (the actual sweep stroke)
             samples = item.get("sweep_samples") or []
-            if is_ghost:
-                stroke = GHOST_STROKE_COLOR
-            elif is_side:
-                stroke = SIDE_STROKE_COLOR
-            else:
-                stroke = "#e45756"
+            stroke = GHOST_STROKE_COLOR if is_ghost else "#e45756"
             if is_sweep and len(samples) >= 2:
                 for s in samples:
                     if "p0" not in s or "p1" not in s:
@@ -1487,108 +1488,73 @@ def _draw_layer(
                         zorder=7, solid_capstyle="round",
                     )
 
-    item_cut_corners: List[List[List[float]]] = [[] for _ in closed_polys]
-
     if show_polygon_nodes:
-        # Yellow = one outermost cut corner per cluster.
-        # Blue = samples not under a yellow tip; spaced along edges.
-        for ii, item in enumerate(closed_polys):
+        # Blue = dual-curve sample trail; yellow = cut corners; purple = fabric corners
+        for item in closed_polys:
+            if _shell_kind_of(item) == "side":
+                continue
             nodes = item.get("clean_ring") or []
             if not nodes and item.get("poly") is not None:
                 nodes = item["poly"]
-            if nodes is None or len(nodes) < 1:
-                continue
             pts: List[List[float]] = []
-            for pt in nodes:
+            for pt in nodes or []:
                 try:
                     pts.append([float(pt[0]), float(pt[1])])
                 except (TypeError, IndexError, ValueError):
                     continue
-            if not pts:
-                continue
-            origin = (
-                sum(p[0] for p in pts) / len(pts),
-                sum(p[1] for p in pts) / len(pts),
-            )
-            cut_pts: List[List[float]] = []
+            origin = None
+            if pts:
+                origin = (
+                    sum(p[0] for p in pts) / len(pts),
+                    sum(p[1] for p in pts) / len(pts),
+                )
+                blue = _collapse_nodes_outermost(
+                    pts, tol=NODE_CLUSTER_TOL * 0.75, origin=origin
+                )
+                blue = _space_nodes(
+                    blue, min_spacing=BLUE_MIN_SPACING, origin=origin
+                )
+                if blue:
+                    ax.plot(
+                        [p[0] for p in blue], [p[1] for p in blue], "o",
+                        color=POLY_NODE_COLOR, markersize=2.5,
+                        markeredgecolor=POLY_NODE_EDGE, markeredgewidth=0.3,
+                        zorder=9, alpha=0.7,
+                    )
+            # Yellow: every straight-cut corner (do not collapse away)
             poly = item.get("poly")
-            if poly is not None and len(poly) >= 3:
-                for pt in poly:
-                    try:
-                        cut_pts.append([float(pt[0]), float(pt[1])])
-                    except (TypeError, IndexError, ValueError):
-                        continue
-            if not cut_pts:
-                hull_idx = _convex_hull_indices(pts)
-                cut_pts = [pts[i] for i in hull_idx]
-            cut_pts = _collapse_nodes_outermost(
-                cut_pts, tol=NODE_CLUSTER_TOL, origin=origin
-            )
-            item_cut_corners[ii] = cut_pts
-            item["_plot_cut_corners"] = cut_pts
-
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            ax.plot(
-                xs + [xs[0]], ys + [ys[0]],
-                color=POLY_NODE_COLOR, linewidth=0.45, alpha=0.3,
-                zorder=7.5, solid_capstyle="round",
-            )
-            blue = [
-                p for p in pts
-                if not _near_any(p, cut_pts, NODE_CLUSTER_TOL)
-            ]
-            blue = _collapse_nodes_outermost(
-                blue, tol=NODE_CLUSTER_TOL * 0.75, origin=origin
-            )
-            blue = _space_nodes(
-                blue, min_spacing=BLUE_MIN_SPACING, origin=origin
-            )
-            if blue:
-                ax.plot(
-                    [p[0] for p in blue], [p[1] for p in blue], "o",
-                    color=POLY_NODE_COLOR, markersize=2.5,
-                    markeredgecolor=POLY_NODE_EDGE, markeredgewidth=0.3,
-                    zorder=9, alpha=0.7,
-                )
-            if cut_pts:
-                yx = [p[0] for p in cut_pts]
-                yy = [p[1] for p in cut_pts]
-                ax.plot(
-                    yx + [yx[0]], yy + [yy[0]],
-                    color=OUTER_NODE_COLOR, linewidth=1.4, alpha=0.9,
-                    zorder=8, solid_capstyle="butt", solid_joinstyle="miter",
-                )
+            if poly is not None and len(poly) >= 3 and (
+                item.get("cut_kind") or item.get("fabric_poly") is not None
+            ):
+                yx = [float(p[0]) for p in poly]
+                yy = [float(p[1]) for p in poly]
                 ax.plot(
                     yx, yy, "o",
-                    color=OUTER_NODE_COLOR, markersize=5.2,
-                    markeredgecolor=OUTER_NODE_EDGE, markeredgewidth=0.65,
-                    zorder=10, alpha=0.98,
+                    color=OUTER_NODE_COLOR, markersize=5.0,
+                    markeredgecolor=OUTER_NODE_EDGE, markeredgewidth=0.7,
+                    zorder=10.0, alpha=0.95,
                 )
-            # Fabrication offset corners (purple)
+            # Purple squares: every fabric_ring corner (always when fabric on)
             if show_fabric_offset:
                 fab = item.get("fabric_poly")
                 if fab is not None and len(fab) >= 3:
-                    fpts = [[float(p[0]), float(p[1])] for p in fab]
-                    fpts = _collapse_nodes_outermost(
-                        fpts, tol=NODE_CLUSTER_TOL, origin=origin
+                    # No UF collapse — show true straight-cut corners
+                    fx = [float(p[0]) for p in fab]
+                    fy = [float(p[1]) for p in fab]
+                    ax.plot(
+                        fx, fy, "s",
+                        color=FABRIC_NODE_COLOR, markersize=5.5,
+                        markeredgecolor=FABRIC_NODE_EDGE,
+                        markeredgewidth=0.7, zorder=10.4, alpha=0.98,
                     )
-                    if fpts:
-                        ax.plot(
-                            [p[0] for p in fpts], [p[1] for p in fpts], "s",
-                            color=FABRIC_NODE_COLOR, markersize=4.2,
-                            markeredgecolor=FABRIC_NODE_EDGE,
-                            markeredgewidth=0.55, zorder=10.2, alpha=0.95,
-                        )
 
     if show_first_last_edges:
-        for ii, item in enumerate(closed_polys):
+        for item in closed_polys:
+            if _shell_kind_of(item) == "side":
+                continue
             fr = item.get("first")
             la = item.get("last")
             apex = item.get("apex")
-            yellow = item.get("_plot_cut_corners") or (
-                item_cut_corners[ii] if ii < len(item_cut_corners) else []
-            )
             if fr is not None:
                 _draw_seg(
                     ax, fr[0], fr[1], color=FIRST_LINE_COLOR,
@@ -1608,21 +1574,16 @@ def _draw_layer(
                         linewidth=2.4, zorder=8, solid_capstyle="butt",
                     )
                 for pt in la:
-                    if show_polygon_nodes and _near_any(pt, yellow, NODE_CLUSTER_TOL):
-                        continue
                     ax.plot(
                         float(pt[0]), float(pt[1]), "o",
                         color=LAST_LINE_COLOR, markersize=4.5, zorder=9,
                     )
             if apex is not None:
-                if show_polygon_nodes and _near_any(apex, yellow, NODE_CLUSTER_TOL):
-                    pass
-                else:
-                    ax.plot(
-                        float(apex[0]), float(apex[1]), "o",
-                        color=LAST_LINE_COLOR, markersize=7.0,
-                        markeredgecolor="#5a0a0a", markeredgewidth=0.8, zorder=10,
-                    )
+                ax.plot(
+                    float(apex[0]), float(apex[1]), "o",
+                    color=LAST_LINE_COLOR, markersize=7.0,
+                    markeredgecolor="#5a0a0a", markeredgewidth=0.8, zorder=10,
+                )
 
     if show_panel_ids:
         for i in sorted(draw_ids):
@@ -1641,15 +1602,22 @@ def _draw_layer(
 
     ax.set_aspect("equal", adjustable="box")
     n_panels = len(draw_ids)
-    if closed_polys:
-        src = closed_polys[0]["source"].split(".")[0]
+    if n_shaded > 0:
+        src = "shaded"
+        for it in closed_polys:
+            if _shell_kind_of(it) != "side" and it.get("source"):
+                src = str(it["source"]).split(".")[0]
+                break
         n_sw = sum(
             1 for it in closed_polys
-            if it.get("paint_kind") == "sweep"
-            or str(it.get("source", "")).endswith("sweep")
+            if _shell_kind_of(it) != "side"
+            and (
+                it.get("paint_kind") == "sweep"
+                or str(it.get("source", "")).endswith("sweep")
+            )
         )
         kind = f"{n_sw} sweeps" if n_sw else "tris/quads"
-        shell_bits = f"phys={n_physical} ghost={n_ghost} side={n_side}"
+        shell_bits = f"phys={n_physical} ghost={n_ghost}"
         ax.set_title(
             f"offset h = {layer_h:g}   "
             f"({n_panels} panels, {n_shaded} paints [{shell_bits}], "
@@ -1780,36 +1748,18 @@ def visualize_trimmed(
         keys = [k for k in keys if any(abs(float(k) - float(h)) < 1e-6 for h in layers)]
         if not keys:
             raise ValueError(f"No matching layers for {layers}; available {list(ubl.keys())}")
-    # Always show every thickness offset (crease heights + any shade-only
-    # layers). Layers without collision still get a panel outline subplot.
 
-    n = len(keys)
-    # Vertical stack: highest thickness offset at top → lowest at bottom
-    try:
-        keys = sorted(keys, key=lambda k: float(k), reverse=True)
-    except ValueError:
-        keys = list(reversed(keys))
-    ncols = 1
-    nrows = max(n, 1)
-    fig, axes = plt.subplots(
-        nrows, ncols,
-        figsize=(6.2, 4.9 * nrows),
-        squeeze=False,
-    )
+    # Drop side-only regions up front (not drawn)
+    def _non_side_closed(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [p for p in items if _shell_kind_of(p) != "side"]
 
-    xmin, xmax, ymin, ymax = _bounds_from_units([orig_units] + [ubl[k] for k in keys])
-
-    total_polys = 0
-    sources = set()
-
-    for idx, key in enumerate(keys):
-        r, c = idx, 0
-        ax = axes[r][c]
+    # Precompute layers; skip empty (0 panels + 0 non-side trims)
+    layer_payload: List[Tuple[str, float, List, List[Dict[str, Any]], set, List]] = []
+    for key in keys:
         layer_h = float(key)
         layer_units = ubl.get(key) or orig_units
         layer_cls = _classifications_for_layer(classifications, layer_h)
         cut_segs = _cut_segments_for_layer(trimmed, layer_h)
-
         closed: List[Dict[str, Any]] = []
         if stats or shaded_regions:
             closed = _items_from_collision_stats(
@@ -1820,12 +1770,7 @@ def visualize_trimmed(
                 orig_units, layer_units, layer_h,
                 layer_cls, cut_segs, creases,
             )
-
-        total_polys += len(closed)
-        for p in closed:
-            sources.add(p.get("source", "?"))
-
-        # Panels that physically exist at this thickness offset
+        closed = _non_side_closed(closed)
         panels_on_layer = _panels_at_height(panel_offsets, layer_h)
         for p in closed:
             if p.get("panel") is not None:
@@ -1833,6 +1778,48 @@ def visualize_trimmed(
                     panels_on_layer.add(int(p["panel"]))
                 except (TypeError, ValueError):
                     pass
+        if not panels_on_layer and not closed:
+            continue
+        layer_payload.append(
+            (key, layer_h, layer_units, closed, panels_on_layer, cut_segs)
+        )
+
+    if not layer_payload:
+        raise ValueError(
+            "No non-empty layers to draw (every offset had 0 panels and 0 trims)."
+        )
+
+    try:
+        layer_payload.sort(key=lambda row: float(row[1]), reverse=True)
+    except ValueError:
+        layer_payload = list(reversed(layer_payload))
+
+    n = len(layer_payload)
+    ncols = 1
+    nrows = max(n, 1)
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(6.2, 4.9 * nrows),
+        squeeze=False,
+    )
+
+    xmin, xmax, ymin, ymax = _bounds_from_units(
+        [orig_units] + [row[2] for row in layer_payload]
+    )
+
+    total_polys = 0
+    sources = set()
+    drew_ghost = False
+
+    for idx, (key, layer_h, layer_units, closed, panels_on_layer, cut_segs) in enumerate(
+        layer_payload
+    ):
+        ax = axes[idx][0]
+        total_polys += len(closed)
+        for p in closed:
+            sources.add(p.get("source", "?"))
+            if _shell_kind_of(p) == "ghost":
+                drew_ghost = True
 
         n_sh = _draw_layer(
             ax,
@@ -1857,11 +1844,6 @@ def visualize_trimmed(
             if p.get("poly") is not None and len(p["poly"]) >= 3
             and _shell_kind_of(p) == "ghost"
         )
-        n_s_draw = sum(
-            1 for p in closed
-            if p.get("poly") is not None and len(p["poly"]) >= 3
-            and _shell_kind_of(p) == "side"
-        )
         n_p_draw = sum(
             1 for p in closed
             if p.get("poly") is not None and len(p["poly"]) >= 3
@@ -1873,8 +1855,8 @@ def visualize_trimmed(
         ax.text(
             0.02, 0.98,
             f"panels @ h: [{panel_list}]\n"
-            f"shades: {n_sh}  (phys={n_p_draw} · ghost={n_g_draw} · side={n_s_draw})\n"
-            f"P# = physical · P#·G = ghost · P#·S = side\n"
+            f"shades: {n_sh}  (phys={n_p_draw} · ghost={n_g_draw})\n"
+            f"P# = physical · P#·G = ghost\n"
             f"first=green · last=red",
             transform=ax.transAxes, ha="left", va="top",
             fontsize=7.5, color="#333333",
@@ -1891,63 +1873,74 @@ def visualize_trimmed(
             facecolor=TRIM_POLY_FACE, edgecolor=TRIM_POLY_EDGE, alpha=TRIM_POLY_ALPHA,
             label="Physical shell shade (P#)",
         ),
-        Patch(
-            facecolor=GHOST_POLY_FACE, edgecolor=GHOST_POLY_EDGE, alpha=GHOST_POLY_ALPHA,
-            hatch="...", label="Ghost shell shade (P#·G)",
-        ),
-        Patch(
-            facecolor=SIDE_POLY_FACE, edgecolor=SIDE_POLY_EDGE, alpha=SIDE_POLY_ALPHA,
-            hatch="xxx", label="Side panel shade (P#·S)",
-        ),
+    ]
+    if drew_ghost:
+        legend_handles.append(
+            Patch(
+                facecolor=GHOST_POLY_FACE, edgecolor=GHOST_POLY_EDGE, alpha=GHOST_POLY_ALPHA,
+                hatch="...", label="Ghost shell shade (P#·G)",
+            )
+        )
+    legend_handles.extend([
         Line2D([0], [0], color=FIRST_LINE_COLOR, lw=2.4, label="first"),
         Line2D([0], [0], color=LAST_LINE_COLOR, lw=2.4, label="last (cut / contact)"),
-        Line2D(
-            [0], [0], color=POLY_NODE_COLOR, marker="o", linestyle="None",
-            markersize=5, label="polygon sample nodes",
-        ),
-        Line2D(
-            [0], [0], color=OUTER_NODE_COLOR, marker="o", linestyle="None",
-            markersize=6, markeredgecolor=OUTER_NODE_EDGE,
-            label="straight-cut corners",
-        ),
-        Line2D(
-            [0], [0], color=FABRIC_EDGE_COLOR, lw=1.8, linestyle="--",
-            label="fabric offset outline",
-        ),
-        Line2D(
-            [0], [0], color=FABRIC_NODE_COLOR, marker="s", linestyle="None",
-            markersize=5, markeredgecolor=FABRIC_NODE_EDGE,
-            label="fabric offset corners",
-        ),
-    ]
+    ])
+    if show_polygon_nodes:
+        legend_handles.extend([
+            Line2D(
+                [0], [0], color=POLY_NODE_COLOR, marker="o", linestyle="None",
+                markersize=5, label="dual-curve sample nodes",
+            ),
+            Line2D(
+                [0], [0], color=OUTER_NODE_COLOR, marker="o", linestyle="None",
+                markersize=6, markeredgecolor=OUTER_NODE_EDGE,
+                label="straight-cut corners",
+            ),
+        ])
+    if show_fabric_offset:
+        legend_handles.extend([
+            Line2D(
+                [0], [0], color=FABRIC_EDGE_COLOR, lw=2.0, linestyle="-",
+                label="fabric offset (straight)",
+            ),
+            Line2D(
+                [0], [0], color=FABRIC_NODE_COLOR, marker="s", linestyle="None",
+                markersize=6, markeredgecolor=FABRIC_NODE_EDGE,
+                label="fabric corners",
+            ),
+        ])
     fig.legend(
         handles=legend_handles, loc="lower center", ncol=3,
         frameon=True, fontsize=8.5, bbox_to_anchor=(0.5, 0.0),
     )
 
     fig_title = title or "Panel trimming"
-    fig_title += (
-        "\nshaded = geometric cut · purple dashed = fabric offset · "
-        "red=physical · blue=ghost · green=side · top→bottom = highest→lowest offset"
-    )
+    if show_fabric_offset:
+        fig_title += (
+            "\nshaded = dual-curve contact · fabric offset optional · "
+            "red=physical · blue=ghost · top→bottom = highest→lowest offset"
+        )
+    else:
+        fig_title += (
+            "\nshaded = dual-curve contact regions · "
+            "red=physical · blue=ghost · top→bottom = highest→lowest offset"
+        )
     meta = trimmed.get("trim_3d_metadata") or {}
     bits = [f"shaded={total_polys}"]
     n_ghost_all = sum(
         1 for sh in (shaded_regions or []) if _shell_kind_of(sh) == "ghost"
     )
-    n_side_all = sum(
-        1 for sh in (shaded_regions or []) if _shell_kind_of(sh) == "side"
-    )
     n_phys_all = sum(
         1 for sh in (shaded_regions or []) if _shell_kind_of(sh) == "physical"
     )
-    if shaded_regions:
+    if shaded_regions is not None:
         bits.append(f"phys={n_phys_all}")
         bits.append(f"ghost={n_ghost_all}")
-        bits.append(f"side={n_side_all}")
     if meta:
         bits.append(f"trimmer_cuts={meta.get('n_cuts', '?')}")
-    n_dual = len(shaded_regions or [])
+    n_dual = sum(
+        1 for sh in (shaded_regions or []) if _shell_kind_of(sh) != "side"
+    )
     if n_dual:
         bits.append(f"dual_curve={n_dual}")
     if stats:
@@ -1957,10 +1950,6 @@ def visualize_trimmed(
         )
         if stats.get("n_ghost_regions") is not None:
             bits.append(f"stats_ghost={stats.get('n_ghost_regions')}")
-        if stats.get("n_side_regions") is not None:
-            bits.append(f"stats_side={stats.get('n_side_regions')}")
-        if stats.get("n_side_panels") is not None:
-            bits.append(f"side_panels={stats.get('n_side_panels')}")
     if sources:
         bits.append("src=" + ",".join(sorted(s.split(".")[0] for s in sources)))
     fig_title += "  (" + ", ".join(bits) + ")"
@@ -1998,29 +1987,38 @@ def _run_one(sim: dict, output_dir: str) -> str:
             stats.get("n_closed_triangles", stats.get("n_closed_polygons", 0)),
         ),
     )
-    n_dual = len(trimmed.get("shaded_regions") or [])
+    n_dual = sum(
+        1 for sh in (trimmed.get("shaded_regions") or [])
+        if _shell_kind_of(sh) != "side"
+    )
     n_ghost = sum(
         1 for sh in (trimmed.get("shaded_regions") or [])
         if _shell_kind_of(sh) == "ghost"
-    )
-    n_side = sum(
-        1 for sh in (trimmed.get("shaded_regions") or [])
-        if _shell_kind_of(sh) == "side"
     )
     n_phys = sum(
         1 for sh in (trimmed.get("shaded_regions") or [])
         if _shell_kind_of(sh) == "physical"
     )
-    n_side_panels = len(trimmed.get("side_panels") or [])
-    if not n_side_panels:
-        n_side_panels = int(stats.get("n_side_panels") or 0)
     has_ubl = bool(trimmed.get("units_by_layer"))
+    # Defaults: cleaned JSON always shows cut/fabric corners + fabric outline
+    stem = os.path.splitext(os.path.basename(trimmed_path))[0].lower()
+    is_cleaned = stem.endswith("-cleaned") or "cleaned" in stem
+    show_nodes = (
+        bool(sim["show_polygon_nodes"])
+        if "show_polygon_nodes" in sim
+        else bool(is_cleaned)
+    )
+    show_fabric = (
+        bool(sim["show_fabric_offset"])
+        if "show_fabric_offset" in sim
+        else bool(is_cleaned)
+    )
     print(
         f"[panel-trimming] {os.path.basename(trimmed_path)}  "
         f"collision_stats={'yes' if has_stats else 'no'}  "
         f"segs={n_segs} shaded={n_poly} dual_curve={n_dual}  "
-        f"phys={n_phys} ghost={n_ghost} side={n_side}  "
-        f"side_panels={n_side_panels}  "
+        f"phys={n_phys} ghost={n_ghost}  "
+        f"nodes={show_nodes} fabric={show_fabric}  "
         f"units_by_layer={'yes' if has_ubl else 'synth-from-units'}"
     )
 
@@ -2033,8 +2031,8 @@ def _run_one(sim: dict, output_dir: str) -> str:
         show_panel_ids=bool(sim.get("show_panel_ids", True)),
         show_closed_polys=bool(sim.get("show_closed_polys", True)),
         show_first_last_edges=bool(sim.get("show_first_last_edges", True)),
-        show_polygon_nodes=bool(sim.get("show_polygon_nodes", True)),
-        show_fabric_offset=bool(sim.get("show_fabric_offset", True)),
+        show_polygon_nodes=show_nodes,
+        show_fabric_offset=show_fabric,
         title=os.path.basename(trimmed_path),
     )
 

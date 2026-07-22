@@ -16,6 +16,7 @@ Usage:
   python panel-trimming/visualize/visualize_3d.py
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --factor 2.5
+  python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --collision-only
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --no-show -o out.png
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --report-only
 
@@ -792,6 +793,58 @@ def _xy_to_verts3d(xy: np.ndarray, z: float) -> np.ndarray:
     return np.hstack([xy.astype(float), zcol])
 
 
+def _synthesize_side_panels_for_viz(
+    panel_xy: Sequence[np.ndarray],
+    panel_offsets: Sequence[Sequence[float]],
+) -> List[Dict[str, Any]]:
+    """
+    Viz-only vertical side walls when JSON has no ``side_panels`` export.
+
+    For each design panel, extrude its outline from min thickness offset to
+    max thickness offset (one band per panel). Not used for collision/sim —
+    only so the 3D view always shows panel side faces.
+    """
+    out: List[Dict[str, Any]] = []
+    for pi, xy in enumerate(panel_xy):
+        if xy is None or len(xy) < 2:
+            continue
+        raw = panel_offsets[pi] if pi < len(panel_offsets) else []
+        hs: List[float] = []
+        for h in sorted(float(x) for x in raw):
+            if not hs or abs(h - hs[-1]) > 1e-9:
+                hs.append(h)
+        if len(hs) < 2:
+            continue
+        h_lo, h_hi = float(hs[0]), float(hs[-1])
+        if abs(h_hi - h_lo) < 1e-9:
+            continue
+        outline = [[float(p[0]), float(p[1])] for p in xy]
+        out.append({
+            "panel": None,
+            "parent_panel": int(pi),
+            "h_lo": h_lo,
+            "h_hi": h_hi,
+            "layer_h": 0.5 * (h_lo + h_hi),
+            "outline_xy": outline,
+            "shell_kind": "side",
+            "source": "synthesized_viz",
+            "n_edges": len(outline),
+        })
+    return out
+
+
+def _side_panels_for_viz(
+    trimmed: dict,
+    panel_xy: Sequence[np.ndarray],
+    panel_offsets: Sequence[Sequence[float]],
+) -> List[Dict[str, Any]]:
+    """Prefer exported ``side_panels``; otherwise synthesize from panel outlines."""
+    exported = list(trimmed.get("side_panels") or [])
+    if exported:
+        return exported
+    return _synthesize_side_panels_for_viz(panel_xy, panel_offsets)
+
+
 def _set_equal_aspect_3d(ax, xs, ys, zs):
     xs, ys, zs = np.asarray(xs), np.asarray(ys), np.asarray(zs)
     if xs.size == 0:
@@ -817,6 +870,7 @@ def build_explosion_scene(
     show_shades: bool = True,
     show_lines: bool = True,
     show_guides: bool = True,
+    show_side_walls: Optional[bool] = None,
     show_panel_ids: bool = False,
     show_layer_labels: bool = True,
     show_shade_labels: bool = False,
@@ -824,6 +878,7 @@ def build_explosion_scene(
     panel_alpha: float = 0.42,
     shade_alpha: float = 1.0,
     title: Optional[str] = None,
+    collision_only: bool = False,
 ):
     """
     Build an interactive (or static) 3D explosion figure.
@@ -832,12 +887,28 @@ def build_explosion_scene(
     color). **Collided** regions = simplified closed dual-curve polygons
     (batched), solid red on every layer — no per-sample stroke swarm.
 
+    If ``collision_only`` is True, only shaded/collided geometry is drawn
+    (dual-curve ribbons + vertical side walls); panels, creases, and guides
+    are hidden.
+
     Returns (fig, ax, state) where state holds redraw helpers for the slider.
     """
     import matplotlib.pyplot as plt
     from matplotlib.colors import to_rgb
     from matplotlib.widgets import Button, CheckButtons, Slider
     from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
+
+    # User-requested defaults (GUI can toggle collision_only over these).
+    want_panels = bool(show_panels)
+    want_shades = bool(show_shades)
+    want_lines = bool(show_lines)
+    want_guides = bool(show_guides)
+    want_panel_ids = bool(show_panel_ids)
+    # Side walls are always drawn for visualization (JSON export or synthesized).
+    if show_side_walls is None:
+        want_side_walls = True
+    else:
+        want_side_walls = bool(show_side_walls)
 
     base = original or trimmed
     units = list(trimmed.get("units") or base.get("units") or [])
@@ -873,6 +944,9 @@ def build_explosion_scene(
     n_panels = len(units)
     panel_xy = [_poly_xy(u) for u in units]
     layer_colors = _layer_solid_colors(heights)
+    # Vertical walls: use JSON export if present, else synthesize for viz only.
+    side_panels_reg = _side_panels_for_viz(trimmed, panel_xy, panel_offsets)
+    side_panels_synthesized = not bool(trimmed.get("side_panels"))
     n_mismatch = sum(1 for r in shade_records if r.get("offset_mismatch"))
     state_assoc = {
         "records": shade_records,
@@ -901,27 +975,60 @@ def build_explosion_scene(
     slider_ax = fig.add_axes([0.12, 0.04, 0.50, 0.035])
 
     # Sidebar layout (right column)
-    help_ax = fig.add_axes([0.74, 0.78, 0.24, 0.16])
+    help_ax = fig.add_axes([0.74, 0.80, 0.24, 0.14])
     help_ax.axis("off")
-    btn_all_ax = fig.add_axes([0.74, 0.725, 0.11, 0.035])
-    btn_none_ax = fig.add_axes([0.87, 0.725, 0.11, 0.035])
+    btn_all_ax = fig.add_axes([0.74, 0.755, 0.11, 0.032])
+    btn_none_ax = fig.add_axes([0.87, 0.755, 0.11, 0.032])
+    # Collision-only toggle (live GUI)
+    coll_check_ax = fig.add_axes([0.74, 0.708, 0.24, 0.038])
     # Check list height scales with layer count (capped)
     n_h = max(len(heights), 1)
-    check_h = min(0.48, 0.055 * n_h + 0.08)
-    check_bottom = 0.72 - check_h - 0.01
+    check_h = min(0.44, 0.055 * n_h + 0.08)
+    check_bottom = 0.700 - check_h - 0.01
     check_ax = fig.add_axes([0.74, check_bottom, 0.24, check_h])
+
+    base_title = title  # may be None; resolved at draw time
 
     state: Dict[str, Any] = {
         "factor": float(explosion_factor),
         "heights": heights,
         # layer_h → visible (explosion spacing still uses full height list)
         "layer_visible": {float(h): True for h in heights},
+        "collision_only": bool(collision_only),
+        # user defaults restored when collision-only is turned off
+        "want_panels": want_panels,
+        "want_shades": want_shades,
+        "want_lines": want_lines,
+        "want_guides": want_guides,
+        "want_side_walls": want_side_walls,
+        "want_panel_ids": want_panel_ids,
         "collections": [],
         "line_artists": [],
         "text_artists": [],
         "guide_artists": [],
         "associations": state_assoc,
+        "help_text": None,
     }
+
+    def _draw_flags() -> Dict[str, bool]:
+        """Effective draw flags; collision_only overrides to shades + side walls."""
+        if state["collision_only"]:
+            return {
+                "show_panels": False,
+                "show_shades": True,
+                "show_lines": False,
+                "show_guides": False,
+                "show_side_walls": True,
+                "show_panel_ids": False,
+            }
+        return {
+            "show_panels": bool(state["want_panels"]),
+            "show_shades": bool(state["want_shades"]),
+            "show_lines": bool(state["want_lines"]),
+            "show_guides": bool(state["want_guides"]),
+            "show_side_walls": bool(state["want_side_walls"]),
+            "show_panel_ids": bool(state["want_panel_ids"]),
+        }
 
     def _layer_visible(h: float, eps: float = 1e-6) -> bool:
         vis = state["layer_visible"]
@@ -961,17 +1068,30 @@ def build_explosion_scene(
         _clear_artists()
         factor = float(factor)
         state["factor"] = factor
+        flags = _draw_flags()
+        coll_only = bool(state["collision_only"])
+        do_panels = flags["show_panels"]
+        do_shades = flags["show_shades"]
+        do_lines = flags["show_lines"]
+        do_guides = flags["show_guides"]
+        do_side_walls = flags["show_side_walls"]
+        do_panel_ids = flags["show_panel_ids"]
 
         vis_heights = _visible_heights()
         zs_all: List[float] = []
-        xs_all: List[float] = list(all_xy[:, 0])
-        ys_all: List[float] = list(all_xy[:, 1])
+        if coll_only:
+            # Frame on collision geometry only (filled below as shades/walls draw).
+            xs_all: List[float] = []
+            ys_all: List[float] = []
+        else:
+            xs_all = list(all_xy[:, 0])
+            ys_all = list(all_xy[:, 1])
 
         # Explosion mapping keeps full stack so toggles don't jump positions
         z_of = {h: _explode_z(h, heights, factor) for h in heights}
 
         # --- panels: batch one Poly3DCollection per layer color (fast) ---
-        if show_panels:
+        if do_panels:
             panels_by_h: Dict[float, List[np.ndarray]] = {}
             for i, xy in enumerate(panel_xy):
                 if len(xy) < 3:
@@ -1009,7 +1129,7 @@ def build_explosion_scene(
         n_shade_ghost_vis = 0
         n_shade_side_vis = 0
         n_shade_phys_vis = 0
-        if show_shades:
+        if do_shades:
             phys_rgb = to_rgb(TRIM_FACE)
             phys_edge = to_rgb(TRIM_EDGE)
             ghost_rgb = to_rgb(GHOST_FACE)
@@ -1052,6 +1172,10 @@ def build_explosion_scene(
                         side_verts.append(verts3)
                     else:
                         phys_verts.append(verts3)
+                    # Frame bounds from collision geometry (needed for collision-only)
+                    xs_all.extend(poly[:, 0].tolist())
+                    ys_all.extend(poly[:, 1].tolist())
+                    zs_all.append(z_bias)
                     if show_shade_labels and item.get("panel") is not None:
                         c = poly.mean(axis=0)
                         if sk == "ghost":
@@ -1106,9 +1230,8 @@ def build_explosion_scene(
                 ax.add_collection3d(coll)
                 state["collections"].append(coll)
 
-        # --- collision-only vertical side panel walls (fill layer-height gaps) ---
-        side_panels_reg = list(trimmed.get("side_panels") or [])
-        if show_panels and side_panels_reg:
+        # --- vertical side walls (exported side_panels, else synthesized for viz) ---
+        if do_side_walls and side_panels_reg:
             side_wall_verts: List[np.ndarray] = []
             side_rgb_w = to_rgb(SIDE_FACE)
             side_edge_w = to_rgb(SIDE_EDGE)
@@ -1143,6 +1266,9 @@ def build_explosion_scene(
                         [float(b[0]), float(b[1]), z1],
                         [float(a[0]), float(a[1]), z1],
                     ], dtype=float))
+                    if coll_only:
+                        xs_all.extend([float(a[0]), float(b[0])])
+                        ys_all.extend([float(a[1]), float(b[1])])
             if side_wall_verts:
                 coll = Poly3DCollection(
                     side_wall_verts,
@@ -1155,7 +1281,7 @@ def build_explosion_scene(
                 state["collections"].append(coll)
 
         # --- creases / borders (only if either end's native z layer is visible) ---
-        if show_lines and lines3d:
+        if do_lines and lines3d:
             segs = []
             colors = []
             widths = []
@@ -1181,7 +1307,7 @@ def build_explosion_scene(
                 state["line_artists"].append(lc)
 
         # --- vertical guide rails across visible offsets only ---
-        if show_guides:
+        if do_guides:
             guide_segs = []
             for i, xy in enumerate(panel_xy):
                 offs = panel_offsets[i] if i < len(panel_offsets) else []
@@ -1219,7 +1345,7 @@ def build_explosion_scene(
                 state["text_artists"].append(t)
                 zs_all.append(z)
 
-        if show_panel_ids:
+        if do_panel_ids:
             for i, xy in enumerate(panel_xy):
                 offs = [
                     float(h)
@@ -1241,6 +1367,10 @@ def build_explosion_scene(
         if not zs_all:
             # keep a stable frame when everything is hidden
             zs_all = [z_of[h] for h in heights] if heights else [0.0]
+        if not xs_all or not ys_all:
+            # collision-only with no drawable shades: fall back to design bounds
+            xs_all = list(all_xy[:, 0])
+            ys_all = list(all_xy[:, 1])
         _set_equal_aspect_3d(ax, xs_all, ys_all, zs_all)
 
         n_shade = sum(len(v) for v in shades.values())
@@ -1259,12 +1389,19 @@ def build_explosion_scene(
         n_assoc = state_assoc["n_associated"]
         n_tot = state_assoc["n_total"]
         n_vis = len(vis_heights)
-        n_side_reg = len(trimmed.get("side_panels") or [])
-        ttl = title or "Thick-panel explosion"
+        n_side_reg = len(side_panels_reg)
+        side_src = "synth" if side_panels_synthesized else "export"
+        if base_title:
+            ttl = base_title
+        elif coll_only:
+            ttl = "Collision regions only"
+        else:
+            ttl = "Thick-panel explosion"
+        mode_tag = "  [collision only]" if coll_only else ""
         ax.set_title(
-            f"{ttl}\n"
+            f"{ttl}{mode_tag}\n"
             f"layers {n_vis}/{len(heights)} visible  panels={n_panels}  "
-            f"side_walls={n_side_reg}  "
+            f"side_walls={n_side_reg}({side_src})  "
             f"shades={n_shade_vis}/{n_shade} "
             f"(phys={n_shade_phys_vis}/{n_phys_all} "
             f"ghost={n_shade_ghost_vis}/{n_ghost_all} "
@@ -1272,6 +1409,7 @@ def build_explosion_scene(
             f"assoc {n_assoc}/{n_tot}  explosion={factor:.2f}",
             fontsize=11, pad=10,
         )
+        _update_help_text()
         fig.canvas.draw_idle()
 
     # Axes cosmetics
@@ -1302,7 +1440,7 @@ def build_explosion_scene(
     state["slider"] = slider
     state["draw"] = _draw
 
-    # ---- Sidebar: help + All/None + layer checkboxes ----
+    # ---- Sidebar: help + All/None + collision toggle + layer checkboxes ----
     # UI order: tallest (highest h) → lowest (smallest h). Internal heights stay ascending.
     heights_ui = sorted((float(h) for h in heights), reverse=True)
 
@@ -1317,28 +1455,47 @@ def build_explosion_scene(
     n_phys_help = sum(
         1 for r in state_assoc["records"] if _shell_kind_of(r) == "physical"
     )
-    n_side_walls = len(trimmed.get("side_panels") or [])
-    help_ax.text(
-        0.0, 1.0,
-        "Layers\n"
-        "────────\n"
-        "Top = tallest h\n"
-        "Bottom = lowest h\n"
-        "Panels: color / layer\n"
-        "Phys shade: red  P#\n"
-        "Ghost shade: blue P#·G\n"
-        "Side walls: green P#·S\n"
-        f"phys={n_phys_help} ghost={n_ghost_help}\n"
-        f"side={n_side_help} walls={n_side_walls}\n"
-        f"assoc {n_assoc}/{n_tot}",
-        transform=help_ax.transAxes,
-        va="top", ha="left", fontsize=7.5, color="#333333",
-        family="monospace",
-        bbox=dict(
-            boxstyle="round,pad=0.4", facecolor="#f7f7f9",
-            edgecolor="#cccccc", alpha=0.95,
-        ),
-    )
+    n_side_walls = len(side_panels_reg)
+    side_src_help = "synth" if side_panels_synthesized else "export"
+
+    def _update_help_text():
+        coll = bool(state["collision_only"])
+        mode_line = "Mode: collision only\n" if coll else "Mode: full stack\n"
+        panel_line = "Panels: hidden\n" if coll else "Panels: color / layer\n"
+        body = (
+            "Layers\n"
+            "────────\n"
+            f"{mode_line}"
+            "Top = tallest h\n"
+            "Bottom = lowest h\n"
+            f"{panel_line}"
+            "Phys shade: red  P#\n"
+            "Ghost shade: blue P#·G\n"
+            "Side walls: green\n"
+            f"phys={n_phys_help} ghost={n_ghost_help}\n"
+            f"side={n_side_help} walls={n_side_walls}\n"
+            f"walls src: {side_src_help}\n"
+            f"assoc {n_assoc}/{n_tot}"
+        )
+        art = state.get("help_text")
+        if art is None:
+            art = help_ax.text(
+                0.0, 1.0, body,
+                transform=help_ax.transAxes,
+                va="top", ha="left", fontsize=7.5, color="#333333",
+                family="monospace",
+                bbox=dict(
+                    boxstyle="round,pad=0.4", facecolor="#f7f7f9",
+                    edgecolor="#cccccc", alpha=0.95,
+                ),
+            )
+            state["help_text"] = art
+        else:
+            art.set_text(body)
+
+    # Must exist before first _draw (title path calls it).
+    state["help_text"] = None
+    _update_help_text()
 
     check_labels = [
         f"h={h:g}  ({shade_count_at.get(float(h), 0)} sh)"
@@ -1361,6 +1518,18 @@ def build_explosion_scene(
     except Exception:
         pass
 
+    coll_check = CheckButtons(
+        coll_check_ax,
+        ["Collision only"],
+        actives=[bool(state["collision_only"])],
+    )
+    try:
+        coll_check.labels[0].set_fontsize(9)
+        coll_check.labels[0].set_fontweight("bold")
+        coll_check.labels[0].set_color("#a32020")
+    except Exception:
+        pass
+
     def _sync_visibility_from_checks():
         status = list(check.get_status()) if check_labels else []
         for i, h in enumerate(heights_ui):
@@ -1372,6 +1541,17 @@ def build_explosion_scene(
         _draw(state["factor"])
 
     check.on_clicked(_on_check)
+
+    def _on_collision_check(_label):
+        # CheckButtons toggles before callback; read current status.
+        try:
+            on = bool(coll_check.get_status()[0])
+        except Exception:
+            on = not bool(state["collision_only"])
+        state["collision_only"] = on
+        _draw(state["factor"])
+
+    coll_check.on_clicked(_on_collision_check)
 
     def _set_all_checks(value: bool):
         """Force every checkbox to on/off and redraw."""
@@ -1390,11 +1570,16 @@ def build_explosion_scene(
     btn_none.on_clicked(lambda _evt: _set_all_checks(False))
 
     state["layer_check"] = check
+    state["collision_check"] = coll_check
     state["heights_ui"] = heights_ui  # tallest → lowest (sidebar order)
     state["btn_all"] = btn_all
     state["btn_none"] = btn_none
     state["set_layer_visible"] = lambda h, on: (
         state["layer_visible"].__setitem__(float(h), bool(on)),
+        _draw(state["factor"]),
+    )
+    state["set_collision_only"] = lambda on: (
+        state.__setitem__("collision_only", bool(on)),
         _draw(state["factor"]),
     )
 
@@ -1411,6 +1596,7 @@ def visualize_explosion_3d(
     show_shades: bool = True,
     show_lines: bool = True,
     show_guides: bool = True,
+    show_side_walls: Optional[bool] = None,
     show_panel_ids: bool = False,
     show_layer_labels: bool = True,
     show_shade_labels: bool = False,
@@ -1419,9 +1605,12 @@ def visualize_explosion_3d(
     interactive: bool = True,
     save_path: Optional[str] = None,
     print_report: bool = True,
+    collision_only: bool = False,
 ) -> Any:
     """
     Create the explosion figure; optionally save a PNG and/or show interactive UI.
+
+    ``collision_only=True`` draws only shaded/collided regions (and side walls).
 
     Returns the matplotlib Figure.
     """
@@ -1466,11 +1655,13 @@ def visualize_explosion_3d(
         show_shades=show_shades,
         show_lines=show_lines,
         show_guides=show_guides,
+        show_side_walls=show_side_walls,
         show_panel_ids=show_panel_ids,
         show_layer_labels=show_layer_labels,
         show_shade_labels=show_shade_labels,
         color_shades_by_panel=color_shades_by_panel,
         title=title,
+        collision_only=collision_only,
     )
 
     if save_path:
@@ -1551,11 +1742,17 @@ def _run_one(
     if report_only:
         return None
 
+    collision_only = bool(sim.get("collision_only", False))
     out_path = None
     if save:
         os.makedirs(output_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(trimmed_path))[0]
-        out_path = os.path.join(output_dir, f"{stem}_explosion_3d.png")
+        suffix = "_collision_3d" if collision_only else "_explosion_3d"
+        out_path = os.path.join(output_dir, f"{stem}{suffix}.png")
+
+    title = os.path.basename(trimmed_path)
+    if collision_only:
+        title = f"{title} — collision only"
 
     visualize_explosion_3d(
         trimmed=trimmed,
@@ -1566,14 +1763,16 @@ def _run_one(
         show_shades=bool(sim.get("show_shades", True)),
         show_lines=bool(sim.get("show_lines", True)),
         show_guides=bool(sim.get("show_guides", True)),
+        show_side_walls=sim.get("show_side_walls"),
         show_panel_ids=bool(sim.get("show_panel_ids", False)),
         show_layer_labels=bool(sim.get("show_layer_labels", True)),
         show_shade_labels=bool(sim.get("show_shade_labels", False)),
         color_shades_by_panel=bool(sim.get("color_shades_by_panel", False)),
-        title=os.path.basename(trimmed_path),
+        title=title,
         interactive=show,
         save_path=out_path,
         print_report=False,  # already printed above
+        collision_only=collision_only,
     )
     return out_path
 
@@ -1624,6 +1823,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Only print panel×layer association table (no figure)",
     )
+    parser.add_argument(
+        "--collision-only",
+        action="store_true",
+        help=(
+            "Show only collision/shaded regions (phys/ghost/side ribbons "
+            "and side walls); hide panels, creases, and guides"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.name:
@@ -1656,6 +1863,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             sim["show_panel_ids"] = True
         if args.no_shade_labels:
             sim["show_shade_labels"] = False
+        if args.collision_only:
+            sim["collision_only"] = True
 
     show = not args.no_show and not args.report_only
     if args.report_only:
