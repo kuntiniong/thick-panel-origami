@@ -860,6 +860,29 @@ def _shell_kind_of(entry: Optional[dict]) -> str:
     return "physical"
 
 
+def _viz_shaded_regions(trimmed: dict) -> List[dict]:
+    """
+    Regions for 2D visualization.
+
+    Prefer clean.py ``shaded_regions_layers`` (every pre-merge ghost/main
+    layer) and append merged continuous stacks from ``shaded_regions``.
+    """
+    layers = list(trimmed.get("shaded_regions_layers") or [])
+    merged = list(trimmed.get("shaded_regions") or [])
+    if layers:
+        out = list(layers)
+        for sh in merged:
+            if sh.get("layer_stack_merged") or sh.get("h_lo") is not None:
+                m = dict(sh)
+                m["viz_merged_stack"] = True
+                out.append(m)
+        return out
+    if merged:
+        return merged
+    stats = trimmed.get("collision_stats") or {}
+    return list(stats.get("shaded_regions") or stats.get("shaded_areas") or [])
+
+
 def _entries_from_shaded_regions(
     regions: Sequence[dict],
 ) -> List[Dict[str, Any]]:
@@ -944,6 +967,11 @@ def _entries_from_shaded_regions(
             "clean_edges": sh.get("clean_edges") or [],
             "cut_kind": sh.get("cut_kind"),
             "cut_ring": coords,
+            "pre_merge_layer": bool(sh.get("pre_merge_layer")),
+            "viz_merged_stack": bool(
+                sh.get("viz_merged_stack") or sh.get("layer_stack_merged")
+            ),
+            "layer_stack_merged": bool(sh.get("layer_stack_merged")),
         })
     return entries
 
@@ -988,7 +1016,22 @@ def _items_from_collision_stats(
         ]
 
     for cp in source_entries:
-        if not _layer_match(cp.get("layer_h"), layer_h, eps):
+        # Merged continuous stacks: show on every subplot within [h_lo, h_hi]
+        if cp.get("viz_merged_stack") or cp.get("layer_stack_merged"):
+            hlo, hhi = cp.get("h_lo"), cp.get("h_hi")
+            try:
+                if hlo is not None and hhi is not None:
+                    lo, hi = float(hlo), float(hhi)
+                    if lo > hi:
+                        lo, hi = hi, lo
+                    if not (lo - eps <= float(layer_h) <= hi + eps):
+                        continue
+                elif not _layer_match(cp.get("layer_h"), layer_h, eps):
+                    continue
+            except (TypeError, ValueError):
+                if not _layer_match(cp.get("layer_h"), layer_h, eps):
+                    continue
+        elif not _layer_match(cp.get("layer_h"), layer_h, eps):
             continue
 
         # Prefer exported shaded-area coordinates (sweep ribbon on design plane)
@@ -1104,6 +1147,13 @@ def _items_from_collision_stats(
             "clean_ring": ring_nodes or [],
             "clean_edges": cp.get("clean_edges") or [],
             "cut_kind": cp.get("cut_kind"),
+            "pre_merge_layer": bool(cp.get("pre_merge_layer")),
+            "viz_merged_stack": bool(
+                cp.get("viz_merged_stack") or cp.get("layer_stack_merged")
+            ),
+            "layer_stack_merged": bool(cp.get("layer_stack_merged")),
+            "h_lo": cp.get("h_lo"),
+            "h_hi": cp.get("h_hi"),
         })
 
     if out:
@@ -1402,8 +1452,13 @@ def _draw_layer(
             if sk == "side":
                 continue
             n_shaded += 1
+            is_merged = bool(
+                item.get("viz_merged_stack") or item.get("layer_stack_merged")
+            )
             is_ghost = sk == "ghost"
-            if is_ghost:
+            if is_merged:
+                pass  # counted via n_shaded only
+            elif is_ghost:
                 n_ghost += 1
             else:
                 n_physical += 1
@@ -1411,27 +1466,30 @@ def _draw_layer(
                 item.get("paint_kind") == "sweep"
                 or str(item.get("source", "")).endswith("sweep")
             )
-            if is_ghost:
+            if is_merged:
+                # Continuous min→max merge: light purple fill, bold outline
+                face, edge, alpha = "#e8d5f5", FABRIC_EDGE_COLOR, 0.18
+                hatch = None
+                lw = 2.0
+            elif is_ghost:
                 face, edge, alpha = GHOST_POLY_FACE, GHOST_POLY_EDGE, GHOST_POLY_ALPHA
+                hatch = "..."
+                lw = 1.2
             else:
                 face, edge, alpha = TRIM_POLY_FACE, TRIM_POLY_EDGE, TRIM_POLY_ALPHA
-            if is_ghost:
-                hatch = "..."
-            elif is_sweep:
-                hatch = None
-            else:
-                hatch = "///"
+                hatch = None if is_sweep else "///"
+                lw = 1.2
             _draw_poly(
                 ax, poly,
                 facecolor=face, edgecolor=edge,
-                linewidth=1.2, alpha=alpha,
+                linewidth=lw, alpha=alpha,
                 hatch=hatch,
-                zorder=6,
+                zorder=8 if is_merged else 6,
             )
             # Geometric cut outline (solid straight edges) when cleaned
             cut_kind = str(item.get("cut_kind") or "")
             poly_is_cut = bool(cut_kind) or item.get("fabric_poly") is not None
-            if poly_is_cut and poly is not None and len(poly) >= 3:
+            if poly_is_cut and poly is not None and len(poly) >= 3 and not is_merged:
                 cx = [float(p[0]) for p in poly]
                 cy = [float(p[1]) for p in poly]
                 ax.plot(
@@ -1440,8 +1498,17 @@ def _draw_layer(
                     linestyle="-", alpha=0.95, zorder=7.1,
                     solid_capstyle="butt", solid_joinstyle="miter",
                 )
+            if is_merged and poly is not None and len(poly) >= 3:
+                cx = [float(p[0]) for p in poly]
+                cy = [float(p[1]) for p in poly]
+                ax.plot(
+                    cx + [cx[0]], cy + [cy[0]],
+                    color=FABRIC_EDGE_COLOR, linewidth=2.2,
+                    linestyle="--", alpha=0.95, zorder=8.2,
+                    solid_capstyle="butt", solid_joinstyle="miter",
+                )
             # Fabrication offset outline (purple): straight segments only
-            if show_fabric_offset:
+            if show_fabric_offset and not is_merged:
                 fab = item.get("fabric_poly")
                 if fab is not None and len(fab) >= 3:
                     # Draw each edge as an explicit straight segment (no curve)
@@ -1456,18 +1523,25 @@ def _draw_layer(
                             linestyle="-", alpha=0.98, zorder=7.3,
                             solid_capstyle="butt", solid_joinstyle="miter",
                         )
-            # Panel tag on shade; ·G = ghost
+            # Panel tag on shade; ·G = ghost, ·M = merged stack
             pid = item.get("panel")
             if pid is not None and len(poly) >= 1:
                 c = poly.mean(axis=0)
-                if is_ghost:
+                if is_merged:
+                    hlo, hhi = item.get("h_lo"), item.get("h_hi")
+                    if hlo is not None and hhi is not None:
+                        tag = f"P{int(pid)}·M[{float(hlo):g}→{float(hhi):g}]"
+                    else:
+                        tag = f"P{int(pid)}·M"
+                    tag_color = "#6a0dad"
+                elif is_ghost:
                     tag = f"P{int(pid)}·G"
                     tag_color = "#0a2a5a"
                 else:
                     tag = f"P{int(pid)}"
                     tag_color = "#5a0a0a"
                 fo = item.get("fabric_offset")
-                if fo is not None and float(fo) > 1e-12:
+                if fo is not None and float(fo) > 1e-12 and not is_merged:
                     tag = f"{tag}·f{float(fo):g}"
                 ax.text(
                     float(c[0]), float(c[1]), tag,
@@ -1707,10 +1781,12 @@ def visualize_trimmed(
 ) -> plt.Figure:
     base = original or trimmed
     stats = trimmed.get("collision_stats")
-    # dual_curve_v1 lives at top-level; fall back to stats-embedded copy
-    shaded_regions = trimmed.get("shaded_regions") or (
-        (stats or {}).get("shaded_regions") if stats else None
-    )
+    # Prefer pre-merge layers for multi-height viz; fall back to merged/export
+    shaded_regions = _viz_shaded_regions(trimmed)
+    if not shaded_regions:
+        shaded_regions = trimmed.get("shaded_regions") or (
+            (stats or {}).get("shaded_regions") if stats else None
+        )
 
     orig_units = base.get("units") or trimmed.get("units") or []
     # Per-panel thickness offsets (crease thick_panel_height), same as sim

@@ -5,15 +5,20 @@ Reads  panel_trimming/trimmedData/<name>-trimmed.json  (or a path)
 Writes panel_trimming/trimmedData/<name>-cleaned.json  (-trimmed → -cleaned suffix)
 
 Pipeline (per kept shaded region):
-  1) Round all dual-curve coords to 6 d.p. (float noise → stable grouping)
-  2) Union-Find group messy nodes (esp. vertex clouds) under custom
+  1) Snap dual-curve coords onto nearby crease / border segments
+     (mountain, valley, border lines + host panel edges) when within snap_tol
+  2) Round all dual-curve coords to 6 d.p. (float noise → stable grouping)
+  3) Union-Find group messy nodes (esp. vertex clouds) under custom
      constraints; keep the outermost node per cluster (farthest from the
      region sample centroid — never the cluster mean)
-  3) Straight containing cut = convex hull of UF winners (panel-clipped),
+  4) Straight containing cut = convex hull of UF winners (panel-clipped),
      residual re-hull if any original sample is outside, optional RDP only
      when containment is preserved → never undershoot shaded region
-  4) Manual fabrication offset outward from the step-3 polygon (barrier /
+  5) Manual fabrication offset outward from the step-4 polygon (barrier /
      panel clamped)
+  6) Per panel: merge all ghost + physical layer stacks into one continuous
+     [min layer_h, max layer_h] footprint (no intermediate Z gaps).
+     Pre-merge layers kept as shaded_regions_layers for visualization.
 
 Also drops:
   - kind == "line"  (exporter collapsed-contact flag)
@@ -102,6 +107,12 @@ DEFAULT_CORNER_MERGE_TOL = DEFAULT_GROUP_TOL
 DEFAULT_ROUND_DP = 6
 # Whether UF refuses to merge pairs whose segment crosses a crease/border
 DEFAULT_UF_RESPECT_BARRIERS = False
+# Snap dual-curve samples onto creases/borders if within this distance (mm).
+# 0 = off.
+DEFAULT_SNAP_TOL = 0.5
+# Per-panel: merge ghost + physical layer stacks into one continuous
+# [min layer_h, max layer_h] solid (no intermediate Z gaps).
+DEFAULT_MERGE_LAYER_STACK = True
 
 
 def _load_json(path: str) -> dict:
@@ -498,6 +509,7 @@ def _point_in_or_on_polygon(p: Sequence, poly: Sequence, eps: float = 1e-7) -> b
 
 
 def _point_seg_dist(p: Sequence, a: Sequence, b: Sequence) -> float:
+    """Perpendicular distance from point to the infinite line through AB."""
     ax, ay = float(a[0]), float(a[1])
     bx, by = float(b[0]), float(b[1])
     px, py = float(p[0]), float(p[1])
@@ -506,6 +518,120 @@ def _point_seg_dist(p: Sequence, a: Sequence, b: Sequence) -> float:
     if lab2 < 1e-24:
         return math.hypot(px - ax, py - ay)
     return abs(dx * (ay - py) - dy * (ax - px)) / math.sqrt(lab2)
+
+
+def _project_point_to_segment(
+    p: Sequence,
+    a: Sequence,
+    b: Sequence,
+) -> Tuple[List[float], float]:
+    """
+    Closest point on segment AB to P, and Euclidean distance.
+
+    Projection is clamped to the segment (not the infinite line).
+    """
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    px, py = float(p[0]), float(p[1])
+    abx, aby = bx - ax, by - ay
+    lab2 = abx * abx + aby * aby
+    if lab2 < 1e-24:
+        return [ax, ay], math.hypot(px - ax, py - ay)
+    t = ((px - ax) * abx + (py - ay) * aby) / lab2
+    t = max(0.0, min(1.0, t))
+    qx, qy = ax + t * abx, ay + t * aby
+    return [qx, qy], math.hypot(px - qx, py - qy)
+
+
+def snap_point_to_segments(
+    p: Sequence,
+    segments: Sequence[Tuple[Sequence, Sequence]],
+    *,
+    snap_tol: float,
+) -> Tuple[List[float], bool, float]:
+    """
+    If P is within snap_tol of any segment, return the closest projection.
+
+    Returns (point_xy, snapped?, distance_to_segment).
+    """
+    tol = float(snap_tol)
+    if tol <= 0 or not segments:
+        q = _xy(p)
+        return q, False, 0.0
+    best_q = _xy(p)
+    best_d = float("inf")
+    for a, b in segments:
+        q, d = _project_point_to_segment(p, a, b)
+        if d < best_d:
+            best_d = d
+            best_q = q
+    if best_d <= tol + 1e-15:
+        return best_q, True, float(best_d)
+    return _xy(p), False, float(best_d if best_d < float("inf") else 0.0)
+
+
+def snap_poly_to_segments(
+    pts: Sequence,
+    segments: Sequence[Tuple[Sequence, Sequence]],
+    *,
+    snap_tol: float,
+) -> Tuple[List[List[float]], int]:
+    """Snap each vertex of a polyline/ring. Returns (new_pts, n_snapped)."""
+    out: List[List[float]] = []
+    n_snap = 0
+    for p in pts or []:
+        q, did, _ = snap_point_to_segments(p, segments, snap_tol=snap_tol)
+        out.append(q)
+        if did:
+            n_snap += 1
+    return out, n_snap
+
+
+def snap_region_to_creases(
+    region: dict,
+    data: Optional[dict],
+    *,
+    snap_tol: float = DEFAULT_SNAP_TOL,
+) -> Dict[str, Any]:
+    """
+    In-place: snap dual-curve / residual poly coords onto nearby creases.
+
+    Targets: mountain, valley, and border line segments from the design, plus
+    the host panel outline edges (same set as barrier segments).
+    """
+    tol = float(snap_tol)
+    info: Dict[str, Any] = {
+        "snap_tol": tol,
+        "n_snapped": 0,
+        "n_points": 0,
+        "skipped": False,
+    }
+    if tol <= 0:
+        info["skipped"] = True
+        info["reason"] = "snap_tol<=0"
+        return info
+
+    segs = collect_barrier_segments(data, region=region)
+    if not segs:
+        info["skipped"] = True
+        info["reason"] = "no_crease_segments"
+        return info
+
+    n_snap = 0
+    n_pts = 0
+    for key in ("c0", "c1", "coordinates", "cut_ring", "fabric_ring", "clean_ring"):
+        raw = region.get(key)
+        if not raw:
+            continue
+        snapped, k = snap_poly_to_segments(raw, segs, snap_tol=tol)
+        region[key] = snapped
+        n_snap += k
+        n_pts += len(snapped)
+
+    info["n_snapped"] = int(n_snap)
+    info["n_points"] = int(n_pts)
+    info["n_segments"] = len(segs)
+    return info
 
 
 def _rdp_indices_open(pts: Sequence, eps: float) -> List[int]:
@@ -2235,6 +2361,7 @@ def _refresh_collision_stats(data: dict, regions: Sequence[dict]) -> None:
         1 for r in regions
         if str(r.get("shell_kind") or "").lower() not in ("ghost", "side")
     )
+    n_merged = sum(1 for r in regions if r.get("layer_stack_merged"))
     stats["schema"] = stats.get("schema") or "dual_curve_v1"
     stats["n_shaded_regions"] = len(regions)
     stats["n_shaded_areas"] = len(regions)
@@ -2243,7 +2370,360 @@ def _refresh_collision_stats(data: dict, regions: Sequence[dict]) -> None:
     stats["n_physical_regions"] = n_phys
     stats["n_ghost_regions"] = n_ghost
     stats["n_side_regions"] = n_side
+    stats["n_layer_stack_merged"] = n_merged
     stats["shaded_regions_key"] = "shaded_regions"
+
+
+# ---------------------------------------------------------------------------
+# Per-panel layer-stack merge (ghost + physical → continuous min→max Z)
+# ---------------------------------------------------------------------------
+
+def _shell_kind_of_region(region: Optional[dict]) -> str:
+    if not region:
+        return "physical"
+    raw = region.get("shell_kind")
+    if raw is None:
+        return "physical"
+    s = str(raw).strip().lower()
+    if s in ("ghost", "g", "intermediate", "collision_only"):
+        return "ghost"
+    if s in ("side", "s", "vertical", "side_ribbon"):
+        return "side"
+    return "physical"
+
+
+def _region_export_ring(region: dict) -> List[List[float]]:
+    """Prefer fabrication / cut ring used by cleaned exporters & viz."""
+    for key in ("fabric_ring", "cut_ring", "coordinates", "clean_ring"):
+        raw = region.get(key)
+        if raw is not None and len(raw) >= 3:
+            return [_xy(p) for p in raw]
+    c0 = region.get("c0") or []
+    c1 = region.get("c1") or []
+    if c0 and c1:
+        n = min(len(c0), len(c1))
+        if n >= 2:
+            ring = [_xy(p) for p in c0[:n]]
+            ring += [_xy(p) for p in reversed(c1[:n])]
+            if len(ring) >= 3:
+                return ring
+    return []
+
+
+def _region_layer_h(region: dict) -> Optional[float]:
+    lh = region.get("layer_h")
+    if lh is None:
+        return None
+    try:
+        return float(lh)
+    except (TypeError, ValueError):
+        return None
+
+
+def _union_rings_2d(
+    rings: Sequence[Sequence],
+    *,
+    round_dp: int = DEFAULT_ROUND_DP,
+) -> List[List[List[float]]]:
+    """
+    2D-union of closed rings → list of exterior rings (MultiPolygon parts).
+
+    Uses shapely when available; otherwise returns deduped input rings.
+    """
+    cleaned: List[List[List[float]]] = []
+    for ring in rings or []:
+        pts = _dedupe_points([_xy(p) for p in ring], eps=10 ** (-int(round_dp)))
+        if len(pts) < 3:
+            continue
+        if abs(_polygon_area_2d(pts)) < 1e-18:
+            continue
+        if _polygon_area_2d(pts) < 0:
+            pts = list(reversed(pts))
+        cleaned.append(pts)
+    if not cleaned:
+        return []
+
+    try:
+        from shapely.geometry import Polygon as _ShPoly
+        from shapely.ops import unary_union as _uunion
+        from shapely.validation import make_valid as _make_valid
+    except Exception:
+        return cleaned
+
+    polys = []
+    for pts in cleaned:
+        try:
+            g = _ShPoly(pts)
+        except Exception:
+            continue
+        if g.is_empty:
+            continue
+        if not g.is_valid:
+            try:
+                g = g.buffer(0)
+            except Exception:
+                try:
+                    g = _make_valid(g)
+                except Exception:
+                    continue
+        if g is None or g.is_empty:
+            continue
+        if g.geom_type == "Polygon" and g.area > 1e-12:
+            polys.append(g)
+        elif g.geom_type == "MultiPolygon":
+            for p in g.geoms:
+                if p.geom_type == "Polygon" and p.area > 1e-12:
+                    polys.append(p)
+        else:
+            try:
+                for p in getattr(g, "geoms", []):
+                    if p.geom_type == "Polygon" and p.area > 1e-12:
+                        polys.append(p)
+            except Exception:
+                continue
+    if not polys:
+        return cleaned
+    try:
+        merged = _uunion(polys)
+    except Exception:
+        merged = polys[0]
+        for p in polys[1:]:
+            try:
+                merged = merged.union(p)
+            except Exception:
+                continue
+    if merged is None or getattr(merged, "is_empty", True):
+        return cleaned
+    if not getattr(merged, "is_valid", True):
+        try:
+            merged = _make_valid(merged)
+        except Exception:
+            try:
+                merged = merged.buffer(0)
+            except Exception:
+                return cleaned
+
+    out_rings: List[List[List[float]]] = []
+
+    def _ext(poly) -> Optional[List[List[float]]]:
+        try:
+            coords = list(poly.exterior.coords)
+        except Exception:
+            return None
+        pts = _round_poly(coords[:-1] if len(coords) > 1 else coords, dp=round_dp)
+        pts = _dedupe_points(pts, eps=10 ** (-int(round_dp)))
+        if len(pts) < 3:
+            return None
+        if abs(_polygon_area_2d(pts)) < 1e-18:
+            return None
+        if _polygon_area_2d(pts) < 0:
+            pts = list(reversed(pts))
+        return pts
+
+    gt = getattr(merged, "geom_type", "")
+    if gt == "Polygon":
+        r = _ext(merged)
+        if r:
+            out_rings.append(r)
+    elif gt == "MultiPolygon":
+        for p in merged.geoms:
+            if p.geom_type == "Polygon" and p.area > 1e-12:
+                r = _ext(p)
+                if r:
+                    out_rings.append(r)
+    else:
+        for p in getattr(merged, "geoms", []) or []:
+            if p.geom_type == "Polygon" and getattr(p, "area", 0) > 1e-12:
+                r = _ext(p)
+                if r:
+                    out_rings.append(r)
+    return out_rings if out_rings else cleaned
+
+
+def merge_panel_layer_stacks(
+    regions: Sequence[dict],
+    *,
+    enabled: bool = DEFAULT_MERGE_LAYER_STACK,
+    round_dp: int = DEFAULT_ROUND_DP,
+) -> Tuple[List[dict], Dict[str, Any]]:
+    """
+    Per panel group: merge all ghost + physical collision shades into a
+    continuous Z span [min layer_h, max layer_h] with 2D-unioned footprints.
+
+    Intermediate ghost / main layers no longer leave gaps between min and max
+    height. Side ribbons are left unchanged.
+
+    Each merged region carries:
+      h_lo / h_hi     — continuous height range (mm)
+      layer_h         — midpoint
+      stock_span_mm   — h_hi − h_lo
+      cut_ring / fabric_ring / coordinates — union polygon(s)
+      layer_stack_merged — True
+    """
+    info: Dict[str, Any] = {
+        "enabled": bool(enabled),
+        "n_in": len(regions or []),
+        "n_out": len(regions or []),
+        "n_panels_merged": 0,
+        "n_sources_merged": 0,
+        "panels": [],
+    }
+    if not enabled:
+        return list(regions or []), info
+    if not regions:
+        return [], info
+
+    sides: List[dict] = []
+    by_panel: Dict[int, List[dict]] = {}
+    orphan: List[dict] = []
+
+    for r in regions:
+        sk = _shell_kind_of_region(r)
+        if sk == "side":
+            sides.append(dict(r))
+            continue
+        panel = r.get("panel")
+        try:
+            pid = int(panel) if panel is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        if pid is None:
+            orphan.append(dict(r))
+            continue
+        by_panel.setdefault(pid, []).append(dict(r))
+
+    out: List[dict] = []
+    out.extend(sides)
+    out.extend(orphan)
+
+    for pid in sorted(by_panel.keys()):
+        group = by_panel[pid]
+        heights: List[float] = []
+        for r in group:
+            h = _region_layer_h(r)
+            if h is not None:
+                heights.append(h)
+        if not heights:
+            out.extend(group)
+            continue
+
+        h_lo = float(min(heights))
+        h_hi = float(max(heights))
+        h_mid = 0.5 * (h_lo + h_hi)
+        span = float(h_hi - h_lo)
+
+        # Prefer fabric rings when any member has offset; else cut rings
+        has_fabric = any(
+            (r.get("fabric_ring") and len(r.get("fabric_ring") or []) >= 3)
+            for r in group
+        )
+        rings: List[List[List[float]]] = []
+        for r in group:
+            if has_fabric:
+                raw = r.get("fabric_ring") or r.get("cut_ring") or _region_export_ring(r)
+            else:
+                raw = r.get("cut_ring") or r.get("fabric_ring") or _region_export_ring(r)
+            if raw and len(raw) >= 3:
+                rings.append([_xy(p) for p in raw])
+
+        unioned = _union_rings_2d(rings, round_dp=round_dp)
+        if not unioned:
+            # Keep originals but stamp continuous span on each
+            for r in group:
+                r = dict(r)
+                r["h_lo"] = h_lo
+                r["h_hi"] = h_hi
+                r["layer_h"] = h_mid if span > 1e-12 else (heights[0] if heights else 0.0)
+                r["stock_span_mm"] = span
+                r["layer_stack_merged"] = len(group) > 1 or span > 1e-12
+                out.append(r)
+            info["n_panels_merged"] += 1
+            info["n_sources_merged"] += len(group)
+            info["panels"].append({
+                "panel": pid,
+                "n_sources": len(group),
+                "n_parts": len(group),
+                "h_lo": h_lo,
+                "h_hi": h_hi,
+                "union_failed": True,
+            })
+            continue
+
+        # Template: largest-area physical, else largest overall
+        def _area_of(r: dict) -> float:
+            try:
+                return float(r.get("area") or region_area(r) or 0.0)
+            except Exception:
+                return 0.0
+
+        phys = [r for r in group if _shell_kind_of_region(r) == "physical"]
+        template = max(phys or group, key=_area_of)
+        shell_kind = "physical" if phys else "ghost"
+        n_ghost = sum(1 for r in group if _shell_kind_of_region(r) == "ghost")
+        n_phys = len(phys)
+
+        for part_i, ring in enumerate(unioned):
+            m = dict(template)
+            # Drop dual-curve + per-layer trails; merged poly is the truth
+            for k in (
+                "c0",
+                "c1",
+                "linear_c0",
+                "linear_c1",
+                "clean_ring",
+                "clean_edges",
+                "layer_idx",
+            ):
+                m.pop(k, None)
+            m["panel"] = pid
+            m["shell_kind"] = shell_kind
+            m["layer_h"] = h_mid if span > 1e-12 else h_lo
+            m["h_lo"] = h_lo
+            m["h_hi"] = h_hi
+            m["stock_span_mm"] = span
+            m["layer_stack_merged"] = True
+            m["n_merged_sources"] = len(group)
+            m["n_merged_ghost"] = n_ghost
+            m["n_merged_physical"] = n_phys
+            m["merged_layer_heights"] = sorted(set(round(h, 9) for h in heights))
+            m["merge_part"] = part_i
+            m["n_merge_parts"] = len(unioned)
+            m["kind"] = "final_trim" if (
+                m.get("fabric_ring") or m.get("cut_ring") or m.get("cut_kind")
+            ) else (m.get("kind") or "sweep")
+            area = abs(_polygon_area_2d(ring))
+            m["area"] = float(area)
+            m["ribbon_area"] = float(area)
+            ring_out = [list(p) for p in ring]
+            if has_fabric:
+                m["fabric_ring"] = ring_out
+                m["coordinates"] = ring_out
+                # Keep a cut_ring too for exporters that prefer cut
+                if not m.get("cut_ring"):
+                    m["cut_ring"] = ring_out
+                else:
+                    m["cut_ring"] = ring_out
+            else:
+                m["cut_ring"] = ring_out
+                m["coordinates"] = ring_out
+                m.pop("fabric_ring", None)
+            out.append(m)
+
+        info["n_panels_merged"] += 1
+        info["n_sources_merged"] += len(group)
+        info["panels"].append({
+            "panel": pid,
+            "n_sources": len(group),
+            "n_parts": len(unioned),
+            "h_lo": h_lo,
+            "h_hi": h_hi,
+            "n_ghost": n_ghost,
+            "n_physical": n_phys,
+            "union_failed": False,
+        })
+
+    info["n_out"] = len(out)
+    return out, info
 
 
 def clean_data(
@@ -2261,6 +2741,8 @@ def clean_data(
     round_dp: int = DEFAULT_ROUND_DP,
     straight_slack: float = DEFAULT_STRAIGHT_SLACK,
     max_overshoot_ratio: float = DEFAULT_MAX_OVERSHOOT_RATIO,
+    snap_tol: float = DEFAULT_SNAP_TOL,
+    merge_layer_stack: bool = DEFAULT_MERGE_LAYER_STACK,
     source_path: Optional[str] = None,
 ) -> Tuple[dict, Dict[str, Any]]:
     """
@@ -2268,21 +2750,37 @@ def clean_data(
 
     Pipeline:
       1) filter collapsed / too-small
-      2) round coords to ``round_dp`` d.p.
-      3) Union-Find group messy nodes → outermost each
-      4) straight containing cut (hull → slack → simplify, never undershoot)
-      5) optional fabric_offset from step-4 polygon
-      6) attach clean_ring + clean_edges
+      2) snap dual-curve coords onto nearby creases/borders (``snap_tol``)
+      3) round coords to ``round_dp`` d.p.
+      4) Union-Find group messy nodes → outermost each
+      5) straight containing cut (hull → slack → simplify, never undershoot)
+      6) optional fabric_offset from cut polygon
+      7) attach clean_ring + clean_edges
+      8) per panel: merge ghost + physical stacks → continuous min→max Z
     """
     gtol = float(group_tol if corner_merge_tol is None else corner_merge_tol)
     rdp = int(round_dp)
+    stol = float(snap_tol)
     out = copy.deepcopy(data)
     regions = list(out.get("shaded_regions") or [])
     kept, dropped_log = filter_shaded_regions(
         regions, min_area=min_area, drop_line_kind=drop_line_kind
     )
 
-    # Step 1: quantize dual curves on every kept region
+    # Step 1: snap samples onto nearby mountain / valley / border segments
+    snap_log: List[Dict[str, Any]] = []
+    n_snap_total = 0
+    if stol > 0:
+        for r in kept:
+            sinfo = snap_region_to_creases(r, out, snap_tol=stol)
+            n_snap_total += int(sinfo.get("n_snapped") or 0)
+            snap_log.append({
+                "panel": r.get("panel"),
+                "layer_h": r.get("layer_h"),
+                **sinfo,
+            })
+
+    # Step 2: quantize dual curves on every kept region
     for r in kept:
         round_region_geometry(r, dp=rdp)
 
@@ -2337,7 +2835,66 @@ def clean_data(
             # Final quantize of viz helpers
             round_region_geometry(r, dp=rdp)
 
+    # Step 8: merge ghost + physical per panel into continuous min→max height.
+    # Keep a pre-merge copy so viz can still show every intermediate layer.
+    layers_for_viz: List[dict] = []
+    if bool(merge_layer_stack) and kept:
+        for r in kept:
+            layer = copy.deepcopy(r)
+            layer["pre_merge_layer"] = True
+            layer.pop("layer_stack_merged", None)
+            layers_for_viz.append(layer)
+
+    kept, merge_info = merge_panel_layer_stacks(
+        kept,
+        enabled=bool(merge_layer_stack),
+        round_dp=rdp,
+    )
+    if attach_polygon_meta and merge_info.get("enabled"):
+        for r in kept:
+            if r.get("layer_stack_merged"):
+                # Re-attach edges for merged rings (dual curves dropped)
+                cut = (
+                    r.get("fabric_ring")
+                    or r.get("cut_ring")
+                    or r.get("coordinates")
+                )
+                if cut and len(cut) >= 3:
+                    edges: List[Dict[str, Any]] = []
+                    m = len(cut)
+                    role = "fabric" if r.get("fabric_ring") else "cut"
+                    for i in range(m):
+                        p0, p1 = cut[i], cut[(i + 1) % m]
+                        dx = float(p0[0]) - float(p1[0])
+                        dy = float(p0[1]) - float(p1[1])
+                        edges.append({
+                            "role": role,
+                            "p0": list(p0),
+                            "p1": list(p1),
+                            "length": math.sqrt(dx * dx + dy * dy),
+                            "grouped": False,
+                            "linear": True,
+                        })
+                    r["clean_edges"] = edges
+                    r["clean_ring"] = [list(p) for p in cut]
+                round_region_geometry(r, dp=rdp)
+
+    # shaded_regions        = merged continuous solid (export / STL)
+    # shaded_regions_layers = pre-merge ghost+physical at each layer_h (viz)
     out["shaded_regions"] = kept
+    if (
+        layers_for_viz
+        and merge_info.get("enabled")
+        and int(merge_info.get("n_panels_merged") or 0) > 0
+    ):
+        out["shaded_regions_layers"] = layers_for_viz
+        meta_tmp = out.get("export_meta")
+        if not isinstance(meta_tmp, dict):
+            meta_tmp = {}
+            out["export_meta"] = meta_tmp
+        meta_tmp["clean_n_layer_viz"] = len(layers_for_viz)
+    else:
+        out.pop("shaded_regions_layers", None)
     _refresh_collision_stats(out, kept)
 
     report = {
@@ -2351,13 +2908,18 @@ def clean_data(
         "fabric_offset": fo,
         "group_tol": gtol,
         "round_dp": rdp,
+        "snap_tol": stol,
+        "merge_layer_stack": bool(merge_layer_stack),
+        "n_snapped_total": int(n_snap_total),
         "uf_respect_barriers": bool(uf_respect_barriers),
         "n_in": len(regions),
         "n_out": len(kept),
         "n_dropped": len(dropped_log),
         "dropped": dropped_log,
+        "snap_log": snap_log,
         "cut_log": cut_log,
         "fabric_log": fabric_log,
+        "merge_log": merge_info,
     }
     meta = out.get("export_meta")
     if not isinstance(meta, dict):
@@ -2375,9 +2937,18 @@ def clean_data(
     meta["clean_cut_kind"] = "straight_containing" if straight_cut else None
     meta["clean_fabric_offset"] = fo
     meta["clean_group_tol"] = gtol
+    meta["clean_snap_tol"] = stol
+    meta["clean_n_snapped"] = int(n_snap_total)
     meta["clean_corner_merge_tol"] = gtol  # legacy
     meta["clean_round_dp"] = rdp
     meta["clean_uf_respect_barriers"] = bool(uf_respect_barriers)
+    meta["clean_merge_layer_stack"] = bool(merge_layer_stack)
+    meta["clean_n_panels_layer_merged"] = int(merge_info.get("n_panels_merged") or 0)
+    meta["clean_n_sources_layer_merged"] = int(merge_info.get("n_sources_merged") or 0)
+    if out.get("shaded_regions_layers") is not None:
+        meta["clean_n_layer_viz"] = len(out["shaded_regions_layers"])
+    else:
+        meta.pop("clean_n_layer_viz", None)
     meta["approx_type"] = "linear" if straight_cut else meta.get("approx_type")
     meta["boundary_order"] = 1 if straight_cut else meta.get("boundary_order")
     meta["curved_boundary"] = False if straight_cut else meta.get("curved_boundary")
@@ -2415,6 +2986,8 @@ def clean_file(
     round_dp: int = DEFAULT_ROUND_DP,
     straight_slack: float = DEFAULT_STRAIGHT_SLACK,
     max_overshoot_ratio: float = DEFAULT_MAX_OVERSHOOT_RATIO,
+    snap_tol: float = DEFAULT_SNAP_TOL,
+    merge_layer_stack: bool = DEFAULT_MERGE_LAYER_STACK,
 ) -> Dict[str, Any]:
     data = _load_json(input_path)
     cleaned, report = clean_data(
@@ -2431,6 +3004,8 @@ def clean_file(
         round_dp=round_dp,
         straight_slack=straight_slack,
         max_overshoot_ratio=max_overshoot_ratio,
+        snap_tol=snap_tol,
+        merge_layer_stack=merge_layer_stack,
         source_path=input_path,
     )
     _write_json(output_path, cleaned)
@@ -2530,6 +3105,8 @@ def _job_settings_from_cfg(job: dict, defaults: dict) -> dict:
         "corner_merge_tol",
         "uf_respect_barriers",
         "round_dp",
+        "snap_tol",
+        "merge_layer_stack",
         "attach_polygon_meta",
         "drop_line_kind",
         "output",
@@ -2637,6 +3214,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--snap-tol",
+        type=float,
+        default=None,
+        help=(
+            "Snap dual-curve samples onto creases/borders within this distance "
+            f"(mm; default {DEFAULT_SNAP_TOL:g}; 0 = off)"
+        ),
+    )
+    parser.add_argument(
         "--group-tol",
         type=float,
         default=None,
@@ -2661,6 +3247,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--uf-respect-barriers",
         action="store_true",
         help="Do not UF-merge pairs whose segment crosses a crease/border",
+    )
+    parser.add_argument(
+        "--merge-layer-stack",
+        action="store_true",
+        default=None,
+        help=(
+            "Per panel: merge ghost+physical layers into continuous "
+            "min→max height (default on)"
+        ),
+    )
+    parser.add_argument(
+        "--no-merge-layer-stack",
+        action="store_true",
+        help="Keep intermediate ghost/main layers separate (no Z-stack merge)",
     )
     parser.add_argument(
         "-o",
@@ -2712,6 +3312,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             cfg.get("max_overshoot_ratio", DEFAULT_MAX_OVERSHOOT_RATIO)
         ),
         "fabric_offset": float(cfg.get("fabric_offset", DEFAULT_FABRIC_OFFSET)),
+        "snap_tol": float(cfg.get("snap_tol", DEFAULT_SNAP_TOL)),
         "group_tol": float(_cfg_group),
         "corner_merge_tol": float(
             cfg.get("corner_merge_tol", cfg.get("group_tol", DEFAULT_GROUP_TOL))
@@ -2720,6 +3321,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             cfg.get("uf_respect_barriers", DEFAULT_UF_RESPECT_BARRIERS)
         ),
         "round_dp": int(cfg.get("round_dp", DEFAULT_ROUND_DP)),
+        "merge_layer_stack": bool(
+            cfg.get("merge_layer_stack", DEFAULT_MERGE_LAYER_STACK)
+        ),
         "attach_polygon_meta": bool(cfg.get("attach_polygon_meta", True)),
         "drop_line_kind": bool(cfg.get("drop_line_kind", True)),
         "output_dir": _resolve_output_dir(cfg.get("output_dir")),
@@ -2736,6 +3340,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg_defaults["max_overshoot_ratio"] = float(args.max_overshoot_ratio)
     if args.fabric_offset is not None:
         cfg_defaults["fabric_offset"] = float(args.fabric_offset)
+    if args.snap_tol is not None:
+        cfg_defaults["snap_tol"] = float(args.snap_tol)
     if args.group_tol is not None:
         cfg_defaults["group_tol"] = float(args.group_tol)
     elif args.corner_merge_tol is not None:
@@ -2750,6 +3356,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg_defaults["attach_polygon_meta"] = False
     if args.keep_line_kind:
         cfg_defaults["drop_line_kind"] = False
+    if args.no_merge_layer_stack:
+        cfg_defaults["merge_layer_stack"] = False
+    elif args.merge_layer_stack:
+        cfg_defaults["merge_layer_stack"] = True
     if args.output_dir is not None:
         cfg_defaults["output_dir"] = _resolve_output_dir(args.output_dir)
     if args.output is not None:
@@ -2791,6 +3401,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     settings["max_overshoot_ratio"] = float(args.max_overshoot_ratio)
                 if args.fabric_offset is not None:
                     settings["fabric_offset"] = float(args.fabric_offset)
+                if args.snap_tol is not None:
+                    settings["snap_tol"] = float(args.snap_tol)
                 if args.group_tol is not None:
                     settings["group_tol"] = float(args.group_tol)
                 elif args.corner_merge_tol is not None:
@@ -2805,6 +3417,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     settings["attach_polygon_meta"] = False
                 if args.keep_line_kind:
                     settings["drop_line_kind"] = False
+                if args.no_merge_layer_stack:
+                    settings["merge_layer_stack"] = False
+                elif args.merge_layer_stack:
+                    settings["merge_layer_stack"] = True
                 try:
                     in_path = _resolve_input(str(job["name"]))
                 except FileNotFoundError as exc:
@@ -2867,6 +3483,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 max_overshoot_ratio=float(
                     settings.get("max_overshoot_ratio", DEFAULT_MAX_OVERSHOOT_RATIO)
                 ),
+                snap_tol=float(settings.get("snap_tol", DEFAULT_SNAP_TOL)),
+                merge_layer_stack=bool(
+                    settings.get("merge_layer_stack", DEFAULT_MERGE_LAYER_STACK)
+                ),
             )
         except Exception as exc:
             print(f"[clean] FAILED {in_path}: {exc}", file=sys.stderr)
@@ -2876,6 +3496,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.quiet:
             fo = float(settings.get("fabric_offset", DEFAULT_FABRIC_OFFSET))
             gt = float(settings.get("group_tol", DEFAULT_GROUP_TOL))
+            st = float(settings.get("snap_tol", DEFAULT_SNAP_TOL))
+            mls = bool(settings.get("merge_layer_stack", DEFAULT_MERGE_LAYER_STACK))
+            mlog = report.get("merge_log") or {}
             print(
                 f"[clean] {os.path.basename(in_path)}: "
                 f"{report['n_in']} → {report['n_out']} "
@@ -2886,7 +3509,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"slack={float(settings.get('straight_slack', DEFAULT_STRAIGHT_SLACK)):g}, "
                 f"group_tol={gt:g}, "
                 f"round_dp={int(settings.get('round_dp', DEFAULT_ROUND_DP))}, "
-                f"fabric_offset={fo:g})"
+                f"snap_tol={st:g}, snapped={report.get('n_snapped_total', 0)}, "
+                f"fabric_offset={fo:g}, "
+                f"merge_layer_stack={mls}, "
+                f"panels_merged={mlog.get('n_panels_merged', 0)})"
             )
             for d in report["dropped"][:12]:
                 print(
@@ -2942,6 +3568,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             n_fab = len(report.get("fabric_log") or [])
             if n_fab > 12:
                 print(f"    ... +{n_fab - 12} more fabric")
+            for M in (mlog.get("panels") or [])[:12]:
+                print(
+                    f"    merge panel={M.get('panel')} "
+                    f"sources={M.get('n_sources')}→parts={M.get('n_parts')} "
+                    f"h=[{float(M.get('h_lo') or 0):g},{float(M.get('h_hi') or 0):g}] "
+                    f"phys={M.get('n_physical', '?')} ghost={M.get('n_ghost', '?')}"
+                    f"{' UNION_FAIL' if M.get('union_failed') else ''}"
+                )
+            n_m = len(mlog.get("panels") or [])
+            if n_m > 12:
+                print(f"    ... +{n_m - 12} more merge")
             print(f"[clean] wrote {out_path}")
 
         # Auto-visualize cleaned JSON (default on)

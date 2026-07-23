@@ -1,20 +1,29 @@
 """
 Interactive 3D explosion diagram for thick-panel origami trimming.
 
-Shows design-plane panel outlines and dual-curve shaded regions stacked at
-each thickness ``layer_h``, with an explosion slider that pulls layers apart
+Shows design-plane panel outlines and shaded/trim regions stacked at each
+thickness ``layer_h``, with an explosion slider that pulls layers apart
 along z. Drag to orbit / zoom with the mouse. Right sidebar: show/hide
 individual thickness layers (checkboxes + All / None).
 
-Each shaded (collided) region is tied to a **specific panel** and **layer**:
+Shaded geometry depends on the JSON type:
+  *-cleaned / export_meta.cleaned
+      → **final trim only** = purple fabric_ring (else cut_ring / coordinates)
+        i.e. the straight containing cut + fabrication outline from clean.py
+      → **merged region only** (no pre-merge ghost/intermediate layers)
+  *-trimmed / raw dual_curve
+      → existing dual-curve ribbon logic (c0+c1 fill)
+      → pre-merge layers + merged stack outline when present
+
+Each region is tied to a **specific panel** and **layer**:
   dual_curve_v1 fields: panel, unit, layer_h, layer_idx, side, unit_a/b
-  shell_kind: "physical" (real thick shell), "ghost" (collision-only intermediate),
-              or "side" (collision-only vertical band, unique panel index)
+  shell_kind: "physical" | "ghost" | "side"
   If panel/layer are missing (legacy JSON), they are inferred from geometry.
 
 Usage:
   python panel-trimming/visualize/visualize_3d.py
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed
+  python panel-trimming/visualize/visualize_3d.py --name miura-thick-cleaned
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --factor 2.5
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --collision-only
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --no-show -o out.png
@@ -58,6 +67,10 @@ ACTIVE_PANEL_FACE = "#f5c26b"
 ACTIVE_PANEL_EDGE = "#c47d1a"
 TRIM_FACE = "#e45756"
 TRIM_EDGE = "#a32020"
+# Final fabrication / clean cut (purple — matches 2D fabric outline)
+FABRIC_FACE = "#9b59b6"
+FABRIC_EDGE = "#6c3483"
+FABRIC_FACE_ALPHA = 0.55
 # Ghost intermediate shells (collision-only stack samples)
 GHOST_FACE = "#4c78a8"
 GHOST_EDGE = "#1f4e79"
@@ -309,10 +322,21 @@ def _collect_layer_heights(
         shades = list(trimmed.get("shaded_regions") or [])
         for offs in panel_thickness_offsets(units, base or trimmed, shades):
             heights.extend(offs)
-    # Always include every shade layer_h (parity with 2D subplots)
-    for sh in trimmed.get("shaded_regions") or []:
+    # Always include every shade layer_h (parity with 2D subplots).
+    # Prefer pre-merge layers so intermediate ghost heights stay in the stack.
+    for sh in _viz_shaded_regions(trimmed):
         if sh.get("layer_h") is not None:
-            heights.append(float(sh["layer_h"]))
+            try:
+                heights.append(float(sh["layer_h"]))
+            except (TypeError, ValueError):
+                pass
+        # Continuous merged span endpoints (if present)
+        for key in ("h_lo", "h_hi"):
+            if sh.get(key) is not None:
+                try:
+                    heights.append(float(sh[key]))
+                except (TypeError, ValueError):
+                    pass
     stats = trimmed.get("collision_stats") or {}
     for bucket_name in ("shaded_areas", "closed_polygons", "segments"):
         for ent in stats.get(bucket_name) or []:
@@ -382,6 +406,7 @@ def _infer_panel_from_poly(
 
 
 def _raw_shaded_regions(trimmed: dict) -> List[dict]:
+    """Export/STL regions: merged continuous solids when clean merged stacks."""
     regions = list(trimmed.get("shaded_regions") or [])
     if regions:
         return regions
@@ -389,8 +414,127 @@ def _raw_shaded_regions(trimmed: dict) -> List[dict]:
     return list(stats.get("shaded_regions") or stats.get("shaded_areas") or [])
 
 
-def _shade_poly_from_region(sh: dict) -> Optional[np.ndarray]:
-    """Polygon geometry — same sources as 2D visualize._entries_from_shaded_regions."""
+def _viz_shaded_regions(
+    trimmed: dict,
+    *,
+    cleaned: Optional[bool] = None,
+) -> List[dict]:
+    """
+    Regions for visualization.
+
+    *-cleaned / export_meta.cleaned:
+      Only ``shaded_regions`` (merged continuous min→max solids). Pre-merge
+      ghost/physical layers in ``shaded_regions_layers`` are omitted.
+
+    *-trimmed / raw:
+      When clean.py stored ``shaded_regions_layers`` (pre-merge ghost/main at
+      each layer_h), return those so every intermediate layer is drawn, and
+      append merged ``shaded_regions`` (layer_stack_merged) so the continuous
+      min→max solid outline is visible as well.
+    """
+    if cleaned is None:
+        cleaned = _is_cleaned_data(trimmed)
+    merged = list(trimmed.get("shaded_regions") or [])
+
+    # Cleaned: final export only — merged footprint, no ghost intermediate layers
+    if cleaned:
+        if merged:
+            out: List[dict] = []
+            for sh in merged:
+                m = dict(sh)
+                if sh.get("layer_stack_merged") or sh.get("h_lo") is not None:
+                    m["viz_merged_stack"] = True
+                out.append(m)
+            return out
+        stats = trimmed.get("collision_stats") or {}
+        return list(stats.get("shaded_regions") or stats.get("shaded_areas") or [])
+
+    layers = list(trimmed.get("shaded_regions_layers") or [])
+    if layers:
+        out = list(layers)
+        for sh in merged:
+            if sh.get("layer_stack_merged") or sh.get("h_lo") is not None:
+                # Tag for distinct draw style in 3D/2D
+                m = dict(sh)
+                m["viz_merged_stack"] = True
+                out.append(m)
+        return out
+    if merged:
+        return merged
+    stats = trimmed.get("collision_stats") or {}
+    return list(stats.get("shaded_regions") or stats.get("shaded_areas") or [])
+
+
+def _is_cleaned_data(
+    data: Optional[dict] = None,
+    *,
+    path: Optional[str] = None,
+    name: Optional[str] = None,
+) -> bool:
+    """True for clean.py outputs (*-cleaned / export_meta.cleaned)."""
+    if data and isinstance(data.get("export_meta"), dict):
+        if data["export_meta"].get("cleaned"):
+            return True
+    for label in (path, name):
+        if not label:
+            continue
+        stem = os.path.splitext(os.path.basename(str(label)))[0].lower()
+        if stem.endswith("-cleaned") or stem.endswith("_cleaned") or "cleaned" in stem:
+            return True
+    if data:
+        for sh in data.get("shaded_regions") or []:
+            if sh.get("fabric_ring") or sh.get("cut_ring") or sh.get("cut_kind"):
+                return True
+            break
+    return False
+
+
+def _shade_poly_from_region(
+    sh: dict,
+    *,
+    final_trim_only: bool = False,
+) -> Optional[np.ndarray]:
+    """
+    Polygon geometry for 3D fill.
+
+    final_trim_only (cleaned JSON):
+      - pre-merge layer → cut_ring first (geometric cut; fabric is outline only)
+      - merged stack / plain final trim → fabric_ring → cut_ring → coordinates
+    else (trimmed / raw):
+      dual-curve ribbon c0+c1, then legacy coordinate keys
+    """
+    if final_trim_only:
+        is_pre = bool(sh.get("pre_merge_layer"))
+        is_merged = bool(
+            sh.get("viz_merged_stack") or sh.get("layer_stack_merged")
+        )
+        if is_pre and not is_merged:
+            # Match 2D: fill = cut, fabric offset drawn separately as edge
+            keys = (
+                "cut_ring",
+                "coordinates",
+                "fabric_ring",
+                "shaded_polygon",
+                "paint_polygon",
+            )
+        else:
+            keys = (
+                "fabric_ring",
+                "cut_ring",
+                "coordinates",
+                "shaded_polygon",
+                "paint_polygon",
+            )
+        for key in keys:
+            raw = sh.get(key)
+            if raw and len(raw) >= 3:
+                return np.asarray(raw, dtype=float)[:, :2]
+        # Last resort if clean fields missing
+        c0, c1 = sh.get("c0") or [], sh.get("c1") or []
+        if c0 and c1:
+            return _ribbon_from_dual_curves(c0, c1)
+        return None
+
     c0, c1 = sh.get("c0") or [], sh.get("c1") or []
     if c0 and c1:
         poly = _ribbon_from_dual_curves(c0, c1)
@@ -403,35 +547,96 @@ def _shade_poly_from_region(sh: dict) -> Optional[np.ndarray]:
     return None
 
 
+def _fabric_poly_from_region(sh: dict) -> Optional[np.ndarray]:
+    """Optional fabrication-offset ring for edge overlay (cleaned)."""
+    raw = sh.get("fabric_ring")
+    if raw is not None and len(raw) >= 3:
+        return np.asarray(raw, dtype=float)[:, :2]
+    return None
+
+
+def _ring_side_faces(
+    poly_xy: np.ndarray,
+    z_lo: float,
+    z_hi: float,
+) -> List[np.ndarray]:
+    """Vertical wall quads for a closed XY ring between z_lo and z_hi."""
+    if poly_xy is None or len(poly_xy) < 2:
+        return []
+    z0, z1 = float(min(z_lo, z_hi)), float(max(z_lo, z_hi))
+    if z1 - z0 < 1e-12:
+        return []
+    faces: List[np.ndarray] = []
+    n = len(poly_xy)
+    for i in range(n):
+        x0, y0 = float(poly_xy[i, 0]), float(poly_xy[i, 1])
+        x1, y1 = float(poly_xy[(i + 1) % n, 0]), float(poly_xy[(i + 1) % n, 1])
+        faces.append(
+            np.asarray(
+                [
+                    [x0, y0, z0],
+                    [x1, y1, z0],
+                    [x1, y1, z1],
+                    [x0, y0, z1],
+                ],
+                dtype=float,
+            )
+        )
+    return faces
+
+
 def resolve_shaded_associations(
     trimmed: dict,
     units: Optional[Sequence] = None,
+    *,
+    final_trim_only: Optional[bool] = None,
+    for_viz: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Resolve each shaded/collided region to a concrete (panel, layer_h).
 
-    Geometry matches 2D visualize.py:
-      dual_curve ribbon from c0/c1, plus sweep_samples for stroke drawing.
+    Geometry:
+      cleaned  → final trim poly (fabric_ring / cut_ring) only
+      trimmed  → dual-curve ribbon (existing logic)
     Missing panel/layer fields are inferred when possible.
+
+    for_viz=True → for trimmed data, include pre-merge ``shaded_regions_layers``
+    plus merged stack outlines; for cleaned data, merged regions only (no ghosts).
     """
+    if final_trim_only is None:
+        final_trim_only = _is_cleaned_data(trimmed)
     base_units = list(units if units is not None else (trimmed.get("units") or []))
     panel_xy = [_poly_xy(u) for u in base_units] if base_units else []
     n_panels = len(base_units)
 
+    source = (
+        _viz_shaded_regions(trimmed, cleaned=bool(final_trim_only))
+        if for_viz
+        else _raw_shaded_regions(trimmed)
+    )
     records: List[Dict[str, Any]] = []
-    for idx, sh in enumerate(_raw_shaded_regions(trimmed)):
+    for idx, sh in enumerate(source):
         c0 = sh.get("c0") or []
         c1 = sh.get("c1") or []
-        poly = _shade_poly_from_region(sh)
+        poly = _shade_poly_from_region(sh, final_trim_only=bool(final_trim_only))
         # Closed ribbon only (no per-sample strokes — those make 3D laggy)
+        # Clean cuts are already sparse; skip heavy downsample
         if poly is not None and len(poly) >= 3:
-            poly = _simplify_closed_poly(poly, max_verts=48)
+            if final_trim_only:
+                if len(poly) > 64:
+                    poly = _simplify_closed_poly(poly, max_verts=32)
+            else:
+                poly = _simplify_closed_poly(poly, max_verts=48)
         area = sh.get("area")
         if area is None:
             area = _poly_area_xy(poly)
         kind = sh.get("kind") or sh.get("paint_kind") or (
             "sweep" if poly is not None and float(area or 0) > 1e-3 else "line"
         )
+        if final_trim_only and (
+            sh.get("fabric_ring") or sh.get("cut_ring") or sh.get("cut_kind")
+        ):
+            kind = "final_trim"
 
         # --- layer ---
         layer_h = sh.get("layer_h")
@@ -495,6 +700,11 @@ def resolve_shaded_associations(
             "depth_from_top_mm": sh.get("depth_from_top_mm"),
             "depth_from_bottom_mm": sh.get("depth_from_bottom_mm"),
             "stock_span_mm": sh.get("stock_span_mm"),
+            "pre_merge_layer": bool(sh.get("pre_merge_layer")),
+            "viz_merged_stack": bool(
+                sh.get("viz_merged_stack") or sh.get("layer_stack_merged")
+            ),
+            "layer_stack_merged": bool(sh.get("layer_stack_merged")),
             "side": sh.get("side"),
             "unit_a": sh.get("unit_a"),
             "unit_b": sh.get("unit_b"),
@@ -507,6 +717,8 @@ def resolve_shaded_associations(
             "layer_source": layer_source,
             "associated": panel is not None and layer_h is not None,
             "drawable": drawable,
+            "final_trim": bool(final_trim_only),
+            "has_fabric": bool(sh.get("fabric_ring")),
         }
         records.append(rec)
     return records
@@ -627,15 +839,21 @@ def association_report(
 def _shade_polys_by_layer(
     trimmed: dict,
     units: Optional[Sequence] = None,
+    *,
+    final_trim_only: Optional[bool] = None,
+    for_viz: bool = True,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Map layer_key → list of shade items (same dual-curve set as 2D).
+    Map layer_key → list of shade items.
 
-    Includes filled ribbons **and** line/stroke-only contacts so every
-    dual_curve export entry that 2D can show is present in 3D.
+    cleaned → final trim polys (fabric/cut), merged only (no ghosts)
+    trimmed → dual-curve ribbons (existing)
+    for_viz (default True) → trimmed: pre-merge layers + merged; cleaned: merged only
     """
     out: Dict[str, List[Dict[str, Any]]] = {}
-    for rec in resolve_shaded_associations(trimmed, units=units):
+    for rec in resolve_shaded_associations(
+        trimmed, units=units, final_trim_only=final_trim_only, for_viz=for_viz
+    ):
         lh = rec.get("layer_h")
         if lh is None:
             continue
@@ -915,13 +1133,18 @@ def build_explosion_scene(
     if not units:
         raise ValueError("No units in JSON — nothing to draw.")
 
-    shade_raw = list(trimmed.get("shaded_regions") or [])
+    # Cleaned JSON → final purple trim only; raw trimmed → dual-curve ribbons
+    final_trim_only = _is_cleaned_data(trimmed)
+    # Cleaned: merged regions only; trimmed: pre-merge layers when present
+    shade_raw = _viz_shaded_regions(trimmed, cleaned=final_trim_only)
     # Per-panel thickness offsets (true z of each thick layer for that panel)
     panel_offsets = panel_thickness_offsets(units, base, shade_raw)
     heights = _collect_layer_heights(
         trimmed, base, layers=layers, panel_offsets=panel_offsets
     )
-    shade_records = resolve_shaded_associations(trimmed, units=units)
+    shade_records = resolve_shaded_associations(
+        trimmed, units=units, final_trim_only=final_trim_only, for_viz=True
+    )
     # Validate shade layer_h against that panel's offsets; snap if needed
     for rec in shade_records:
         p, lh = rec.get("panel"), rec.get("layer_h")
@@ -936,7 +1159,9 @@ def build_explosion_scene(
             rec["offset_mismatch"] = True
         else:
             rec["offset_mismatch"] = False
-    shades = _shade_polys_by_layer(trimmed, units=units)
+    shades = _shade_polys_by_layer(
+        trimmed, units=units, final_trim_only=final_trim_only, for_viz=True
+    )
     lines3d = _lines_xyz(trimmed if trimmed.get("lines") else base, heights)
     if not lines3d and base is not trimmed:
         lines3d = _lines_xyz(base, heights)
@@ -954,6 +1179,7 @@ def build_explosion_scene(
         "n_total": len(shade_records),
         "panel_offsets": panel_offsets,
         "n_offset_mismatch": n_mismatch,
+        "final_trim_only": bool(final_trim_only),
     }
 
     # Bounds in xy
@@ -1124,16 +1350,31 @@ def build_explosion_scene(
                 ax.add_collection3d(coll)
                 state["collections"].append(coll)
 
-        # --- shaded: closed dual-curve polygons (phys=red, ghost=blue, side=green) ---
+        # --- shaded fills ---
+        # cleaned → purple final trim (fabric/cut); trimmed → dual-curve colors
         n_shade_vis = 0
         n_shade_ghost_vis = 0
         n_shade_side_vis = 0
         n_shade_phys_vis = 0
         if do_shades:
-            phys_rgb = to_rgb(TRIM_FACE)
-            phys_edge = to_rgb(TRIM_EDGE)
-            ghost_rgb = to_rgb(GHOST_FACE)
-            ghost_edge = to_rgb(GHOST_EDGE)
+            use_final_trim = bool(
+                state_assoc.get("final_trim_only")
+                or any(it.get("final_trim") for items in shades.values() for it in items)
+            )
+            if use_final_trim:
+                phys_rgb = to_rgb(FABRIC_FACE)
+                phys_edge = to_rgb(FABRIC_EDGE)
+                phys_alpha = FABRIC_FACE_ALPHA
+                ghost_rgb = to_rgb(FABRIC_FACE)
+                ghost_edge = to_rgb(FABRIC_EDGE)
+                ghost_alpha = FABRIC_FACE_ALPHA * 0.85
+            else:
+                phys_rgb = to_rgb(TRIM_FACE)
+                phys_edge = to_rgb(TRIM_EDGE)
+                phys_alpha = shade_alpha
+                ghost_rgb = to_rgb(GHOST_FACE)
+                ghost_edge = to_rgb(GHOST_EDGE)
+                ghost_alpha = shade_alpha
             side_rgb = to_rgb(SIDE_FACE)
             side_edge = to_rgb(SIDE_EDGE)
             # Sit almost on the panel (tiny lift only to avoid z-fighting)
@@ -1149,6 +1390,7 @@ def build_explosion_scene(
             phys_verts: List[np.ndarray] = []
             ghost_verts: List[np.ndarray] = []
             side_verts: List[np.ndarray] = []
+            merged_verts: List[np.ndarray] = []
             for key, items in shades.items():
                 try:
                     h = float(key)
@@ -1165,8 +1407,23 @@ def build_explosion_scene(
                     if float(item.get("area") or 0.0) < 1e-3:
                         continue
                     sk = _shell_kind_of(item)
-                    verts3 = _xy_to_verts3d(poly, z_bias)
-                    if sk == "ghost":
+                    is_merged = bool(
+                        item.get("viz_merged_stack") or item.get("layer_stack_merged")
+                    )
+                    # Cleaned: merged / final export only — no ghost or side ribbons
+                    if use_final_trim:
+                        if sk == "side":
+                            continue
+                        if sk == "ghost" and not is_merged:
+                            continue
+                        if item.get("pre_merge_layer") and not is_merged:
+                            continue
+                    # Merged stack sits slightly above its mid layer for clarity
+                    z_item = z_bias + (0.6 * z_lift if is_merged else 0.0)
+                    verts3 = _xy_to_verts3d(poly, z_item)
+                    if is_merged:
+                        merged_verts.append(verts3)
+                    elif sk == "ghost":
                         ghost_verts.append(verts3)
                     elif sk == "side":
                         side_verts.append(verts3)
@@ -1175,10 +1432,23 @@ def build_explosion_scene(
                     # Frame bounds from collision geometry (needed for collision-only)
                     xs_all.extend(poly[:, 0].tolist())
                     ys_all.extend(poly[:, 1].tolist())
-                    zs_all.append(z_bias)
+                    zs_all.append(z_item)
                     if show_shade_labels and item.get("panel") is not None:
                         c = poly.mean(axis=0)
-                        if sk == "ghost":
+                        if is_merged:
+                            hlo, hhi = item.get("h_lo"), item.get("h_hi")
+                            if hlo is not None and hhi is not None:
+                                tag = (
+                                    f"P{int(item['panel'])}·M"
+                                    f"[{float(hlo):g}→{float(hhi):g}]"
+                                )
+                            else:
+                                tag = f"P{int(item['panel'])}·M"
+                            tcolor = "#6a0dad"
+                        elif use_final_trim and not item.get("pre_merge_layer"):
+                            tag = f"P{int(item['panel'])}·T"
+                            tcolor = "#4a1a6a"
+                        elif sk == "ghost":
                             tag = f"P{int(item['panel'])}·G"
                             tcolor = "#0a2a5a"
                         elif sk == "side":
@@ -1188,7 +1458,7 @@ def build_explosion_scene(
                             tag = f"P{int(item['panel'])}"
                             tcolor = "#5a0a0a"
                         t = ax.text(
-                            float(c[0]), float(c[1]), z_bias,
+                            float(c[0]), float(c[1]), z_item,
                             tag,
                             color=tcolor,
                             fontsize=5.5, ha="center", va="center",
@@ -1198,13 +1468,19 @@ def build_explosion_scene(
             n_shade_phys_vis = len(phys_verts)
             n_shade_ghost_vis = len(ghost_verts)
             n_shade_side_vis = len(side_verts)
-            n_shade_vis = n_shade_phys_vis + n_shade_ghost_vis + n_shade_side_vis
+            n_shade_merged_vis = len(merged_verts)
+            n_shade_vis = (
+                n_shade_phys_vis
+                + n_shade_ghost_vis
+                + n_shade_side_vis
+                + n_shade_merged_vis
+            )
             if phys_verts:
                 coll = Poly3DCollection(
                     phys_verts,
-                    facecolors=[(*phys_rgb, shade_alpha)] * len(phys_verts),
+                    facecolors=[(*phys_rgb, phys_alpha)] * len(phys_verts),
                     edgecolors=[phys_edge] * len(phys_verts),
-                    linewidths=0.7,
+                    linewidths=0.9 if use_final_trim else 0.7,
                     zsort="average",
                 )
                 ax.add_collection3d(coll)
@@ -1212,14 +1488,28 @@ def build_explosion_scene(
             if ghost_verts:
                 coll = Poly3DCollection(
                     ghost_verts,
-                    facecolors=[(*ghost_rgb, shade_alpha)] * len(ghost_verts),
+                    facecolors=[(*ghost_rgb, ghost_alpha)] * len(ghost_verts),
                     edgecolors=[ghost_edge] * len(ghost_verts),
-                    linewidths=0.7,
+                    linewidths=0.9 if use_final_trim else 0.7,
                     zsort="average",
                 )
                 ax.add_collection3d(coll)
                 state["collections"].append(coll)
-            if side_verts:
+            if merged_verts:
+                # Continuous min→max merge outline (distinct from per-layer fills)
+                m_rgb = to_rgb(FABRIC_EDGE) if use_final_trim else to_rgb("#6a0dad")
+                m_face = (*m_rgb, 0.12)
+                m_edge = (*m_rgb, 0.95)
+                coll = Poly3DCollection(
+                    merged_verts,
+                    facecolors=[m_face] * len(merged_verts),
+                    edgecolors=[m_edge] * len(merged_verts),
+                    linewidths=1.6,
+                    zsort="average",
+                )
+                ax.add_collection3d(coll)
+                state["collections"].append(coll)
+            if side_verts and not use_final_trim:
                 coll = Poly3DCollection(
                     side_verts,
                     facecolors=[(*side_rgb, shade_alpha)] * len(side_verts),
@@ -1376,7 +1666,9 @@ def build_explosion_scene(
         n_shade = sum(len(v) for v in shades.values())
         n_ghost_all = sum(
             1 for items in shades.values()
-            for it in items if _shell_kind_of(it) == "ghost"
+            for it in items
+            if _shell_kind_of(it) == "ghost"
+            and not (it.get("viz_merged_stack") or it.get("layer_stack_merged"))
         )
         n_side_all = sum(
             1 for items in shades.values()
@@ -1384,7 +1676,14 @@ def build_explosion_scene(
         )
         n_phys_all = sum(
             1 for items in shades.values()
-            for it in items if _shell_kind_of(it) == "physical"
+            for it in items
+            if _shell_kind_of(it) == "physical"
+            and not (it.get("viz_merged_stack") or it.get("layer_stack_merged"))
+        )
+        n_merged_all = sum(
+            1 for items in shades.values()
+            for it in items
+            if it.get("viz_merged_stack") or it.get("layer_stack_merged")
         )
         n_assoc = state_assoc["n_associated"]
         n_tot = state_assoc["n_total"]
@@ -1405,6 +1704,7 @@ def build_explosion_scene(
             f"shades={n_shade_vis}/{n_shade} "
             f"(phys={n_shade_phys_vis}/{n_phys_all} "
             f"ghost={n_shade_ghost_vis}/{n_ghost_all} "
+            f"merged={n_shade_merged_vis if do_shades else 0}/{n_merged_all} "
             f"side={n_shade_side_vis}/{n_side_all})  "
             f"assoc {n_assoc}/{n_tot}  explosion={factor:.2f}",
             fontsize=11, pad=10,
@@ -1707,13 +2007,16 @@ def _run_one(
 
     units = list(trimmed.get("units") or (original or {}).get("units") or [])
     base = original or trimmed
+    final_trim_only = _is_cleaned_data(trimmed, path=trimmed_path, name=name)
     panel_offsets = panel_thickness_offsets(
         units, base, trimmed.get("shaded_regions") or []
     )
     heights = _collect_layer_heights(
         trimmed, base, layers=sim.get("layers"), panel_offsets=panel_offsets
     )
-    records = resolve_shaded_associations(trimmed, units=units)
+    records = resolve_shaded_associations(
+        trimmed, units=units, final_trim_only=final_trim_only
+    )
     for rec in records:
         p, lh = rec.get("panel"), rec.get("layer_h")
         if _shell_kind_of(rec) == "side":
@@ -1729,11 +2032,15 @@ def _run_one(
     n_ghost = sum(1 for r in records if _shell_kind_of(r) == "ghost")
     n_side = sum(1 for r in records if _shell_kind_of(r) == "side")
     n_phys = sum(1 for r in records if _shell_kind_of(r) == "physical")
+    n_drawable = sum(1 for r in records if r.get("drawable"))
     n_side_panels = len(trimmed.get("side_panels") or [])
+    mode = "final_trim(fabric/cut)" if final_trim_only else "dual_curve_ribbon"
     print(
         f"[explosion-3d] {os.path.basename(trimmed_path)}  "
+        f"mode={mode}  "
         f"thickness_offsets={heights}  units={len(units)}  "
-        f"shaded_regions={n_shade}  phys={n_phys} ghost={n_ghost} "
+        f"shaded_regions={n_shade}  drawable={n_drawable}  "
+        f"phys={n_phys} ghost={n_ghost} "
         f"side={n_side}  side_panels={n_side_panels}  "
         f"associated={n_ok}/{n_shade}"
     )
@@ -1751,6 +2058,8 @@ def _run_one(
         out_path = os.path.join(output_dir, f"{stem}{suffix}.png")
 
     title = os.path.basename(trimmed_path)
+    if final_trim_only:
+        title = f"{title} — final trim (purple)"
     if collision_only:
         title = f"{title} — collision only"
 

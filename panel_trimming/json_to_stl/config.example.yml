@@ -1,0 +1,24 @@
+# panel_trimming/json_to_stl config example
+#
+#   python panel_trimming/json_to_stl/run.py
+#   python panel_trimming/json_to_stl/run.py --name miura-thick-trimmed
+#
+# Pipeline (matches visualize_3d):
+#   1) panel outline from units[]
+#   2) stock Z from thickness offsets (non-border crease heights + shade layer_h)
+#   3) collision polys from resolve_shaded_associations (fabric/dual-curve)
+#   4) three extrusions:
+#        original  = panel stock
+#        collision = clean.py layer-stack merge (h_lo→h_hi) when present;
+#                    else min→max of sample layer_h
+#        final     = original − collision band
+#
+# Outputs: <stem>-original.stl, <stem>-collision.stl, <stem>-final.stl
+
+default_thickness: 6            # when panel has a single thickness offset
+# thickness: 6                  # force uniform thickness (optional)
+
+jobs:
+  - name: miura-thick-trimmed
+  # - name: miura-thick-cleaned
+  # - name: mountain-thick-trimmed
