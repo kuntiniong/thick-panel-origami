@@ -2,23 +2,30 @@
 Clean trimmed collision shades: drop collapsed paints, UF-clean nodes, cut, offset.
 
 Reads  panel_trimming/trimmedData/<name>-trimmed.json  (or a path)
-Writes panel_trimming/trimmedData/<name>-cleaned.json  (-trimmed → -cleaned suffix)
+Writes panel_trimming/trimmedData/<name>-cleaned.json  (-trimmed ΓåÆ -cleaned suffix)
 
 Pipeline (per kept shaded region):
   1) Snap dual-curve coords onto nearby crease / border segments
      (mountain, valley, border lines + host panel edges) when within snap_tol
-  2) Round all dual-curve coords to 6 d.p. (float noise → stable grouping)
+  2) Round all dual-curve coords to 6 d.p. (float noise ΓåÆ stable grouping)
   3) Union-Find group messy nodes (esp. vertex clouds) under custom
      constraints; keep the outermost node per cluster (farthest from the
-     region sample centroid — never the cluster mean)
+     region sample centroid ΓÇö never the cluster mean)
   4) Straight containing cut = convex hull of UF winners (panel-clipped),
      residual re-hull if any original sample is outside, optional RDP only
-     when containment is preserved → never undershoot shaded region
-  5) Manual fabrication offset outward from the step-4 polygon (barrier /
-     panel clamped)
-  6) Per panel: merge all ghost + physical layer stacks into one continuous
-     [min layer_h, max layer_h] footprint (no intermediate Z gaps).
-     Pre-merge layers kept as shaded_regions_layers for visualization.
+     when containment is preserved ΓåÆ never undershoot shaded region
+  5) Re-snap cut_ring vertices/edges onto creases (closes thin residual
+     walls left by simplify / UF when original ΓêÆ collision is applied)
+  6) Manual fabrication offset outward from the cut polygon (barrier /
+     panel clamped), then re-snap fabric_ring onto creases
+  7) Per panel: merge each stream into one solid prism (largest cleaned layer):
+       main    = physical + ghosts inside the physical shell span
+       support = support pads + ghosts outside that span (support-collision);
+                 Z expanded to abut physical stock
+     Same rule both streams: clean every layer, then extrude the single
+     largest-area cleaned ring from min→max layer_h (not multi-layer union).
+     Side ribbons unchanged. Pre-merge layers kept as shaded_regions_layers.
+     Merged rings are re-snapped onto creases after the prism merge.
 
 Also drops:
   - kind == "line"  (exporter collapsed-contact flag)
@@ -63,7 +70,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import yaml
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# panel_trimming/clean/ → panel_trimming → project root
+# panel_trimming/clean/ ΓåÆ panel_trimming ΓåÆ project root
 _PANEL_TRIM_DIR = os.path.dirname(_THIS_DIR)
 _PROJECT_ROOT = os.path.dirname(_PANEL_TRIM_DIR)
 if _PROJECT_ROOT not in sys.path:
@@ -83,7 +90,7 @@ COLLAPSED_AREA_EPS = 1e-6
 # Near-duplicate vertex eps when building hull / ring
 VERTEX_EPS = 1e-9
 # Max perpendicular deviation when simplifying dense convex hulls (design units).
-# Larger → fewer, longer straight edges (still containment-checked).
+# Larger ΓåÆ fewer, longer straight edges (still containment-checked).
 DEFAULT_CUT_TOL = 3.5
 # Small outward slack before simplify so aggressive straight cuts don't undershoot.
 # Clamped by panel / barriers; keeps overshoot modest.
@@ -92,7 +99,7 @@ DEFAULT_STRAIGHT_SLACK = 0.6
 DEFAULT_MAX_OVERSHOOT_RATIO = 1.35
 # Outward fabrication offset (design units / mm). 0 = off.
 DEFAULT_FABRIC_OFFSET = 0.0
-# line_features.type: mountain / valley / border — expansion may not cross these
+# line_features.type: mountain / valley / border ΓÇö expansion may not cross these
 TYPE_MOUNTAIN = 0
 TYPE_VALLEY = 1
 TYPE_BORDER = 2
@@ -107,11 +114,15 @@ DEFAULT_CORNER_MERGE_TOL = DEFAULT_GROUP_TOL
 DEFAULT_ROUND_DP = 6
 # Whether UF refuses to merge pairs whose segment crosses a crease/border
 DEFAULT_UF_RESPECT_BARRIERS = False
-# Snap dual-curve samples onto creases/borders if within this distance (mm).
-# 0 = off.
-DEFAULT_SNAP_TOL = 0.5
-# Per-panel: merge ghost + physical layer stacks into one continuous
-# [min layer_h, max layer_h] solid (no intermediate Z gaps).
+# Snap dual-curve samples / cut rings onto creases/borders if within this
+# distance (mm). 0 = off. Needs to cover the typical dual-curve inset so
+# original ΓêÆ collision does not leave a thin wall along the crease.
+DEFAULT_SNAP_TOL = 1.5
+# Edges nearly parallel to a crease (|cos| >= this) may be fully projected
+# onto that crease when their mean distance is within snap_tol.
+SNAP_EDGE_PARALLEL_COS = 0.97
+# Per-panel: merge ghost + physical (and separately support) layer stacks into
+# continuous [min layer_h, max layer_h] solids (no intermediate Z gaps).
 DEFAULT_MERGE_LAYER_STACK = True
 
 
@@ -188,9 +199,9 @@ def _resolve_input(name_or_path: str) -> str:
 
 def _cleaned_basename(input_path: str) -> str:
     """
-    mountain-thick-trimmed.json → mountain-thick-cleaned.json
-    mountain-thick.json         → mountain-thick-cleaned.json
-    mountain-thick-cleaned.json → mountain-thick-cleaned.json  (idempotent)
+    mountain-thick-trimmed.json ΓåÆ mountain-thick-cleaned.json
+    mountain-thick.json         ΓåÆ mountain-thick-cleaned.json
+    mountain-thick-cleaned.json ΓåÆ mountain-thick-cleaned.json  (idempotent)
     """
     base = os.path.basename(input_path)
     stem, ext = os.path.splitext(base)
@@ -421,8 +432,8 @@ def _dedupe_points(pts: Sequence, *, eps: float = VERTEX_EPS) -> List[List[float
 def convex_hull(pts: Sequence) -> List[List[float]]:
     """
     Convex hull (monotone chain), CCW, straight edges only.
-    Smallest convex set containing every input point → full red ribbon inside,
-    hull area ≥ ribbon area.
+    Smallest convex set containing every input point ΓåÆ full red ribbon inside,
+    hull area ΓëÑ ribbon area.
     """
     raw = _dedupe_points(pts)
     n = len(raw)
@@ -587,24 +598,136 @@ def snap_poly_to_segments(
     return out, n_snap
 
 
+def snap_closed_ring_to_creases(
+    ring: Sequence,
+    segments: Sequence[Tuple[Sequence, Sequence]],
+    *,
+    snap_tol: float,
+    parallel_cos: float = SNAP_EDGE_PARALLEL_COS,
+) -> Tuple[List[List[float]], int]:
+    """
+    Snap a closed cut/fabric ring tightly onto crease/border segments.
+
+    1) Vertex snap: each vertex within ``snap_tol`` of a segment is projected
+       onto that segment (exact on-crease, no barrier stop-eps pullback).
+    2) Edge attraction: if a ring edge is nearly parallel to a crease and
+       every sample along the edge is within ``snap_tol`` of that crease,
+       both endpoints are projected onto it so the whole edge sits on the
+       crease (closes thin residual walls after original ΓêÆ collision).
+
+    Returns (new_ring, n_vertices_moved).
+    """
+    tol = float(snap_tol)
+    raw = [_xy(p) for p in ring or []]
+    if tol <= 0 or len(raw) < 3 or not segments:
+        return raw, 0
+
+    out = [list(p) for p in raw]
+    n = len(out)
+    n_moved = 0
+
+    # Pass 1: vertex snap onto nearest barrier within tol
+    for i in range(n):
+        q, did, _ = snap_point_to_segments(out[i], segments, snap_tol=tol)
+        if did and _dist2(out[i], q) > 1e-24:
+            out[i] = q
+            n_moved += 1
+        elif did:
+            out[i] = q  # exact coincidence / float clean-up
+
+    # Pass 2: project near-parallel edges fully onto matching creases
+    cos_min = float(parallel_cos)
+    for i in range(n):
+        a = out[i]
+        b = out[(i + 1) % n]
+        ex = float(b[0]) - float(a[0])
+        ey = float(b[1]) - float(a[1])
+        el = math.hypot(ex, ey)
+        if el < 1e-12:
+            continue
+        ux, uy = ex / el, ey / el
+        best: Optional[Tuple[float, Sequence, Sequence]] = None
+        for sa, sb in segments:
+            sx = float(sb[0]) - float(sa[0])
+            sy = float(sb[1]) - float(sa[1])
+            sl = math.hypot(sx, sy)
+            if sl < 1e-12:
+                continue
+            sux, suy = sx / sl, sy / sl
+            if abs(ux * sux + uy * suy) < cos_min:
+                continue
+            # Sample edge; require all samples within tol of this segment
+            ds: List[float] = []
+            ok = True
+            for k in range(5):
+                t = k / 4.0
+                p = [float(a[0]) + t * ex, float(a[1]) + t * ey]
+                _, d = _project_point_to_segment(p, sa, sb)
+                if d > tol + 1e-12:
+                    ok = False
+                    break
+                ds.append(d)
+            if not ok or not ds:
+                continue
+            mean_d = sum(ds) / len(ds)
+            if best is None or mean_d < best[0]:
+                best = (mean_d, sa, sb)
+        if best is None:
+            continue
+        _, sa, sb = best
+        qa, _ = _project_point_to_segment(a, sa, sb)
+        qb, _ = _project_point_to_segment(b, sa, sb)
+        if math.hypot(qb[0] - qa[0], qb[1] - qa[1]) < 1e-12:
+            continue
+        if _dist2(out[i], qa) > 1e-24:
+            n_moved += 1
+        if _dist2(out[(i + 1) % n], qb) > 1e-24:
+            n_moved += 1
+        out[i] = qa
+        out[(i + 1) % n] = qb
+
+    # Drop near-duplicates introduced by projecting both ends of short edges
+    cleaned: List[List[float]] = []
+    for p in out:
+        if not cleaned or _dist2(cleaned[-1], p) > VERTEX_EPS * VERTEX_EPS:
+            cleaned.append(list(p))
+    if (
+        len(cleaned) >= 2
+        and _dist2(cleaned[0], cleaned[-1]) <= VERTEX_EPS * VERTEX_EPS
+    ):
+        cleaned = cleaned[:-1]
+    if len(cleaned) < 3:
+        return raw, 0
+    if _poly_signed_area(cleaned) < 0:
+        cleaned = list(reversed(cleaned))
+    return cleaned, int(n_moved)
+
+
 def snap_region_to_creases(
     region: dict,
     data: Optional[dict],
     *,
     snap_tol: float = DEFAULT_SNAP_TOL,
+    rings_only: bool = False,
 ) -> Dict[str, Any]:
     """
-    In-place: snap dual-curve / residual poly coords onto nearby creases.
+    In-place: snap dual-curve and/or cut/fabric rings onto nearby creases.
 
     Targets: mountain, valley, and border line segments from the design, plus
     the host panel outline edges (same set as barrier segments).
+
+    When ``rings_only`` is True, only closed export rings (cut/fabric/
+    coordinates/clean_ring) are edge-attracted onto creases ΓÇö used after the
+    straight cut / fabric offset / merge so simplify cannot leave a thin gap.
     """
     tol = float(snap_tol)
     info: Dict[str, Any] = {
         "snap_tol": tol,
         "n_snapped": 0,
         "n_points": 0,
+        "n_ring_moved": 0,
         "skipped": False,
+        "rings_only": bool(rings_only),
     }
     if tol <= 0:
         info["skipped"] = True
@@ -619,23 +742,43 @@ def snap_region_to_creases(
 
     n_snap = 0
     n_pts = 0
-    for key in ("c0", "c1", "coordinates", "cut_ring", "fabric_ring", "clean_ring"):
+    n_ring_moved = 0
+
+    if not rings_only:
+        for key in ("c0", "c1"):
+            raw = region.get(key)
+            if not raw:
+                continue
+            snapped, k = snap_poly_to_segments(raw, segs, snap_tol=tol)
+            region[key] = snapped
+            n_snap += k
+            n_pts += len(snapped)
+
+    # Closed rings: vertex snap + near-parallel edge attraction
+    ring_keys = ("cut_ring", "fabric_ring", "coordinates", "clean_ring")
+    if not rings_only:
+        # Early pipeline may only have residual coordinates
+        ring_keys = ("coordinates", "cut_ring", "fabric_ring", "clean_ring")
+
+    for key in ring_keys:
         raw = region.get(key)
-        if not raw:
+        if not raw or len(raw) < 3:
             continue
-        snapped, k = snap_poly_to_segments(raw, segs, snap_tol=tol)
+        snapped, k = snap_closed_ring_to_creases(raw, segs, snap_tol=tol)
         region[key] = snapped
-        n_snap += k
+        n_ring_moved += k
         n_pts += len(snapped)
+        n_snap += k
 
     info["n_snapped"] = int(n_snap)
     info["n_points"] = int(n_pts)
+    info["n_ring_moved"] = int(n_ring_moved)
     info["n_segments"] = len(segs)
     return info
 
 
 def _rdp_indices_open(pts: Sequence, eps: float) -> List[int]:
-    """Douglas–Peucker keep indices for an open polyline."""
+    """DouglasΓÇôPeucker keep indices for an open polyline."""
     n = len(pts) if pts is not None else 0
     if n <= 0:
         return []
@@ -681,7 +824,7 @@ def simplify_closed_polygon(
     start = min(range(n), key=lambda i: (raw[i][0], raw[i][1]))
     rot = raw[start:] + raw[:start]
     # Open polyline = full cycle without duplicating start at end for RDP,
-    # but we need to close: RDP the chain rot[0]..rot[-1] then connect last→first.
+    # but we need to close: RDP the chain rot[0]..rot[-1] then connect lastΓåÆfirst.
     # Use rot + [rot[0]] as open path of length n+1, RDP, drop duplicate end.
     path = rot + [rot[0]]
     idxs = _rdp_indices_open(path, float(tol))
@@ -827,7 +970,7 @@ def max_expand_scale_along_ray(
     Largest scale s for V' = C + s*(V-C) that does not cross a barrier.
 
     Original vertex is s=1. Any barrier hit with s >= 1 (including a vertex
-    already sitting on a border) caps expansion — previously only s>1 was
+    already sitting on a border) caps expansion ΓÇö previously only s>1 was
     capped, so border vertices got s_lim=inf and expanded past the wall.
     """
     cx, cy = float(c[0]), float(c[1])
@@ -842,7 +985,7 @@ def max_expand_scale_along_ray(
         if s_hit is None:
             continue
         # Cap at barrier on or beyond the vertex (s >= 1). Also pull back if
-        # the barrier lies between C and V (s in (0,1)) — vertex already past wall.
+        # the barrier lies between C and V (s in (0,1)) ΓÇö vertex already past wall.
         if s_hit > 1e-9:
             s_cap = min(s_cap, s_hit)
 
@@ -858,8 +1001,8 @@ def _clip_poly_by_edge(
     b: Sequence,
 ) -> List[List[float]]:
     """
-    Sutherland–Hodgman: clip subject polygon to the half-plane left of directed
-    edge A→B (points with cross(B-A, P-A) >= 0 kept).
+    SutherlandΓÇôHodgman: clip subject polygon to the half-plane left of directed
+    edge AΓåÆB (points with cross(B-A, P-A) >= 0 kept).
     """
     if not subject:
         return []
@@ -875,7 +1018,7 @@ def _clip_poly_by_edge(
         qx, qy = float(q[0]), float(q[1])
         dx, dy = qx - px, qy - py
         # p + t (q-p) on line a + u (b-a)
-        # (p-a) × e + t (d × e) = 0
+        # (p-a) ├ù e + t (d ├ù e) = 0
         denom = dx * ey - dy * ex
         if abs(denom) < 1e-14:
             return _xy(q)
@@ -1035,7 +1178,7 @@ def expand_polygon_to_contain(
         lab = math.hypot(dx, dy)
         if lab < 1e-15:
             return _xy(origin)
-        # scale s in [0,1] along origin→target
+        # scale s in [0,1] along originΓåÆtarget
         s_cap = 1.0
         for a, b in bars:
             s_hit = _ray_hit_segment_scale(origin, (dx, dy), a, b)
@@ -1077,8 +1220,8 @@ def expand_polygon_to_contain(
             a, b = cur[best_i], cur[(best_i + 1) % n]
             ex, ey = float(b[0]) - float(a[0]), float(b[1]) - float(a[1])
             el = math.hypot(ex, ey) or 1.0
-            # outward normal for CCW poly = right-to-left rotate → (-ey, ex)? 
-            # CCW edge A→B, interior left, outward = (ey, -ex) / el
+            # outward normal for CCW poly = right-to-left rotate ΓåÆ (-ey, ex)? 
+            # CCW edge AΓåÆB, interior left, outward = (ey, -ex) / el
             nx, ny = ey / el, -ex / el
             # Ensure outward points away from centroid
             mx = 0.5 * (float(a[0]) + float(b[0]))
@@ -1131,7 +1274,7 @@ def drop_near_collinear(
 ) -> List[List[float]]:
     """
     Closed-polygon pass: drop intermediate verts whose deviation from the
-    neighbour chord is ≤ max_dev (handles near-collinear hull runs on convex
+    neighbour chord is Γëñ max_dev (handles near-collinear hull runs on convex
     sides that RDP already mostly cleaned).
     """
     raw = [_xy(p) for p in pts or []]
@@ -1276,11 +1419,11 @@ def inflate_polygon_slack(
     info["area_out"] = a1
     # Containment: inflated poly must still hold samples (should; outward)
     if samples and not _all_samples_inside(expanded, samples, eps=1e-4):
-        # Rare numerical case — keep original
+        # Rare numerical case ΓÇö keep original
         return [list(p) for p in raw], {**info, "reverted": True, "reason": "lost_samples"}
 
     if a0 > 1e-9 and a1 > a0 * float(max_area_ratio):
-        # Too much overshoot — try half slack once
+        # Too much overshoot ΓÇö try half slack once
         half = float(slack) * 0.5
         if half > 1e-12:
             mid, minfo = offset_polygon_outward(
@@ -1352,7 +1495,7 @@ def straight_containing_cut(
     Pipeline:
       1) Convex hull of dual-curve samples (UF winners + all samples)
       2) Small outward ``straight_slack`` (barrier/panel clamped) so simplify
-         has room — fewer long straight edges without cutting into the shade
+         has room ΓÇö fewer long straight edges without cutting into the shade
       3) Containment-preserving simplify (RDP + greedy flat-vertex drop)
          with forgiving ``tol``; reject any candidate that loses a sample
       4) Cap overshoot via ``max_overshoot_ratio`` vs hull area
@@ -1436,7 +1579,7 @@ def straight_containing_cut(
     hull_a = _polygon_area_2d(hull) if len(hull) >= 3 else 0.0
     cut = [list(p) for p in hull]
 
-    # Degenerate projected hull → full unclipped sample hull
+    # Degenerate projected hull ΓåÆ full unclipped sample hull
     if hull_a < max(1e-4, 0.05 * max(ribbon_a, 1e-9)) and must_contain_all:
         full_all = convex_hull(must_contain_all)
         fa = _polygon_area_2d(full_all) if len(full_all) >= 3 else 0.0
@@ -1498,7 +1641,7 @@ def straight_containing_cut(
                 continue
             sa = _polygon_area_2d(simp)
             if sa > base_area * float(max_overshoot_ratio) * 1.15:
-                # Simplified shape grew too much relative to hull — skip
+                # Simplified shape grew too much relative to hull ΓÇö skip
                 continue
             if len(simp) < best_n:
                 best = simp
@@ -1589,7 +1732,7 @@ def straight_containing_cut(
 
 
 # ---------------------------------------------------------------------------
-# Union-Find: group messy nodes → outermost representative
+# Union-Find: group messy nodes ΓåÆ outermost representative
 # ---------------------------------------------------------------------------
 
 def _segments_properly_intersect(
@@ -1663,11 +1806,11 @@ def group_nodes_outermost(
     """
     Union-Find cluster of near-coincident / messy nodes; one outermost each.
 
-    Clustering is **complete-linkage** (cluster diameter ≤ tol) so dense dual-
+    Clustering is **complete-linkage** (cluster diameter Γëñ tol) so dense dual-
     curve chains do not collapse into one giant component.
 
     **Outermost** = member maximizing squared distance to the *global* sample
-    centroid ``origin`` (default: mean of all input points — not the cluster
+    centroid ``origin`` (default: mean of all input points ΓÇö not the cluster
     mean). Ties: higher x, then higher y.
 
     Rationale: tip clouds at outer vertices should collapse to the true extreme
@@ -1788,7 +1931,7 @@ def collapse_nodes_keep_outermost(
     barriers: Optional[Sequence[Tuple[Sequence, Sequence]]] = None,
     respect_barriers: bool = False,
 ) -> List[List[float]]:
-    """Backward-compatible wrapper → :func:`group_nodes_outermost`."""
+    """Backward-compatible wrapper ΓåÆ :func:`group_nodes_outermost`."""
     out, _ = group_nodes_outermost(
         pts,
         tol=tol,
@@ -1813,7 +1956,7 @@ def apply_straight_containing_cut(
     max_overshoot_ratio: float = DEFAULT_MAX_OVERSHOOT_RATIO,
 ) -> Dict[str, Any]:
     """
-    In-place: round → UF outermost samples → straight containing cut.
+    In-place: round ΓåÆ UF outermost samples ΓåÆ straight containing cut.
 
     Keeps original dual curves (rounded) as c0/c1 for trails / clean_ring.
     Cut is a few long straight edges containing the shade (never undershoot).
@@ -1923,7 +2066,7 @@ def apply_straight_containing_cut(
         )
 
     if contain_check and _n_out_check(cut, contain_check) > 0:
-        # Force containment: hull of cut ∪ samples, then re-simplify only if safe
+        # Force containment: hull of cut Γê¬ samples, then re-simplify only if safe
         fixed = convex_hull(
             _round_poly(list(cut) + list(contain_check), dp=round_dp)
         )
@@ -1994,11 +2137,11 @@ def apply_straight_containing_cut(
 # ---------------------------------------------------------------------------
 
 def _edge_outward_normal(a: Sequence, b: Sequence, *, ccw: bool) -> Tuple[float, float]:
-    """Unit outward normal for directed edge A→B (poly CCW ⇒ outward = right)."""
+    """Unit outward normal for directed edge AΓåÆB (poly CCW ΓçÆ outward = right)."""
     ex = float(b[0]) - float(a[0])
     ey = float(b[1]) - float(a[1])
     el = math.hypot(ex, ey) or 1.0
-    # CCW: left of edge is interior → outward = (ey, -ex) / el
+    # CCW: left of edge is interior ΓåÆ outward = (ey, -ex) / el
     # CW: flip
     nx, ny = ey / el, -ex / el
     if not ccw:
@@ -2021,7 +2164,7 @@ def offset_polygon_outward(
       - ray toward the offset target stops before creases / borders
       - result is hard-clipped to the host panel
 
-    Positive distance = grow outward. Zero / negative → no-op copy.
+    Positive distance = grow outward. Zero / negative ΓåÆ no-op copy.
     """
     raw = _ensure_ccw(poly)
     n = len(raw)
@@ -2077,11 +2220,11 @@ def offset_polygon_outward(
         bx, by = n0[0] + n1[0], n0[1] + n1[1]
         bl = math.hypot(bx, by)
         if bl < 1e-12:
-            # nearly opposite normals — fall back to n1
+            # nearly opposite normals ΓÇö fall back to n1
             bx, by = n1[0], n1[1]
             bl = math.hypot(bx, by) or 1.0
         bx, by = bx / bl, by / bl
-        # miter length so offset distance along edge normals ≈ d
+        # miter length so offset distance along edge normals Γëê d
         cos_a = max(0.15, min(1.0, n1[0] * bx + n1[1] * by))
         miter = d / cos_a
         target = [raw[i][0] + bx * miter, raw[i][1] + by * miter]
@@ -2129,10 +2272,10 @@ def apply_fabric_offset(
     (never undershoot the shade). Keeps long straight edges.
 
     Stores:
-      fabric_ring      — offset polygon (straight, containing)
-      fabric_offset    — requested distance
-      cut_ring         — geometric cut (unchanged if already set)
-      coordinates      — set to fabric_ring when offset > 0 (export paint)
+      fabric_ring      ΓÇö offset polygon (straight, containing)
+      fabric_offset    ΓÇö requested distance
+      cut_ring         ΓÇö geometric cut (unchanged if already set)
+      coordinates      ΓÇö set to fabric_ring when offset > 0 (export paint)
     """
     d = float(offset)
     if d <= 1e-12:
@@ -2237,7 +2380,7 @@ def apply_fabric_offset(
     if len(fab) >= 3 and _poly_signed_area(fab) < 0:
         fab = list(reversed(fab))
 
-    # Drop near-duplicates only (tiny tol) — keep real corners
+    # Drop near-duplicates only (tiny tol) ΓÇö keep real corners
     if len(fab) > 3:
         fab_d = _dedupe_points(fab, eps=max(1e-6, 10 ** (-int(round_dp))))
         if len(fab_d) >= 3 and _n_out(fab_d, must) == 0:
@@ -2262,8 +2405,8 @@ def apply_fabric_offset(
 def attach_closed_polygon_meta(region: dict) -> None:
     """
     Attach:
-      clean_ring  — all dual-curve sample nodes (for blue/yellow node viz)
-      clean_edges — straight edges of the containing cut (hull) when present,
+      clean_ring  ΓÇö all dual-curve sample nodes (for blue/yellow node viz)
+      clean_edges ΓÇö straight edges of the containing cut (hull) when present,
                     else dual-curve ring edges
     """
     c0 = region.get("c0") or []
@@ -2354,12 +2497,16 @@ def _refresh_collision_stats(data: dict, regions: Sequence[dict]) -> None:
     n_ghost = sum(
         1 for r in regions if str(r.get("shell_kind") or "").lower() == "ghost"
     )
+    n_support = sum(
+        1 for r in regions if str(r.get("shell_kind") or "").lower() == "support"
+    )
     n_side = sum(
         1 for r in regions if str(r.get("shell_kind") or "").lower() == "side"
     )
     n_phys = sum(
         1 for r in regions
-        if str(r.get("shell_kind") or "").lower() not in ("ghost", "side")
+        if str(r.get("shell_kind") or "").lower()
+        not in ("ghost", "side", "support")
     )
     n_merged = sum(1 for r in regions if r.get("layer_stack_merged"))
     stats["schema"] = stats.get("schema") or "dual_curve_v1"
@@ -2369,13 +2516,19 @@ def _refresh_collision_stats(data: dict, regions: Sequence[dict]) -> None:
     stats["n_closed_polygons"] = n_sweep
     stats["n_physical_regions"] = n_phys
     stats["n_ghost_regions"] = n_ghost
+    stats["n_support_regions"] = n_support
     stats["n_side_regions"] = n_side
     stats["n_layer_stack_merged"] = n_merged
     stats["shaded_regions_key"] = "shaded_regions"
 
 
 # ---------------------------------------------------------------------------
-# Per-panel layer-stack merge (ghost + physical → continuous min→max Z)
+# Per-panel layer-stack merge
+#   main    = physical + in-span ghost  → largest-layer solid prism
+#   support = support pads + out-of-span ghost → largest-layer solid prism
+#             (Z expanded to abut physical stock)
+# Both: clean each layer, then ONE prism from the single largest cleaned ring
+# extruded min→max layer_h (not a multi-layer 2D union).
 # ---------------------------------------------------------------------------
 
 def _shell_kind_of_region(region: Optional[dict]) -> str:
@@ -2387,9 +2540,313 @@ def _shell_kind_of_region(region: Optional[dict]) -> str:
     s = str(raw).strip().lower()
     if s in ("ghost", "g", "intermediate", "collision_only"):
         return "ghost"
+    if s in ("support", "sup", "pad", "filler"):
+        return "support"
     if s in ("side", "s", "vertical", "side_ribbon"):
         return "side"
     return "physical"
+
+
+def _panel_phys_spans_from_data(
+    data: Optional[dict],
+) -> Dict[int, Tuple[float, float]]:
+    """
+    Per design-panel physical shell Z span from crease heights only.
+
+    Matches ``collision.py`` / ``collect_support_panel_slabs`` membership.
+    Used to expand support-collision prisms so they abut the physical stock.
+    """
+    if not data:
+        return {}
+    try:
+        from panel_trimming.visualize.visualize_3d import (  # noqa: WPS433
+            panel_thickness_offsets,
+        )
+        offs = panel_thickness_offsets(
+            list(data.get("units") or []), data, shaded_regions=None
+        )
+    except Exception:
+        offs = []
+    out: Dict[int, Tuple[float, float]] = {}
+    for pi, hs in enumerate(offs or []):
+        if not hs:
+            continue
+        try:
+            vals = [float(h) for h in hs]
+        except (TypeError, ValueError):
+            continue
+        if not vals:
+            continue
+        out[int(pi)] = (float(min(vals)), float(max(vals)))
+    return out
+
+
+def _merge_stream_of(
+    region: Optional[dict],
+    *,
+    phys_span: Optional[Tuple[float, float]] = None,
+) -> str:
+    """
+    Which merge bucket a cleaned collision shade belongs to.
+
+    - support pads → support
+    - side → left alone
+    - physical → main
+    - ghost inside physical shell span → main
+    - ghost strictly outside physical shell span → support
+      (those samples live in the support-stock Z band; they must form the
+      support-collision prism, not a main prism that never hits original stock)
+    """
+    sk = _shell_kind_of_region(region)
+    if sk == "support":
+        return "support"
+    if sk == "side":
+        return "side"
+    if sk == "ghost" and phys_span is not None:
+        h = _region_layer_h(region) if region else None
+        if h is not None:
+            p_lo, p_hi = float(phys_span[0]), float(phys_span[1])
+            if float(h) < p_lo - 1e-9 or float(h) > p_hi + 1e-9:
+                return "support"
+    return "main"
+
+
+# When sample max/min is within this of a physical shell face, snap the prism
+# end onto that face so stock − collision does not leave a hairline slab.
+DEFAULT_Z_FACE_SNAP_MM = 1.0
+# Outward seal of the largest-layer prism footprint (mm) after merge so the
+# cut reaches creases (kills ~0.05–0.2 mm thin walls along mountain/valley).
+DEFAULT_PRISM_CREASE_SEAL_MM = 0.35
+
+
+def _expand_support_z_to_phys(
+    h_lo: float,
+    h_hi: float,
+    phys_span: Optional[Tuple[float, float]],
+) -> Tuple[float, float]:
+    """
+    Expand support-collision Z so the prism fills the support stock band.
+
+    Support stock tightly abuts physical: below → […, phys_lo], above →
+    [phys_hi, …]. A lone support sample at one height becomes a real solid
+    prism, same idea as the main ghost continuous stack.
+    """
+    if phys_span is None:
+        return float(h_lo), float(h_hi)
+    p_lo, p_hi = float(phys_span[0]), float(phys_span[1])
+    lo, hi = float(h_lo), float(h_hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    # Entirely at or below the physical bottom face → extend up to phys_lo
+    if hi <= p_lo + 1e-9:
+        return lo, p_lo
+    # Entirely at or above the physical top face → extend down to phys_hi
+    if lo >= p_hi - 1e-9:
+        return p_hi, hi
+    return lo, hi
+
+
+def _snap_stream_z_to_phys_faces(
+    h_lo: float,
+    h_hi: float,
+    phys_span: Optional[Tuple[float, float]],
+    *,
+    face_snap_mm: float = DEFAULT_Z_FACE_SNAP_MM,
+) -> Tuple[float, float]:
+    """
+    Snap prism Z ends onto physical shell faces when they nearly reach them.
+
+    Kills super-thin residual walls at the bottom/top of the stock when the
+    last ghost sample stops ~0.2 mm short of the shell height (e.g. −3.2 vs −3).
+    """
+    if phys_span is None:
+        return float(h_lo), float(h_hi)
+    p_lo, p_hi = float(phys_span[0]), float(phys_span[1])
+    lo, hi = float(h_lo), float(h_hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    tol = max(float(face_snap_mm), 0.0)
+    # Only when the prism already overlaps the physical band
+    if hi < p_lo - 1e-12 or lo > p_hi + 1e-12:
+        return lo, hi
+    if lo <= p_lo + tol:
+        lo = min(lo, p_lo)
+    if hi >= p_hi - tol:
+        hi = max(hi, p_hi)
+    return lo, hi
+
+
+def _region_ring_for_merge(region: dict, *, prefer_fabric: bool) -> List[List[float]]:
+    """Cleaned cut/fabric ring for one layer (export priority)."""
+    if prefer_fabric:
+        keys = ("fabric_ring", "cut_ring", "coordinates", "clean_ring")
+    else:
+        keys = ("cut_ring", "fabric_ring", "coordinates", "clean_ring")
+    for key in keys:
+        raw = region.get(key)
+        if raw is not None and len(raw) >= 3:
+            return [_xy(p) for p in raw]
+    return _region_export_ring(region)
+
+
+def _panel_outline_xy(data: Optional[dict], panel_idx: Optional[int]) -> List[List[float]]:
+    """Design-panel outline ring for a unit index."""
+    if data is None or panel_idx is None:
+        return []
+    units = list(data.get("units") or [])
+    try:
+        pi = int(panel_idx)
+    except (TypeError, ValueError):
+        return []
+    if pi < 0 or pi >= len(units):
+        return []
+    unit = units[pi]
+    if not unit or len(unit) < 3:
+        return []
+    ring = [_xy(p) for p in unit]
+    # Drop duplicate close
+    if len(ring) >= 2:
+        a, b = ring[0], ring[-1]
+        if abs(float(a[0]) - float(b[0])) < 1e-12 and abs(float(a[1]) - float(b[1])) < 1e-12:
+            ring = ring[:-1]
+    return ring if len(ring) >= 3 else []
+
+
+def _seal_merged_prism_to_creases(
+    region: dict,
+    data: Optional[dict],
+    *,
+    amount: float = DEFAULT_PRISM_CREASE_SEAL_MM,
+    round_dp: int = DEFAULT_ROUND_DP,
+    snap_tol: float = DEFAULT_SNAP_TOL,
+) -> bool:
+    """
+    Slightly inflate the merged prism footprint and re-snap onto creases.
+
+    Closes hairline gaps (~0.05–0.2 mm) between the largest-layer ring and
+    mountain/valley edges so stock − collision leaves no super-thin wall.
+    Clamped to the host panel outline.
+    """
+    d = float(amount)
+    if d <= 1e-12:
+        return False
+    prefer_fabric = bool(region.get("fabric_ring"))
+    ring = _region_ring_for_merge(region, prefer_fabric=prefer_fabric)
+    if len(ring) < 3:
+        return False
+
+    panel_xy = _panel_outline_xy(data, region.get("panel"))
+    sealed: Optional[List[List[float]]] = None
+    try:
+        from shapely.geometry import Polygon as _ShPoly
+        from shapely.validation import make_valid as _make_valid
+    except Exception:
+        sealed = None
+    else:
+        try:
+            g = _ShPoly(ring)
+            if g.is_empty:
+                return False
+            if not g.is_valid:
+                try:
+                    g = g.buffer(0)
+                except Exception:
+                    g = _make_valid(g)
+            g = g.buffer(d, join_style=2, mitre_limit=5.0)
+            if panel_xy and len(panel_xy) >= 3:
+                try:
+                    panel = _ShPoly(panel_xy)
+                    if not panel.is_valid:
+                        panel = panel.buffer(0)
+                    inter = g.intersection(panel)
+                    if inter is not None and not inter.is_empty:
+                        g = inter
+                except Exception:
+                    pass
+            # Largest exterior part
+            best = None
+            best_a = -1.0
+            gt = getattr(g, "geom_type", "")
+            cands = []
+            if gt == "Polygon":
+                cands = [g]
+            elif gt == "MultiPolygon":
+                cands = list(g.geoms)
+            else:
+                cands = list(getattr(g, "geoms", []) or [])
+            for p in cands:
+                if getattr(p, "geom_type", "") != "Polygon":
+                    continue
+                a = float(getattr(p, "area", 0.0) or 0.0)
+                if a > best_a:
+                    best_a = a
+                    best = p
+            if best is None:
+                return False
+            coords = list(best.exterior.coords)
+            sealed = _round_poly(
+                coords[:-1] if len(coords) > 1 else coords, dp=round_dp
+            )
+            sealed = _dedupe_points(sealed, eps=10 ** (-int(round_dp)))
+            if len(sealed) < 3:
+                return False
+            if _polygon_area_2d(sealed) < 0:
+                sealed = list(reversed(sealed))
+        except Exception:
+            return False
+
+    if not sealed:
+        return False
+
+    # Write sealed ring back
+    ring_out = [list(p) for p in sealed]
+    if prefer_fabric or region.get("fabric_ring"):
+        region["fabric_ring"] = ring_out
+        region["cut_ring"] = ring_out
+        region["coordinates"] = ring_out
+    else:
+        region["cut_ring"] = ring_out
+        region["coordinates"] = ring_out
+    region["prism_crease_seal_mm"] = float(d)
+    try:
+        region["area"] = float(abs(_polygon_area_2d(sealed)))
+        region["ribbon_area"] = float(region["area"])
+    except Exception:
+        pass
+
+    # Pull sealed edges fully onto creases
+    if float(snap_tol) > 0 and data is not None:
+        snap_region_to_creases(
+            region, data, snap_tol=float(snap_tol), rings_only=True
+        )
+    return True
+
+
+def _pick_largest_layer(
+    group: Sequence[dict],
+    *,
+    stream: str,
+) -> Optional[dict]:
+    """
+    Single layer that defines the prism footprint.
+
+    Prefer the largest-area **ghost** layer when any ghosts are in the group
+    (worst-case intermediate cross-section). Else largest physical / support.
+    Same rule for main and support streams.
+    """
+    if not group:
+        return None
+
+    def _area_of(r: dict) -> float:
+        try:
+            return float(r.get("area") or region_area(r) or 0.0)
+        except Exception:
+            return 0.0
+
+    ghosts = [r for r in group if _shell_kind_of_region(r) == "ghost"]
+    if ghosts:
+        return max(ghosts, key=_area_of)
+    return max(group, key=_area_of)
 
 
 def _region_export_ring(region: dict) -> List[List[float]]:
@@ -2426,7 +2883,7 @@ def _union_rings_2d(
     round_dp: int = DEFAULT_ROUND_DP,
 ) -> List[List[List[float]]]:
     """
-    2D-union of closed rings → list of exterior rings (MultiPolygon parts).
+    2D-union of closed rings ΓåÆ list of exterior rings (MultiPolygon parts).
 
     Uses shapely when available; otherwise returns deduped input rings.
     """
@@ -2540,25 +2997,208 @@ def _union_rings_2d(
     return out_rings if out_rings else cleaned
 
 
+def _merge_one_panel_stream(
+    pid: int,
+    group: List[dict],
+    *,
+    stream: str,
+    round_dp: int,
+    phys_span: Optional[Tuple[float, float]] = None,
+) -> Tuple[List[dict], Dict[str, Any]]:
+    """
+    Merge one panel stream into a single vertical solid prism.
+
+    Same rules for main and support:
+      1) Z span = min→max layer_h of every cleaned layer in the stream
+         (support expands to abut the physical stock face)
+      2) XY footprint = the **single largest cleaned layer ring only**
+         (main prefers largest ghost; not a multi-layer 2D union)
+      3) Extrude that ring as one solid prism over the full Z span
+    """
+    empty_info: Dict[str, Any] = {
+        "panel": pid,
+        "stream": stream,
+        "n_sources": len(group),
+        "n_parts": 0,
+        "union_failed": True,
+    }
+    if not group:
+        return [], empty_info
+
+    def _area_of(r: dict) -> float:
+        try:
+            return float(r.get("area") or region_area(r) or 0.0)
+        except Exception:
+            return 0.0
+
+    heights: List[float] = []
+    for r in group:
+        h = _region_layer_h(r)
+        if h is not None:
+            heights.append(h)
+    if not heights:
+        return [dict(r) for r in group], {
+            **empty_info,
+            "n_parts": len(group),
+            "reason": "no_layer_h",
+        }
+
+    h_lo = float(min(heights))
+    h_hi = float(max(heights))
+    if stream == "support":
+        h_lo, h_hi = _expand_support_z_to_phys(h_lo, h_hi, phys_span)
+    else:
+        # Main: snap ends onto phys faces when ghosts stop just short
+        # (kills hairline slabs at the stock bottom/top).
+        h_lo, h_hi = _snap_stream_z_to_phys_faces(h_lo, h_hi, phys_span)
+    h_mid = 0.5 * (h_lo + h_hi)
+    span = float(h_hi - h_lo)
+
+    has_fabric = any(
+        (r.get("fabric_ring") and len(r.get("fabric_ring") or []) >= 3)
+        for r in group
+    )
+
+    # Prism basis = one largest cleaned layer (not union of every height)
+    best = _pick_largest_layer(group, stream=stream)
+    if best is None:
+        best = max(group, key=_area_of)
+    best_ring = _region_ring_for_merge(best, prefer_fabric=has_fabric)
+    # Validate / normalize the single ring (may split MultiPolygon parts)
+    prism_rings = _union_rings_2d([best_ring], round_dp=round_dp) if best_ring else []
+    if not prism_rings and best_ring and len(best_ring) >= 3:
+        prism_rings = [[_xy(p) for p in best_ring]]
+
+    n_ghost = sum(1 for r in group if _shell_kind_of_region(r) == "ghost")
+    n_phys = sum(1 for r in group if _shell_kind_of_region(r) == "physical")
+    n_support = sum(1 for r in group if _shell_kind_of_region(r) == "support")
+    largest_area = _area_of(best)
+    best_h = _region_layer_h(best)
+
+    if not prism_rings:
+        stamped: List[dict] = []
+        for r in group:
+            rr = dict(r)
+            rr["h_lo"] = h_lo
+            rr["h_hi"] = h_hi
+            rr["layer_h"] = h_mid if span > 1e-12 else (heights[0] if heights else 0.0)
+            rr["stock_span_mm"] = span
+            rr["layer_stack_merged"] = len(group) > 1 or span > 1e-12
+            rr["merge_stream"] = stream
+            rr["largest_layer_area"] = float(largest_area)
+            if best_h is not None:
+                rr["largest_layer_h"] = float(best_h)
+            if stream == "support":
+                rr["shell_kind"] = "support"
+            stamped.append(rr)
+        return stamped, {
+            "panel": pid,
+            "stream": stream,
+            "n_sources": len(group),
+            "n_parts": len(group),
+            "h_lo": h_lo,
+            "h_hi": h_hi,
+            "largest_layer_area": float(largest_area),
+            "largest_layer_h": best_h,
+            "union_failed": True,
+            "reason": "no_largest_ring",
+        }
+
+    if stream == "support":
+        shell_kind = "support"
+        template = best
+    else:
+        phys = [r for r in group if _shell_kind_of_region(r) == "physical"]
+        # Geometry from largest ghost; keep physical as metadata host when present
+        template = dict(best)
+        shell_kind = "physical" if phys else "ghost"
+
+    out: List[dict] = []
+    for part_i, ring in enumerate(prism_rings):
+        m = dict(template)
+        for k in (
+            "c0",
+            "c1",
+            "linear_c0",
+            "linear_c1",
+            "clean_ring",
+            "clean_edges",
+            "layer_idx",
+        ):
+            m.pop(k, None)
+        m["panel"] = pid
+        m["shell_kind"] = shell_kind
+        m["layer_h"] = h_mid if span > 1e-12 else h_lo
+        m["h_lo"] = h_lo
+        m["h_hi"] = h_hi
+        m["stock_span_mm"] = span
+        m["layer_stack_merged"] = True
+        m["merge_stream"] = stream
+        m["prism_from_largest_layer"] = True
+        m["n_merged_sources"] = len(group)
+        m["n_merged_ghost"] = n_ghost
+        m["n_merged_physical"] = n_phys
+        m["n_merged_support"] = n_support
+        m["largest_layer_area"] = float(largest_area)
+        if best_h is not None:
+            m["largest_layer_h"] = float(best_h)
+        m["merged_layer_heights"] = sorted(set(round(h, 9) for h in heights))
+        m["merge_part"] = part_i
+        m["n_merge_parts"] = len(prism_rings)
+        m["kind"] = "final_trim" if (
+            m.get("fabric_ring") or m.get("cut_ring") or m.get("cut_kind")
+        ) else (m.get("kind") or "sweep")
+        area = abs(_polygon_area_2d(ring))
+        m["area"] = float(area)
+        m["ribbon_area"] = float(area)
+        ring_out = [list(p) for p in ring]
+        if has_fabric or best.get("fabric_ring"):
+            m["fabric_ring"] = ring_out
+            m["coordinates"] = ring_out
+            m["cut_ring"] = ring_out
+        else:
+            m["cut_ring"] = ring_out
+            m["coordinates"] = ring_out
+            m.pop("fabric_ring", None)
+        out.append(m)
+
+    return out, {
+        "panel": pid,
+        "stream": stream,
+        "n_sources": len(group),
+        "n_parts": len(prism_rings),
+        "h_lo": h_lo,
+        "h_hi": h_hi,
+        "n_ghost": n_ghost,
+        "n_physical": n_phys,
+        "n_support": n_support,
+        "largest_layer_area": float(largest_area),
+        "largest_layer_h": best_h,
+        "prism_from_largest_layer": True,
+        "union_failed": False,
+    }
+
+
 def merge_panel_layer_stacks(
     regions: Sequence[dict],
     *,
     enabled: bool = DEFAULT_MERGE_LAYER_STACK,
     round_dp: int = DEFAULT_ROUND_DP,
+    phys_span_by_panel: Optional[Dict[int, Tuple[float, float]]] = None,
+    data: Optional[dict] = None,
 ) -> Tuple[List[dict], Dict[str, Any]]:
     """
-    Per panel group: merge all ghost + physical collision shades into a
-    continuous Z span [min layer_h, max layer_h] with 2D-unioned footprints.
+    Per panel: merge collision shades into continuous Z prisms.
 
-    Intermediate ghost / main layers no longer leave gaps between min and max
-    height. Side ribbons are left unchanged.
+    Two independent streams (identical geometry rules):
+      main    — physical + ghost → shell_kind physical|ghost
+      support — support pads     → shell_kind support
+                (Z expanded to abut physical stock)
 
-    Each merged region carries:
-      h_lo / h_hi     — continuous height range (mm)
-      layer_h         — midpoint
-      stock_span_mm   — h_hi − h_lo
-      cut_ring / fabric_ring / coordinates — union polygon(s)
-      layer_stack_merged — True
+    Footprint for each stream is the **single largest cleaned layer ring**
+    extruded min→max layer_h (a true prism — not a multi-layer 2D union).
+
+    Side ribbons are left unchanged.
     """
     info: Dict[str, Any] = {
         "enabled": bool(enabled),
@@ -2566,6 +3206,9 @@ def merge_panel_layer_stacks(
         "n_out": len(regions or []),
         "n_panels_merged": 0,
         "n_sources_merged": 0,
+        "n_main_streams": 0,
+        "n_support_streams": 0,
+        "n_support_sources": 0,
         "panels": [],
     }
     if not enabled:
@@ -2573,154 +3216,63 @@ def merge_panel_layer_stacks(
     if not regions:
         return [], info
 
+    spans = phys_span_by_panel
+    if spans is None:
+        spans = _panel_phys_spans_from_data(data)
+    spans = spans or {}
+
     sides: List[dict] = []
-    by_panel: Dict[int, List[dict]] = {}
+    by_panel: Dict[int, Dict[str, List[dict]]] = {}
     orphan: List[dict] = []
+    n_ghost_to_support = 0
 
     for r in regions:
-        sk = _shell_kind_of_region(r)
-        if sk == "side":
-            sides.append(dict(r))
-            continue
         panel = r.get("panel")
         try:
             pid = int(panel) if panel is not None else None
         except (TypeError, ValueError):
             pid = None
+        phys_span = spans.get(pid) if pid is not None else None
+        stream = _merge_stream_of(r, phys_span=phys_span)
+        if stream == "support" and _shell_kind_of_region(r) == "ghost":
+            n_ghost_to_support += 1
+        if stream == "side":
+            sides.append(dict(r))
+            continue
         if pid is None:
             orphan.append(dict(r))
             continue
-        by_panel.setdefault(pid, []).append(dict(r))
+        by_panel.setdefault(pid, {}).setdefault(stream, []).append(dict(r))
+
+    info["n_ghosts_routed_to_support"] = int(n_ghost_to_support)
 
     out: List[dict] = []
     out.extend(sides)
     out.extend(orphan)
 
     for pid in sorted(by_panel.keys()):
-        group = by_panel[pid]
-        heights: List[float] = []
-        for r in group:
-            h = _region_layer_h(r)
-            if h is not None:
-                heights.append(h)
-        if not heights:
-            out.extend(group)
-            continue
-
-        h_lo = float(min(heights))
-        h_hi = float(max(heights))
-        h_mid = 0.5 * (h_lo + h_hi)
-        span = float(h_hi - h_lo)
-
-        # Prefer fabric rings when any member has offset; else cut rings
-        has_fabric = any(
-            (r.get("fabric_ring") and len(r.get("fabric_ring") or []) >= 3)
-            for r in group
-        )
-        rings: List[List[List[float]]] = []
-        for r in group:
-            if has_fabric:
-                raw = r.get("fabric_ring") or r.get("cut_ring") or _region_export_ring(r)
-            else:
-                raw = r.get("cut_ring") or r.get("fabric_ring") or _region_export_ring(r)
-            if raw and len(raw) >= 3:
-                rings.append([_xy(p) for p in raw])
-
-        unioned = _union_rings_2d(rings, round_dp=round_dp)
-        if not unioned:
-            # Keep originals but stamp continuous span on each
-            for r in group:
-                r = dict(r)
-                r["h_lo"] = h_lo
-                r["h_hi"] = h_hi
-                r["layer_h"] = h_mid if span > 1e-12 else (heights[0] if heights else 0.0)
-                r["stock_span_mm"] = span
-                r["layer_stack_merged"] = len(group) > 1 or span > 1e-12
-                out.append(r)
+        streams = by_panel[pid]
+        phys_span = spans.get(pid)
+        for stream in ("main", "support"):
+            group = streams.get(stream) or []
+            if not group:
+                continue
+            merged, pinfo = _merge_one_panel_stream(
+                pid,
+                group,
+                stream=stream,
+                round_dp=round_dp,
+                phys_span=phys_span,
+            )
+            out.extend(merged)
             info["n_panels_merged"] += 1
-            info["n_sources_merged"] += len(group)
-            info["panels"].append({
-                "panel": pid,
-                "n_sources": len(group),
-                "n_parts": len(group),
-                "h_lo": h_lo,
-                "h_hi": h_hi,
-                "union_failed": True,
-            })
-            continue
-
-        # Template: largest-area physical, else largest overall
-        def _area_of(r: dict) -> float:
-            try:
-                return float(r.get("area") or region_area(r) or 0.0)
-            except Exception:
-                return 0.0
-
-        phys = [r for r in group if _shell_kind_of_region(r) == "physical"]
-        template = max(phys or group, key=_area_of)
-        shell_kind = "physical" if phys else "ghost"
-        n_ghost = sum(1 for r in group if _shell_kind_of_region(r) == "ghost")
-        n_phys = len(phys)
-
-        for part_i, ring in enumerate(unioned):
-            m = dict(template)
-            # Drop dual-curve + per-layer trails; merged poly is the truth
-            for k in (
-                "c0",
-                "c1",
-                "linear_c0",
-                "linear_c1",
-                "clean_ring",
-                "clean_edges",
-                "layer_idx",
-            ):
-                m.pop(k, None)
-            m["panel"] = pid
-            m["shell_kind"] = shell_kind
-            m["layer_h"] = h_mid if span > 1e-12 else h_lo
-            m["h_lo"] = h_lo
-            m["h_hi"] = h_hi
-            m["stock_span_mm"] = span
-            m["layer_stack_merged"] = True
-            m["n_merged_sources"] = len(group)
-            m["n_merged_ghost"] = n_ghost
-            m["n_merged_physical"] = n_phys
-            m["merged_layer_heights"] = sorted(set(round(h, 9) for h in heights))
-            m["merge_part"] = part_i
-            m["n_merge_parts"] = len(unioned)
-            m["kind"] = "final_trim" if (
-                m.get("fabric_ring") or m.get("cut_ring") or m.get("cut_kind")
-            ) else (m.get("kind") or "sweep")
-            area = abs(_polygon_area_2d(ring))
-            m["area"] = float(area)
-            m["ribbon_area"] = float(area)
-            ring_out = [list(p) for p in ring]
-            if has_fabric:
-                m["fabric_ring"] = ring_out
-                m["coordinates"] = ring_out
-                # Keep a cut_ring too for exporters that prefer cut
-                if not m.get("cut_ring"):
-                    m["cut_ring"] = ring_out
-                else:
-                    m["cut_ring"] = ring_out
+            info["n_sources_merged"] += int(pinfo.get("n_sources") or 0)
+            if stream == "support":
+                info["n_support_streams"] += 1
+                info["n_support_sources"] += int(pinfo.get("n_sources") or 0)
             else:
-                m["cut_ring"] = ring_out
-                m["coordinates"] = ring_out
-                m.pop("fabric_ring", None)
-            out.append(m)
-
-        info["n_panels_merged"] += 1
-        info["n_sources_merged"] += len(group)
-        info["panels"].append({
-            "panel": pid,
-            "n_sources": len(group),
-            "n_parts": len(unioned),
-            "h_lo": h_lo,
-            "h_hi": h_hi,
-            "n_ghost": n_ghost,
-            "n_physical": n_phys,
-            "union_failed": False,
-        })
+                info["n_main_streams"] += 1
+            info["panels"].append(pinfo)
 
     info["n_out"] = len(out)
     return out, info
@@ -2748,23 +3300,33 @@ def clean_data(
     """
     Return (cleaned_data, report). Deep-copies input structure.
 
-    Pipeline:
+    Pipeline (applies to physical, ghost, **and support** collisions; side left alone):
       1) filter collapsed / too-small
       2) snap dual-curve coords onto nearby creases/borders (``snap_tol``)
       3) round coords to ``round_dp`` d.p.
       4) Union-Find group messy nodes → outermost each
       5) straight containing cut (hull → slack → simplify, never undershoot)
-      6) optional fabric_offset from cut polygon
-      7) attach clean_ring + clean_edges
-      8) per panel: merge ghost + physical stacks → continuous min→max Z
+      6) re-snap cut_ring onto creases (edge attraction; kills thin walls)
+      7) optional fabric_offset from cut polygon, then re-snap fabric_ring
+      8) attach clean_ring + clean_edges
+      9) per panel: merge main (phys+ghost) and support streams each into
+         one solid prism from the largest cleaned layer ring over
+         min→max layer_h (support Z expands to abut physical stock);
+         re-snap merged rings onto creases
     """
     gtol = float(group_tol if corner_merge_tol is None else corner_merge_tol)
     rdp = int(round_dp)
     stol = float(snap_tol)
     out = copy.deepcopy(data)
     regions = list(out.get("shaded_regions") or [])
+    n_support_in = sum(
+        1 for r in regions if _shell_kind_of_region(r) == "support"
+    )
     kept, dropped_log = filter_shaded_regions(
         regions, min_area=min_area, drop_line_kind=drop_line_kind
+    )
+    n_support_kept = sum(
+        1 for r in kept if _shell_kind_of_region(r) == "support"
     )
 
     # Step 1: snap samples onto nearby mountain / valley / border segments
@@ -2804,6 +3366,13 @@ def clean_data(
                 "layer_h": r.get("layer_h"),
                 **info,
             })
+            # Pull cut_ring back onto creases (simplify/UF can leave ~1ΓÇô3 mm
+            # inset gaps ΓåÆ thin residual wall after original ΓêÆ collision).
+            if not info.get("skipped") and stol > 0:
+                sinfo = snap_region_to_creases(
+                    r, out, snap_tol=stol, rings_only=True
+                )
+                cut_log[-1]["post_cut_snap"] = sinfo
     else:
         # Still round; no cut polygon
         for r in kept:
@@ -2828,6 +3397,11 @@ def clean_data(
                 "layer_h": r.get("layer_h"),
                 **finfo,
             })
+            if not finfo.get("skipped") and stol > 0:
+                sinfo = snap_region_to_creases(
+                    r, out, snap_tol=stol, rings_only=True
+                )
+                fabric_log[-1]["post_fabric_snap"] = sinfo
 
     if attach_polygon_meta:
         for r in kept:
@@ -2835,8 +3409,8 @@ def clean_data(
             # Final quantize of viz helpers
             round_region_geometry(r, dp=rdp)
 
-    # Step 8: merge ghost + physical per panel into continuous min→max height.
-    # Keep a pre-merge copy so viz can still show every intermediate layer.
+    # Step 8: merge main (phys+ghost) and support streams into largest-layer
+    # solid prisms. Keep a pre-merge copy so viz can still show every layer.
     layers_for_viz: List[dict] = []
     if bool(merge_layer_stack) and kept:
         for r in kept:
@@ -2849,6 +3423,41 @@ def clean_data(
         kept,
         enabled=bool(merge_layer_stack),
         round_dp=rdp,
+        data=out,
+    )
+    # After prism merge: seal footprint to creases (small outward inflate +
+    # re-snap) so stock − collision does not leave super-thin walls.
+    n_merge_snap = 0
+    n_sealed = 0
+    if kept:
+        for r in kept:
+            if not (
+                r.get("layer_stack_merged")
+                or r.get("prism_from_largest_layer")
+                or r.get("cut_ring")
+                or r.get("fabric_ring")
+            ):
+                continue
+            if stol > 0:
+                sinfo = snap_region_to_creases(
+                    r, out, snap_tol=stol, rings_only=True
+                )
+                n_merge_snap += int(sinfo.get("n_ring_moved") or 0)
+            if _seal_merged_prism_to_creases(
+                r,
+                out,
+                amount=DEFAULT_PRISM_CREASE_SEAL_MM,
+                round_dp=rdp,
+                snap_tol=max(stol, DEFAULT_PRISM_CREASE_SEAL_MM * 2.0),
+            ):
+                n_sealed += 1
+            if rdp > 0:
+                round_region_geometry(r, dp=rdp)
+        merge_info = dict(merge_info)
+        merge_info["n_post_merge_snap_moved"] = int(n_merge_snap)
+        merge_info["n_prism_crease_sealed"] = int(n_sealed)
+    n_support_out = sum(
+        1 for r in kept if _shell_kind_of_region(r) == "support"
     )
     if attach_polygon_meta and merge_info.get("enabled"):
         for r in kept:
@@ -2879,8 +3488,8 @@ def clean_data(
                     r["clean_ring"] = [list(p) for p in cut]
                 round_region_geometry(r, dp=rdp)
 
-    # shaded_regions        = merged continuous solid (export / STL)
-    # shaded_regions_layers = pre-merge ghost+physical at each layer_h (viz)
+    # shaded_regions        = merged continuous solids (main + support streams)
+    # shaded_regions_layers = pre-merge phys/ghost/support at each layer_h (viz)
     out["shaded_regions"] = kept
     if (
         layers_for_viz
@@ -2915,6 +3524,10 @@ def clean_data(
         "n_in": len(regions),
         "n_out": len(kept),
         "n_dropped": len(dropped_log),
+        "n_support_in": int(n_support_in),
+        "n_support_kept": int(n_support_kept),
+        "n_support_out": int(n_support_out),
+        "n_support_streams": int(merge_info.get("n_support_streams") or 0),
         "dropped": dropped_log,
         "snap_log": snap_log,
         "cut_log": cut_log,
@@ -2930,6 +3543,10 @@ def clean_data(
     meta["clean_n_in"] = len(regions)
     meta["clean_n_out"] = len(kept)
     meta["clean_n_dropped"] = len(dropped_log)
+    meta["clean_n_support_in"] = int(n_support_in)
+    meta["clean_n_support_kept"] = int(n_support_kept)
+    meta["clean_n_support_out"] = int(n_support_out)
+    meta["clean_n_support_streams"] = int(merge_info.get("n_support_streams") or 0)
     meta["clean_straight_cut"] = bool(straight_cut)
     meta["clean_cut_tol"] = float(cut_tol)
     meta["clean_straight_slack"] = float(straight_slack)
@@ -2945,6 +3562,7 @@ def clean_data(
     meta["clean_merge_layer_stack"] = bool(merge_layer_stack)
     meta["clean_n_panels_layer_merged"] = int(merge_info.get("n_panels_merged") or 0)
     meta["clean_n_sources_layer_merged"] = int(merge_info.get("n_sources_merged") or 0)
+    meta["clean_n_main_streams"] = int(merge_info.get("n_main_streams") or 0)
     if out.get("shaded_regions_layers") is not None:
         meta["clean_n_layer_viz"] = len(out["shaded_regions_layers"])
     else:
@@ -3044,7 +3662,7 @@ def run_visualize_cleaned(
     """
     path = os.path.abspath(cleaned_path)
     if not os.path.isfile(path):
-        print(f"[clean] viz skip — missing {path}", file=sys.stderr)
+        print(f"[clean] viz skip ΓÇö missing {path}", file=sys.stderr)
         return 1
     stem = os.path.splitext(os.path.basename(path))[0]
     try:
@@ -3114,7 +3732,7 @@ def _job_settings_from_cfg(job: dict, defaults: dict) -> dict:
     ):
         if k in job and job[k] is not None:
             out[k] = job[k]
-    # Legacy alias: corner_merge_tol → group_tol when group_tol omitted
+    # Legacy alias: corner_merge_tol ΓåÆ group_tol when group_tol omitted
     if "group_tol" not in job and job.get("corner_merge_tol") is not None:
         out["group_tol"] = job["corner_merge_tol"]
     if "output_dir" in job and job["output_dir"] is not None:
@@ -3182,7 +3800,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=None,
         help=(
             "Forgiving max edge deviation for straight-edge simplify "
-            f"(larger → fewer longer lines; default {DEFAULT_CUT_TOL:g})"
+            f"(larger ΓåÆ fewer longer lines; default {DEFAULT_CUT_TOL:g})"
         ),
     )
     parser.add_argument(
@@ -3253,14 +3871,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         default=None,
         help=(
-            "Per panel: merge ghost+physical layers into continuous "
-            "min→max height (default on)"
+            "Per panel: merge phys+ghost (main) and support streams each into "
+            "continuous minΓåÆmax height (default on)"
         ),
     )
     parser.add_argument(
         "--no-merge-layer-stack",
         action="store_true",
-        help="Keep intermediate ghost/main layers separate (no Z-stack merge)",
+        help=(
+            "Keep intermediate phys/ghost/support layers separate "
+            "(no Z-stack merge)"
+        ),
     )
     parser.add_argument(
         "-o",
@@ -3501,8 +4122,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             mlog = report.get("merge_log") or {}
             print(
                 f"[clean] {os.path.basename(in_path)}: "
-                f"{report['n_in']} → {report['n_out']} "
+                f"{report['n_in']} ΓåÆ {report['n_out']} "
                 f"(dropped {report['n_dropped']}, "
+                f"support {report.get('n_support_in', 0)}ΓåÆ"
+                f"{report.get('n_support_out', 0)}, "
                 f"min_area={float(settings.get('min_area', 0)):g}, "
                 f"straight_cut={bool(settings.get('straight_cut', True))}, "
                 f"cut_tol={float(settings.get('cut_tol', DEFAULT_CUT_TOL)):g}, "
@@ -3512,7 +4135,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"snap_tol={st:g}, snapped={report.get('n_snapped_total', 0)}, "
                 f"fabric_offset={fo:g}, "
                 f"merge_layer_stack={mls}, "
-                f"panels_merged={mlog.get('n_panels_merged', 0)})"
+                f"panels_merged={mlog.get('n_panels_merged', 0)}, "
+                f"support_streams={mlog.get('n_support_streams', 0)})"
             )
             for d in report["dropped"][:12]:
                 print(
@@ -3538,8 +4162,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         f"    cut panel={C.get('panel')} "
                         f"[{C.get('shape')}] "
                         f"uf_merge={uf_m} "
-                        f"hull={C.get('n_hull')}→cut={C.get('n_cut')} "
-                        f"ribbon={float(C.get('ribbon_area') or 0):.4g}→"
+                        f"hull={C.get('n_hull')}ΓåÆcut={C.get('n_cut')} "
+                        f"ribbon={float(C.get('ribbon_area') or 0):.4g}ΓåÆ"
                         f"cut_area={float(C.get('cut_area') or 0):.4g} "
                         f"ov={ov:.2f} "
                         f"out={C.get('n_outside', 0)} "
@@ -3561,7 +4185,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(
                         f"    fabric panel={F.get('panel')} "
                         f"offset={float(F.get('fabric_offset') or 0):g} "
-                        f"area {float(F.get('area_in') or 0):.4g}→"
+                        f"area {float(F.get('area_in') or 0):.4g}ΓåÆ"
                         f"{float(F.get('area_out') or 0):.4g}"
                         f"{cflag}{pflag}"
                     )
@@ -3569,11 +4193,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             if n_fab > 12:
                 print(f"    ... +{n_fab - 12} more fabric")
             for M in (mlog.get("panels") or [])[:12]:
+                stream = M.get("stream") or "main"
                 print(
-                    f"    merge panel={M.get('panel')} "
-                    f"sources={M.get('n_sources')}→parts={M.get('n_parts')} "
+                    f"    merge panel={M.get('panel')} stream={stream} "
+                    f"sources={M.get('n_sources')}ΓåÆparts={M.get('n_parts')} "
                     f"h=[{float(M.get('h_lo') or 0):g},{float(M.get('h_hi') or 0):g}] "
-                    f"phys={M.get('n_physical', '?')} ghost={M.get('n_ghost', '?')}"
+                    f"phys={M.get('n_physical', '?')} ghost={M.get('n_ghost', '?')} "
+                    f"support={M.get('n_support', '?')}"
                     f"{' UNION_FAIL' if M.get('union_failed') else ''}"
                 )
             n_m = len(mlog.get("panels") or [])

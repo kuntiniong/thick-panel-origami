@@ -5,12 +5,12 @@ Mixed into PD_Origami_Simulator so @ti.kernel / @ti.func stay on the same
 
 Architecture (collision_shading=True)
 -------------------------------------
-0. Side + ghost panel builders
+0. Side + ghost + support panel builders
 1. Index every panel by layer (main → side → ghost ranks)
 2. Collision logic
-   main & ghost → AABB + tri-tri
-   side         → OBB  + tri-tri
-3. Sweeping visualization (same path for main, ghost, side)  [host]
+   main & ghost & support → AABB + tri-tri
+   side                   → OBB  + tri-tri
+3. Sweeping visualization (main, ghost, support, side)  [host]
 4. JSON export helper (dual-curve shaded_regions)              [host]
 
 Pure geometry helpers: collision_util.
@@ -242,8 +242,17 @@ class CollisionMixin:
             self._flat_kps_np = np.asarray(self.kps, dtype=numpy_data_type)
         # Vertical side panels between consecutive physical heights.
         self._build_side_collision_panels()
-        # Ghost intermediate shells + full-stack layer ordinals (before upload).
+        # Ghost intermediate shells between physical heights (before support).
         self._build_ghost_collision_shells()
+        # Support shells: pad every design panel to the full global height set
+        # so each layer has the same panel count (collision-only, like ghosts).
+        self._build_support_collision_shells()
+        # Ghosts in the gaps between physical and support heights (was missing:
+        # ghosts only ran physical→physical, so support extensions had no
+        # intermediate collision samples).
+        self._build_ghosts_across_support_gaps()
+        # Pack draw topology for GUI (green support meshes; ghosts are not drawn).
+        self._upload_support_panel_draw_buffers()
         # Dense unit→layer tables after ghost remaps coll layer ranks.
         self._build_unit_layer_arrays()
 
@@ -493,6 +502,489 @@ class CollisionMixin:
                 f"{n_ghost} collision-only shell(s) (no PD); "
                 f"physical units unchanged."
             )
+
+    def _support_blend_pair(self, phys, target_h):
+        """
+        Choose two physical shells + blend weight so support sits at target_h.
+
+        phys: sorted list of {unit, h} for one design panel.
+        Uses linear interpolation between bracketing shells, or extrapolation
+        past the ends (e.g. miura P2 at h=3 from shells at -9 and -3).
+
+        Returns (unit_lo, unit_hi, h_lo, h_hi, alpha) or None.
+        """
+        if not phys:
+            return None
+        th = float(target_h)
+        if len(phys) == 1:
+            # Single shell: degenerate blend (live mesh == that shell).
+            # Caller may still offset; alpha=0, same unit twice.
+            u = int(phys[0]["unit"])
+            h = float(phys[0]["h"])
+            return u, u, h, h, 0.0
+
+        # Extrapolate below / above the panel's own stack, else interpolate.
+        if th <= float(phys[0]["h"]) + 1e-12:
+            lo, hi = phys[0], phys[1]
+        elif th >= float(phys[-1]["h"]) - 1e-12:
+            lo, hi = phys[-2], phys[-1]
+        else:
+            lo = phys[0]
+            hi = phys[-1]
+            for p in phys:
+                if float(p["h"]) <= th + 1e-12:
+                    lo = p
+                if float(p["h"]) >= th - 1e-12:
+                    hi = p
+                    break
+
+        h0 = float(lo["h"])
+        h1 = float(hi["h"])
+        u0 = int(lo["unit"])
+        u1 = int(hi["unit"])
+        if abs(h1 - h0) < 1e-12:
+            return u0, u0, h0, h0, 0.0
+        # Unclamped alpha: 0 at lo, 1 at hi, >1 / <0 outside the span
+        # so missing layers (3 and -9 on miura) land at the right stack depth.
+        alpha = (th - h0) / (h1 - h0)
+        return u0, u1, h0, h1, float(alpha)
+
+    def _build_support_collision_shells(self):
+        """
+        Pad every design panel to the full set of global physical heights.
+
+        Example (miura-thick):
+          global heights = {-9, -3, 3}
+          h=-3 : all four panels have physical shells
+          h=3  : only P0,P1 physical → support for P2,P3 (green)
+          h=-9 : only P2,P3 physical → support for P0,P1 (green)
+
+        Support shells are collision-only (no PD) and drawn green in the GUI.
+        Live geometry blends/extrapolates the panel's own physical shells so
+        the mesh sits at the target height, not on top of a neighbor layer.
+        """
+        self._collision_support_shells = []
+        if not bool(getattr(self, "thick_support_panels", True)):
+            return
+        if not bool(getattr(self, "thick_mode_flag", False)):
+            return
+
+        mapping = self._panel_layer_mapping()
+        if not mapping:
+            return
+        flat_kps = getattr(self, "_flat_kps_np", None)
+        if flat_kps is None:
+            flat_kps = np.asarray(self.kps, dtype=numpy_data_type)
+            self._flat_kps_np = flat_kps
+
+        # Per-panel physical shells sorted by height
+        per_panel = []
+        all_heights = []
+        for panel_idx, unit_ids in enumerate(mapping):
+            phys = []
+            for uid in unit_ids or []:
+                h = float(self._unit_layer_height_z(int(uid)))
+                phys.append({"unit": int(uid), "h": h})
+                all_heights.append(h)
+            phys.sort(key=lambda x: x["h"])
+            per_panel.append(phys)
+
+        if not all_heights:
+            return
+
+        # Unique global physical heights — every layer must host all panels
+        height_keys = sorted({round(float(h), 6) for h in all_heights})
+        if len(height_keys) < 1:
+            return
+
+        # Per height: which design panels are already physical
+        panels_at_h = {hk: set() for hk in height_keys}
+        for panel_idx, phys in enumerate(per_panel):
+            for p in phys:
+                panels_at_h[round(float(p["h"]), 6)].add(int(panel_idx))
+
+        n_support = 0
+        n_panels = len(mapping)
+        for panel_idx, phys in enumerate(per_panel):
+            if not phys:
+                continue
+            present = {round(float(p["h"]), 6) for p in phys}
+            for gi, hk in enumerate(height_keys):
+                if hk in present:
+                    continue
+                target_h = float(hk)
+                blend = self._support_blend_pair(phys, target_h)
+                if blend is None:
+                    continue
+                u0, u1, h0, h1, alpha = blend
+
+                kp_lo, kp_hi = self._match_unit_kp_correspondence(u0, u1, flat_kps)
+                if kp_lo is None:
+                    kps = list(self._unit_kp_indices(u0))
+                    if len(kps) < 3:
+                        continue
+                    kp_lo = kps
+                    kp_hi = list(self._unit_kp_indices(u1)) if u1 != u0 else list(kps)
+                    if len(kp_hi) != len(kp_lo):
+                        n = min(len(kp_lo), len(kp_hi))
+                        if n < 3:
+                            continue
+                        kp_lo, kp_hi = kp_lo[:n], kp_hi[:n]
+                local_tris = self._local_tris_for_unit(u0, kp_lo)
+                if not local_tris and u1 != u0:
+                    local_tris = self._local_tris_for_unit(u1, kp_hi)
+                if not local_tris:
+                    continue
+
+                support = {
+                    "support_id": n_support,
+                    "panel_idx": int(panel_idx),
+                    "layer_h": float(target_h),
+                    "layer_idx": int(gi),
+                    "alpha": float(alpha),
+                    "unit_lo": int(u0),
+                    "unit_hi": int(u1),
+                    "h_lo": float(h0),
+                    "h_hi": float(h1),
+                    "kp_lo": kp_lo,
+                    "kp_hi": kp_hi,
+                    "local_tris": local_tris,
+                    "shell_kind": "support",
+                }
+                self._collision_support_shells.append(support)
+                n_support += 1
+
+        # Always log: which heights were incomplete and how many supports filled
+        if n_support > 0 or getattr(self, "verbose", False):
+            bits = []
+            for hk in height_keys:
+                have = sorted(panels_at_h.get(hk) or [])
+                missing = [p for p in range(n_panels) if p not in (panels_at_h.get(hk) or set())]
+                if missing:
+                    bits.append(
+                        f"h={hk:g}: phys={have} +support P{missing}"
+                    )
+            detail = "; ".join(bits) if bits else "all layers already full"
+            print(
+                f"[Contact] support shells: {n_support} green collision-only "
+                f"shell(s) across heights {height_keys} "
+                f"({detail})"
+            )
+
+    def _build_ghosts_across_support_gaps(self):
+        """
+        Fill intermediate ghost shells between physical and support heights.
+
+        ``_build_ghost_collision_shells`` only samples between consecutive
+        **physical** shells. After support pads extend a panel's stack
+        (e.g. P0 phys at -3/3 + support at -9), the interval [-9, -3] had
+        no ghosts — so intermediate collision with other panels was missing.
+
+        For each panel, take the sorted set of physical + support heights and
+        insert ghosts every ``thick_ghost_spacing_mm`` between consecutive
+        samples that are not already covered.
+        """
+        spacing = float(getattr(self, "thick_ghost_spacing_mm", 0.0) or 0.0)
+        if spacing <= 1e-12:
+            return
+        if not bool(getattr(self, "thick_support_panels", True)):
+            return
+        supports = getattr(self, "_collision_support_shells", None) or []
+        if not supports:
+            return
+
+        mapping = self._panel_layer_mapping()
+        flat_kps = getattr(self, "_flat_kps_np", None)
+        if flat_kps is None:
+            flat_kps = np.asarray(self.kps, dtype=numpy_data_type)
+            self._flat_kps_np = flat_kps
+
+        # Existing ghost heights per panel (avoid duplicates)
+        existing_h: Dict[int, List[float]] = {}
+        for g in getattr(self, "_collision_ghost_shells", None) or []:
+            pi = int(g["panel_idx"])
+            existing_h.setdefault(pi, []).append(float(g["layer_h"]))
+
+        support_h: Dict[int, List[float]] = {}
+        for s in supports:
+            pi = int(s["panel_idx"])
+            support_h.setdefault(pi, []).append(float(s["layer_h"]))
+
+        n_new = 0
+        n_ghost = len(getattr(self, "_collision_ghost_shells", None) or [])
+
+        for panel_idx, unit_ids in enumerate(mapping):
+            if not unit_ids:
+                continue
+            phys = []
+            for uid in unit_ids or []:
+                h = float(self._unit_layer_height_z(int(uid)))
+                phys.append({"unit": int(uid), "h": h})
+            phys.sort(key=lambda x: x["h"])
+            if not phys:
+                continue
+
+            # Full stack endpoints: physical + support for this panel
+            h_set = {round(float(p["h"]), 6) for p in phys}
+            for h in support_h.get(panel_idx, []):
+                h_set.add(round(float(h), 6))
+            heights = sorted(float(h) for h in h_set)
+            if len(heights) < 2:
+                continue
+
+            # Extend stock span to include support (depth fields / viz)
+            span = self._panel_stock_span.get(int(panel_idx), (heights[0], heights[-1]))
+            self._panel_stock_span[int(panel_idx)] = (
+                float(min(span[0], heights[0])),
+                float(max(span[1], heights[-1])),
+            )
+
+            have = existing_h.get(panel_idx, [])
+
+            def _already(h_val: float) -> bool:
+                for eh in have:
+                    if abs(float(eh) - float(h_val)) < 0.5 * spacing:
+                        return True
+                # also skip physical/support endpoints
+                for ep in heights:
+                    if abs(float(ep) - float(h_val)) < 1e-9:
+                        return True
+                return False
+
+            for i in range(len(heights) - 1):
+                h0, h1 = float(heights[i]), float(heights[i + 1])
+                dh = h1 - h0
+                if abs(dh) < 1e-12:
+                    continue
+                # Only fill gaps that involve support (new intervals beyond
+                # pure physical-physical, which already have ghosts).
+                # Physical-physical interval: both endpoints are physical.
+                phys_hs = {round(float(p["h"]), 6) for p in phys}
+                both_phys = (
+                    round(h0, 6) in phys_hs and round(h1, 6) in phys_hs
+                )
+                if both_phys:
+                    continue
+
+                h = h0 + spacing
+                while h < h1 - 1e-9:
+                    if _already(h):
+                        h += spacing
+                        continue
+                    blend = self._support_blend_pair(phys, h)
+                    if blend is None:
+                        h += spacing
+                        continue
+                    u0, u1, _ha, _hb, alpha = blend
+                    if abs(alpha) < 1e-12 and int(u0) == int(u1):
+                        h += spacing
+                        continue
+                    kp_lo, kp_hi = self._match_unit_kp_correspondence(
+                        u0, u1, flat_kps
+                    )
+                    if kp_lo is None:
+                        kps = list(self._unit_kp_indices(u0))
+                        if len(kps) < 3:
+                            h += spacing
+                            continue
+                        kp_lo = kps
+                        kp_hi = (
+                            list(self._unit_kp_indices(u1))
+                            if int(u1) != int(u0)
+                            else list(kps)
+                        )
+                        n = min(len(kp_lo), len(kp_hi))
+                        if n < 3:
+                            h += spacing
+                            continue
+                        kp_lo, kp_hi = kp_lo[:n], kp_hi[:n]
+                    local_tris = self._local_tris_for_unit(u0, kp_lo)
+                    if not local_tris and int(u1) != int(u0):
+                        local_tris = self._local_tris_for_unit(u1, kp_hi)
+                    if not local_tris:
+                        h += spacing
+                        continue
+                    ghost = {
+                        "ghost_id": n_ghost,
+                        "panel_idx": int(panel_idx),
+                        "layer_h": float(h),
+                        # Rank by absolute height among global samples later
+                        "layer_idx": -1,
+                        "alpha": float(alpha),
+                        "unit_lo": int(u0),
+                        "unit_hi": int(u1),
+                        "kp_lo": kp_lo,
+                        "kp_hi": kp_hi,
+                        "local_tris": local_tris,
+                        "shell_kind": "ghost",
+                        "support_gap_ghost": True,
+                    }
+                    self._collision_ghost_shells.append(ghost)
+                    have.append(float(h))
+                    n_ghost += 1
+                    n_new += 1
+                    h += spacing
+
+        if n_new > 0 or getattr(self, "verbose", False):
+            print(
+                f"[Contact] support-gap ghosts: +{n_new} intermediate shell(s) "
+                f"between physical and support heights "
+                f"(spacing={spacing:g} mm)."
+            )
+
+    def _support_shell_live_verts(self, support, positions):
+        """
+        Place support shell in 3D by blending/extrapolating physical shell verts.
+
+        verts = (1-alpha)*pos_lo + alpha*pos_hi
+        alpha may be outside [0,1] so missing layers (e.g. h=3 from -9/-3)
+        continue the stack rather than sitting on the nearest physical panel.
+        """
+        a = float(support.get("alpha", 0.0))
+        lo = np.asarray(positions[support["kp_lo"]], dtype=float)
+        hi = np.asarray(positions[support["kp_hi"]], dtype=float)
+        if int(support["unit_lo"]) == int(support["unit_hi"]):
+            # True single-shell panel: cannot invent thickness from one sample.
+            return lo.copy()
+        return (1.0 - a) * lo + a * hi
+
+    def _upload_support_panel_draw_buffers(self):
+        """
+        Pack support shell triangle topology into Taichi draw buffers.
+
+        Vertex positions are filled every frame from live physical kp blends
+        (see ``_update_support_panel_draw_verts``). Ghost intermediate shells
+        are intentionally not drawn — only support pads.
+        """
+        self._support_draw_meta = []
+        self._support_panel_vert_count = 0
+        self._support_panel_index_count = 0
+        self._support_panel_edge_vert_count = 0
+        if not hasattr(self, "support_panel_verts"):
+            return
+        supports = getattr(self, "_collision_support_shells", None) or []
+        if not supports:
+            return
+
+        max_v = int(getattr(self, "_support_max_verts", 0) or 0)
+        max_i = int(getattr(self, "_support_max_idx", 0) or 0)
+        max_e = int(getattr(self, "_support_max_edge_v", 0) or 0)
+        if max_v < 3 or max_i < 3:
+            return
+
+        idx_list = []
+        edge_pairs = []  # packed local vert index pairs for outline edges
+        meta = []
+        v_off = 0
+        n_skipped = 0
+        for s in supports:
+            kp_lo = list(s.get("kp_lo") or [])
+            n_v = len(kp_lo)
+            if n_v < 3:
+                n_skipped += 1
+                continue
+            if v_off + n_v > max_v:
+                n_skipped += 1
+                continue
+            local_tris = list(s.get("local_tris") or [])
+            added_tri = 0
+            for i0, i1, i2 in local_tris:
+                if len(idx_list) + 3 > max_i:
+                    break
+                if (
+                    0 <= int(i0) < n_v
+                    and 0 <= int(i1) < n_v
+                    and 0 <= int(i2) < n_v
+                ):
+                    idx_list.extend([
+                        v_off + int(i0),
+                        v_off + int(i1),
+                        v_off + int(i2),
+                    ])
+                    added_tri += 1
+            if added_tri == 0:
+                n_skipped += 1
+                continue
+            # Outline edges in kp ring order (unit boundary)
+            for i in range(n_v):
+                a = v_off + i
+                b = v_off + ((i + 1) % n_v)
+                if len(edge_pairs) * 2 + 2 <= max_e:
+                    edge_pairs.append((a, b))
+            meta.append({
+                "v_off": int(v_off),
+                "n_v": int(n_v),
+                "kp_lo": [int(k) for k in kp_lo],
+                "kp_hi": [int(k) for k in (s.get("kp_hi") or kp_lo)],
+                "alpha": float(s.get("alpha", 0.0)),
+                "unit_lo": int(s.get("unit_lo", -1)),
+                "unit_hi": int(s.get("unit_hi", -1)),
+            })
+            v_off += n_v
+
+        self._support_draw_meta = meta
+        self._support_panel_vert_count = int(v_off)
+        self._support_panel_index_count = int(len(idx_list))
+        self._support_edge_pairs = edge_pairs  # packed local vert pairs
+        self._support_panel_edge_vert_count = int(len(edge_pairs) * 2)
+
+        idx_buf = np.zeros(max_i, dtype=np.int32)
+        if idx_list:
+            idx_buf[: len(idx_list)] = np.asarray(idx_list, dtype=np.int32)
+        self.support_panel_indices.from_numpy(idx_buf)
+        # Zero verts until first frame update
+        self.support_panel_verts.fill(0)
+        self.support_panel_edge_verts.fill(0)
+
+        if meta:
+            print(
+                f"[Contact] support draw (GUI green): {len(meta)} shell(s)  "
+                f"verts={v_off}  tris={len(idx_list)//3}"
+                + (f"  skipped={n_skipped}" if n_skipped else "")
+            )
+
+    def _update_support_panel_draw_verts(self, positions=None):
+        """Fill support mesh + edge verts from live physical kp blends/extrapolation."""
+        meta = getattr(self, "_support_draw_meta", None) or []
+        if not meta or not hasattr(self, "support_panel_verts"):
+            return
+        if positions is None:
+            positions = self._cache_frame_positions()
+        positions = np.asarray(positions, dtype=float)
+        max_v = int(getattr(self, "_support_max_verts", 0) or 0)
+        max_e = int(getattr(self, "_support_max_edge_v", 0) or 0)
+        n_v = int(getattr(self, "_support_panel_vert_count", 0) or 0)
+        if n_v < 3 or max_v < 3:
+            return
+
+        V = np.zeros((max_v, 3), dtype=np.float32)
+        for m in meta:
+            off = int(m["v_off"])
+            nv = int(m["n_v"])
+            try:
+                shell = {
+                    "alpha": float(m["alpha"]),
+                    "kp_lo": m["kp_lo"],
+                    "kp_hi": m["kp_hi"],
+                    "unit_lo": m["unit_lo"],
+                    "unit_hi": m["unit_hi"],
+                }
+                verts = self._support_shell_live_verts(shell, positions)
+                V[off : off + nv] = np.asarray(verts, dtype=np.float32)
+            except Exception:
+                continue
+        self.support_panel_verts.from_numpy(V)
+
+        # Edge line verts (pairs of packed mesh verts)
+        edge_pairs = getattr(self, "_support_edge_pairs", None) or []
+        n_e = min(len(edge_pairs), max_e // 2)
+        if n_e > 0 and hasattr(self, "support_panel_edge_verts"):
+            E = np.zeros((max_e, 3), dtype=np.float32)
+            for i, (ia, ib) in enumerate(edge_pairs[:n_e]):
+                E[2 * i] = V[int(ia)]
+                E[2 * i + 1] = V[int(ib)]
+            self.support_panel_edge_verts.from_numpy(E)
+            self._support_panel_edge_vert_count = int(n_e * 2)
 
     def _unit_outline_kp_ordered(self, unit_id):
         """Boundary keypoint indices of a sim unit in outline order."""
@@ -1391,12 +1883,18 @@ class CollisionMixin:
         """
         Host-side narrowphase for collision-only ghost shells.
 
-        Ghosts at the same collision-stack layer_idx on different panels are
-        tested with triangle_intersection_contacts_3d. No physics involvement.
+        Ghosts at the same absolute layer_h on different panels are tested with
+        triangle_intersection_contacts_3d. Grouping by height (not per-panel
+        stack rank) so support-gap ghosts pair with other panels' samples.
+        No physics involvement.
         """
         ghosts = getattr(self, "_collision_ghost_shells", None) or []
         if not ghosts:
             return
+
+        spacing = float(getattr(self, "thick_ghost_spacing_mm", 0.0) or 0.0)
+        # Bucket width for height matching (support-gap ghosts use absolute h)
+        h_tol = max(0.5 * spacing, 1e-4) if spacing > 1e-12 else 1e-3
 
         # Prepare live geometry once per ghost
         prepared = []
@@ -1415,11 +1913,23 @@ class CollisionMixin:
                 })
             prepared.append({"g": g, "verts": verts, "tris": tris})
 
-        by_layer = {}
+        # Group by absolute height (rounded). Fall back to layer_idx only when
+        # height is missing.
+        by_h = {}
         for prep in prepared:
-            by_layer.setdefault(int(prep["g"]["layer_idx"]), []).append(prep)
+            lh = prep["g"].get("layer_h")
+            if lh is not None:
+                # Quantize to spacing grid when available
+                if spacing > 1e-12:
+                    key = round(float(lh) / spacing) * spacing
+                    key = round(key, 6)
+                else:
+                    key = round(float(lh), 6)
+            else:
+                key = ("idx", int(prep["g"].get("layer_idx", -1)))
+            by_h.setdefault(key, []).append(prep)
 
-        for layer_idx, group in by_layer.items():
+        for h_key, group in by_h.items():
             n = len(group)
             for ia in range(n):
                 for ib in range(ia + 1, n):
@@ -1428,6 +1938,9 @@ class CollisionMixin:
                     ga = pa["g"]
                     gb = pb["g"]
                     if int(ga["panel_idx"]) == int(gb["panel_idx"]):
+                        continue
+                    # Extra height check when bucket is coarse
+                    if abs(float(ga["layer_h"]) - float(gb["layer_h"])) > h_tol * 2:
                         continue
                     for ta in pa["tris"]:
                         for tb in pb["tris"]:
@@ -1460,8 +1973,8 @@ class CollisionMixin:
                             p_of_uhi = int(gR["panel_idx"])
                             layer_h_a = float(gL["layer_h"])
                             layer_h_b = float(gR["layer_h"])
-                            layer_idx_a = int(gL["layer_idx"])
-                            layer_idx_b = int(gR["layer_idx"])
+                            layer_idx_a = int(gL.get("layer_idx", -1))
+                            layer_idx_b = int(gR.get("layer_idx", -1))
                             p_lo = min(p_of_ulo, p_of_uhi)
                             p_hi = max(p_of_ulo, p_of_uhi)
                             i0a, i1a, i2a = t_left["local"]
@@ -1474,7 +1987,7 @@ class CollisionMixin:
                                 "panel_of_unit_b": p_of_uhi,
                                 "panel_a": p_lo,
                                 "panel_b": p_hi,
-                                "layer_idx": int(layer_idx),
+                                "layer_idx": layer_idx_a,
                                 "layer_h": layer_h_a,
                                 "layer_idx_a": layer_idx_a,
                                 "layer_h_a": layer_h_a,
@@ -1565,6 +2078,288 @@ class CollisionMixin:
                                     contact_points.append(p0)
                                 if len(contact_points) < max_pts:
                                     contact_points.append(p1)
+
+    def _detect_support_shell_contacts(
+        self,
+        positions,
+        flat_kps,
+        contact_points,
+        contact_segments,
+        contact_points_flat,
+        contact_segments_flat,
+        max_pts,
+        max_segs,
+    ):
+        """
+        Host-side narrowphase for collision-only support shells.
+
+        Support shells pad missing design panels at each global physical height
+        so every layer has the same panel count. Tests:
+          - support ↔ support (same layer_h, different panels)
+          - support ↔ physical (same layer_h, different panels)
+          - support ↔ ghost (same layer_h — support-gap ghosts included)
+        No physics involvement.
+        """
+        supports = getattr(self, "_collision_support_shells", None) or []
+        if not supports:
+            return
+
+        def _prep_shell(shell, verts, tris_local, shell_kind, synthetic_base):
+            tris = []
+            for ti_, (i0, i1, i2) in enumerate(tris_local):
+                tris.append({
+                    "local": (i0, i1, i2),
+                    "tri_idx": int(synthetic_base) * 1024 + ti_,
+                    "corners": [
+                        verts[i0].tolist(),
+                        verts[i1].tolist(),
+                        verts[i2].tolist(),
+                    ],
+                })
+            return {
+                "shell": shell,
+                "verts": verts,
+                "tris": tris,
+                "shell_kind": shell_kind,
+            }
+
+        # Support geometry
+        by_h = {}
+        for s in supports:
+            verts = self._support_shell_live_verts(s, positions)
+            prep = _prep_shell(
+                s, verts, s["local_tris"], "support",
+                100000 + int(s["support_id"]),
+            )
+            hk = round(float(s["layer_h"]), 6)
+            by_h.setdefault(hk, []).append(prep)
+
+        # Physical shells at the same global heights (for support↔physical)
+        mapping = self._panel_layer_mapping()
+        coll_map = getattr(self, "_unit_coll_layer_idx", None) or {}
+        meta = getattr(self, "_collision_unit_layer_meta", None) or {}
+        for panel_idx, unit_ids in enumerate(mapping):
+            for uid in unit_ids or []:
+                uid = int(uid)
+                h = float(self._unit_layer_height_z(uid))
+                hk = round(h, 6)
+                if hk not in by_h:
+                    # No support shells at this height — still may be useful but
+                    # support↔physical only matters where supports exist.
+                    continue
+                kps = list(self._unit_kp_indices(uid))
+                if len(kps) < 3:
+                    continue
+                local_tris = self._local_tris_for_unit(uid, kps)
+                if not local_tris:
+                    continue
+                verts = np.asarray(positions[kps], dtype=float)
+                layer_idx = int(coll_map.get(uid, meta.get(uid, {}).get("layer_idx", 0)))
+                phys_shell = {
+                    "panel_idx": int(panel_idx),
+                    "layer_h": float(h),
+                    "layer_idx": layer_idx,
+                    "unit_lo": uid,
+                    "unit_hi": uid,
+                    "kp_lo": kps,
+                    "kp_hi": kps,
+                    "alpha": 0.0,
+                    "shell_kind": "physical",
+                }
+                prep = _prep_shell(
+                    phys_shell, verts, local_tris, "physical",
+                    200000 + uid,
+                )
+                by_h[hk].append(prep)
+
+        # Ghost shells near support heights (support-gap + regular ghosts)
+        # so support↔ghost intermediate contacts are detected.
+        spacing = float(getattr(self, "thick_ghost_spacing_mm", 0.0) or 0.0)
+        h_tol = max(0.5 * spacing, 1e-3) if spacing > 1e-12 else 1e-3
+        support_heights = list(by_h.keys())
+        for g in getattr(self, "_collision_ghost_shells", None) or []:
+            lh = float(g.get("layer_h", 0.0))
+            best_hk = None
+            best_d = 1e300
+            for hk in support_heights:
+                d = abs(float(hk) - lh)
+                if d < best_d:
+                    best_d = d
+                    best_hk = hk
+            if best_hk is None or best_d > h_tol * 2:
+                continue
+            verts = self._ghost_shell_live_verts(g, positions)
+            prep = _prep_shell(
+                g, verts, g["local_tris"], "ghost",
+                300000 + int(g.get("ghost_id", 0)),
+            )
+            by_h[best_hk].append(prep)
+
+        def _side_for(shell, verts, loc_i, p3d, panel, lh, sk):
+            # Reuse ghost bary mapper (same kp_lo / verts layout)
+            flat = self._flat_from_ghost_bary(
+                p3d, shell, verts, loc_i[0], loc_i[1], loc_i[2], flat_kps
+            )
+            side = {
+                "unit": int(shell.get("unit_lo", -1)),
+                "panel": int(panel),
+                "layer_idx": int(shell.get("layer_idx", -1)),
+                "layer_h": float(lh),
+                "shell_kind": sk,
+            }
+            return flat, side
+
+        def _emit_pair(left, right, t_left, t_right, kind, p0, p1, layer_h):
+            gL, gR = left["shell"], right["shell"]
+            sk_a = left["shell_kind"]
+            sk_b = right["shell_kind"]
+            # Prefer support as the primary shell_kind when either side is support
+            if sk_a == "support" or sk_b == "support":
+                pair_sk = "support"
+            else:
+                pair_sk = sk_a
+            u_lo = int(gL["unit_lo"])
+            u_hi = int(gR["unit_lo"])
+            p_of_ulo = int(gL["panel_idx"])
+            p_of_uhi = int(gR["panel_idx"])
+            layer_h_a = float(gL["layer_h"])
+            layer_h_b = float(gR["layer_h"])
+            layer_idx_a = int(gL.get("layer_idx", -1))
+            layer_idx_b = int(gR.get("layer_idx", -1))
+            p_lo = min(p_of_ulo, p_of_uhi)
+            p_hi = max(p_of_ulo, p_of_uhi)
+            i0a, i1a, i2a = t_left["local"]
+            i0b, i1b, i2b = t_right["local"]
+            pair_meta = {
+                "unit_a": u_lo,
+                "unit_b": u_hi,
+                "panel_of_unit_a": p_of_ulo,
+                "panel_of_unit_b": p_of_uhi,
+                "panel_a": p_lo,
+                "panel_b": p_hi,
+                "layer_idx": int(gL.get("layer_idx", -1)),
+                "layer_h": float(layer_h),
+                "layer_idx_a": layer_idx_a,
+                "layer_h_a": layer_h_a,
+                "layer_idx_b": layer_idx_b,
+                "layer_h_b": layer_h_b,
+                "tri_a": int(t_left["tri_idx"]),
+                "tri_b": int(t_right["tri_idx"]),
+                "tri_lo": int(t_left["tri_idx"]),
+                "tri_hi": int(t_right["tri_idx"]),
+                "shell_kind": pair_sk,
+                "shell_kind_a": sk_a,
+                "shell_kind_b": sk_b,
+            }
+            if kind == 1:
+                if len(contact_points) >= max_pts:
+                    return
+                contact_points.append(p0)
+                ent = dict(pair_meta)
+                fa, sa = _side_for(
+                    gL, left["verts"], (i0a, i1a, i2a), p0,
+                    p_of_ulo, layer_h_a, sk_a,
+                )
+                fb, sb = _side_for(
+                    gR, right["verts"], (i0b, i1b, i2b), p0,
+                    p_of_uhi, layer_h_b, sk_b,
+                )
+                sa["p"] = fa["p"]
+                sa["loc"] = fa["loc"]
+                sb["p"] = fb["p"]
+                sb["loc"] = fb["loc"]
+                self._annotate_side_depth(sa, p_of_ulo, layer_h_a, sk_a)
+                self._annotate_side_depth(sb, p_of_uhi, layer_h_b, sk_b)
+                ent["side_a"] = sa
+                ent["side_b"] = sb
+                ent["p"] = fa["p"]
+                ent["p_3d"] = p0
+                ent.update(self._stack_depth_fields(p_of_ulo, layer_h_a))
+                contact_points_flat.append(ent)
+            else:
+                if len(contact_segments) >= max_segs:
+                    return
+                contact_segments.append((p0, p1))
+                ent = dict(pair_meta)
+                fa0, sa = _side_for(
+                    gL, left["verts"], (i0a, i1a, i2a), p0,
+                    p_of_ulo, layer_h_a, sk_a,
+                )
+                fa1, _ = _side_for(
+                    gL, left["verts"], (i0a, i1a, i2a), p1,
+                    p_of_ulo, layer_h_a, sk_a,
+                )
+                fb0, sb = _side_for(
+                    gR, right["verts"], (i0b, i1b, i2b), p0,
+                    p_of_uhi, layer_h_b, sk_b,
+                )
+                fb1, _ = _side_for(
+                    gR, right["verts"], (i0b, i1b, i2b), p1,
+                    p_of_uhi, layer_h_b, sk_b,
+                )
+                sa["p0"], sa["p1"] = fa0["p"], fa1["p"]
+                sa["loc0"], sa["loc1"] = fa0["loc"], fa1["loc"]
+                sb["p0"], sb["p1"] = fb0["p"], fb1["p"]
+                sb["loc0"], sb["loc1"] = fb0["loc"], fb1["loc"]
+                self._annotate_side_depth(sa, p_of_ulo, layer_h_a, sk_a)
+                self._annotate_side_depth(sb, p_of_uhi, layer_h_b, sk_b)
+                ent["side_a"] = sa
+                ent["side_b"] = sb
+                ent["p0"], ent["p1"] = fa0["p"], fa1["p"]
+                ent["p0_3d"] = p0
+                ent["p1_3d"] = p1
+                ent.update(self._stack_depth_fields(p_of_ulo, layer_h_a))
+                contact_segments_flat.append(ent)
+                if len(contact_points) < max_pts:
+                    contact_points.append(p0)
+                if len(contact_points) < max_pts:
+                    contact_points.append(p1)
+
+        for hk, group in by_h.items():
+            n = len(group)
+            # Only run pairs that involve at least one support shell
+            for ia in range(n):
+                for ib in range(ia + 1, n):
+                    pa = group[ia]
+                    pb = group[ib]
+                    # Skip pure physical↔physical (already handled by Taichi)
+                    if pa["shell_kind"] == "physical" and pb["shell_kind"] == "physical":
+                        continue
+                    # Skip pure ghost↔ghost (handled in _detect_ghost_shell_contacts)
+                    if pa["shell_kind"] == "ghost" and pb["shell_kind"] == "ghost":
+                        continue
+                    # Require support on at least one side
+                    if (
+                        pa["shell_kind"] != "support"
+                        and pb["shell_kind"] != "support"
+                    ):
+                        continue
+                    if int(pa["shell"]["panel_idx"]) == int(pb["shell"]["panel_idx"]):
+                        continue
+                    for ta in pa["tris"]:
+                        for tb in pb["tris"]:
+                            pts = triangle_intersection_contacts_3d(
+                                ta["corners"], tb["corners"], eps=1e-4
+                            )
+                            if not pts:
+                                continue
+                            if len(pts) == 1:
+                                kind = 1
+                                p0 = [float(pts[0][0]), float(pts[0][1]), float(pts[0][2])]
+                                p1 = None
+                            else:
+                                kind = 2
+                                p0 = [float(pts[0][0]), float(pts[0][1]), float(pts[0][2])]
+                                p1 = [float(pts[-1][0]), float(pts[-1][1]), float(pts[-1][2])]
+                            left, right = pa, pb
+                            t_left, t_right = ta, tb
+                            if int(left["shell"]["unit_lo"]) > int(right["shell"]["unit_lo"]):
+                                left, right = right, left
+                                t_left, t_right = t_right, t_left
+                            _emit_pair(
+                                left, right, t_left, t_right,
+                                kind, p0, p1, float(hk),
+                            )
 
     @ti.func
     def _ti_v3(self, x, y, z):
@@ -2463,6 +3258,23 @@ class CollisionMixin:
                 self._ghost_contact_error_logged = True
                 print(f"[Contact] ghost shell detect failed: {exc}")
 
+        # Collision-only support shells (pad layer panel counts; no physics)
+        try:
+            self._detect_support_shell_contacts(
+                positions,
+                flat_kps,
+                contact_points,
+                contact_segments,
+                contact_points_flat,
+                contact_segments_flat,
+                max_pts,
+                max_segs,
+            )
+        except Exception as exc:
+            if not getattr(self, "_support_contact_error_logged", False):
+                self._support_contact_error_logged = True
+                print(f"[Contact] support shell detect failed: {exc}")
+
         # Collision-only vertical side panels (unique indices, no physics)
         try:
             self._detect_side_panel_contacts(
@@ -3109,8 +3921,8 @@ class CollisionMixin:
 
     def _render_panel_meshes(self, scene):
         """
-        Draw base mesh + translucent side walls + surface sweep paint
-        + red contact markers. (af0a695 non-Taichi draw path)
+        Draw base mesh + side walls + green support shells (not ghosts)
+        + surface sweep paint + red contact markers.
         """
         scene.mesh(
             self.vertices,
@@ -3119,7 +3931,7 @@ class CollisionMixin:
             two_sided=True,
         )
 
-        # Collision-only vertical side panels (pale green, two-sided).
+        # Collision-only vertical side panels (pale mint, two-sided).
         # GGUI mesh has no true alpha; light mint fill + green outline.
         # Topology/contact/edge-copy are all Taichi; draw uses live vertices.
         n_side_idx = int(getattr(self, "_side_panel_index_count", 0) or 0)
@@ -3158,6 +3970,44 @@ class CollisionMixin:
                     if not getattr(self, "_side_edge_error_logged", False):
                         self._side_edge_error_logged = True
                         print(f"[Contact] side panel edge draw failed: {exc}")
+
+        # Support panels (pad missing layer panels) — green fill, not ghosts.
+        # Live verts blended from physical shells each frame.
+        n_sup_idx = int(getattr(self, "_support_panel_index_count", 0) or 0)
+        if (
+            self.collision_shading
+            and bool(getattr(self, "thick_support_panels", True))
+            and n_sup_idx >= 3
+            and hasattr(self, "support_panel_verts")
+            and hasattr(self, "support_panel_indices")
+        ):
+            try:
+                self._update_support_panel_draw_verts()
+                scene.mesh(
+                    self.support_panel_verts,
+                    indices=self.support_panel_indices,
+                    # Bright green so missing-layer pads (e.g. miura @3 / @-9) stand out
+                    color=(0.12, 0.78, 0.18),
+                    two_sided=True,
+                    index_count=n_sup_idx,
+                )
+            except Exception as exc:
+                if not getattr(self, "_support_mesh_error_logged", False):
+                    self._support_mesh_error_logged = True
+                    print(f"[Contact] support panel mesh draw failed: {exc}")
+            n_sup_edge = int(getattr(self, "_support_panel_edge_vert_count", 0) or 0)
+            if n_sup_edge >= 2 and hasattr(self, "support_panel_edge_verts"):
+                try:
+                    scene.lines(
+                        self.support_panel_edge_verts,
+                        width=1.6,
+                        color=(0.08, 0.40, 0.10),
+                        vertex_count=n_sup_edge,
+                    )
+                except Exception as exc:
+                    if not getattr(self, "_support_edge_error_logged", False):
+                        self._support_edge_error_logged = True
+                        print(f"[Contact] support panel edge draw failed: {exc}")
 
         n_pts = self._collision_contact_count
         n_segs = self._collision_segment_count
@@ -3351,9 +4201,9 @@ class CollisionMixin:
                 parent_panel = side.get("parent_panel")
                 if parent_panel is None:
                     parent_panel = seg.get("parent_panel_a") if side_key == "side_a" else seg.get("parent_panel_b")
-                # Authoritative physical height from registry — but never for ghost
-                # or side shells: those keep their stamped layer_h / unique panel id.
-                if shell_kind_s not in ("ghost", "side"):
+                # Authoritative physical height from registry — but never for ghost,
+                # support, or side shells: those keep their stamped layer_h.
+                if shell_kind_s not in ("ghost", "side", "support"):
                     su = side.get("unit")
                     if su is not None:
                         try:
@@ -3387,10 +4237,15 @@ class CollisionMixin:
                 else:
                     depth_fields = self._stack_depth_fields(depth_panel, side_layer_h)
                 # Keep layer_h consistent with depth if side carried stamped depths
-                # (ghost/side: side_layer_h already correct; recompute depths).
-                if shell_kind_s in ("ghost", "side"):
+                # (ghost/support/side: side_layer_h already correct; recompute depths).
+                if shell_kind_s in ("ghost", "side", "support"):
                     depth_fields = self._stack_depth_fields(depth_panel, side_layer_h)
 
+                _sk_export = (
+                    shell_kind_s
+                    if shell_kind_s in ("ghost", "side", "support")
+                    else "physical"
+                )
                 region = {
                     # identity
                     "panel": panel_id,
@@ -3398,7 +4253,7 @@ class CollisionMixin:
                     "side": side_key,
                     "layer_idx": side_layer_idx,
                     "layer_h": side_layer_h,
-                    "shell_kind": shell_kind_s if shell_kind_s in ("ghost", "side") else "physical",
+                    "shell_kind": _sk_export,
                     "unit_a": int(seg.get("unit_a", -1)),
                     "unit_b": int(seg.get("unit_b", -1)),
                     "tri_a": int(seg.get("tri_a", -1)),
@@ -3448,9 +4303,10 @@ class CollisionMixin:
         n_sweep = sum(1 for r in regions if r.get("kind") == "sweep")
         n_ghost = sum(1 for r in regions if r.get("shell_kind") == "ghost")
         n_side = sum(1 for r in regions if r.get("shell_kind") == "side")
+        n_support = sum(1 for r in regions if r.get("shell_kind") == "support")
         n_phys = sum(
             1 for r in regions
-            if r.get("shell_kind") not in ("ghost", "side")
+            if r.get("shell_kind") not in ("ghost", "side", "support")
         )
         depth_tops = [
             float(r["depth_from_top_mm"])
@@ -3492,10 +4348,17 @@ class CollisionMixin:
             "n_physical_regions": n_phys,
             "n_ghost_regions": n_ghost,
             "n_side_regions": n_side,
+            "n_support_regions": n_support,
             "thick_ghost_spacing_mm": float(
                 getattr(self, "thick_ghost_spacing_mm", 0.0) or 0.0
             ),
+            "thick_support_panels": bool(
+                getattr(self, "thick_support_panels", True)
+            ),
             "n_ghost_shells": len(getattr(self, "_collision_ghost_shells", None) or []),
+            "n_support_shells": len(
+                getattr(self, "_collision_support_shells", None) or []
+            ),
             "n_side_panels": len(side_reg),
             "depth_global_max_from_top": float(max(depth_tops) if depth_tops else 0.0),
             "depth_global_max_from_bottom": float(max(depth_bots) if depth_bots else 0.0),
@@ -3507,7 +4370,8 @@ class CollisionMixin:
             print(
                 f"[Contact] shaded export: {len(regions)} region(s) "
                 f"(sweep={n_sweep}, sealed_lines={n_fixed}, "
-                f"physical={n_phys}, ghost={n_ghost}, side={n_side}) "
+                f"physical={n_phys}, ghost={n_ghost}, support={n_support}, "
+                f"side={n_side}) "
                 f"schema=dual_curve_v1 depth=stack_shell_v1 → input_json['shaded_regions']"
             )
 

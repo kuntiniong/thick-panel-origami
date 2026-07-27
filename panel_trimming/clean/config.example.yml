@@ -6,8 +6,13 @@
 #   3) Union-Find group messy nodes (group_tol) → outermost each
 #   4) convex-hull → straight_slack inflate → simplify to long straight edges
 #      (never undershoot; cap overshoot via max_overshoot_ratio)
-#   5) fabric_offset outward from cut polygon
-#   6) merge ghost+physical per panel → continuous min→max layer_h
+#   5) re-snap cut_ring onto creases (vertex + near-parallel edge attraction)
+#   6) fabric_offset outward from cut polygon, then re-snap fabric_ring
+#   7) merge per panel into continuous min→max solid prisms:
+#        main    = physical + ghost (XY = largest cleaned ghost layer)
+#        support = support pads     (XY = largest cleaned support layer;
+#                 Z expanded to abut physical stock)
+#      same rule: one largest-layer ring extruded min→max (not multi-union)
 
 min_area: 0
 straight_cut: true
@@ -17,9 +22,11 @@ max_overshoot_ratio: 1.35 # reject expand/simplify if cut grows too much vs hull
 fabric_offset: 0
 group_tol: 3.0
 round_dp: 6
-snap_tol: 0.5             # snap samples onto M/V/border if within this mm (0=off)
+# Snap samples + final cut/fabric rings onto M/V/border (mm). 0 = off.
+# Raise if original − collision leaves a thin wall along the crease.
+snap_tol: 1.5
 uf_respect_barriers: false
-merge_layer_stack: true   # per panel: ghost+main → one solid min→max height
+merge_layer_stack: true   # per panel: main + support streams → solid prisms
 
 jobs:
   - name: miura-thick-trimmed
@@ -29,5 +36,5 @@ jobs:
     straight_slack: 0.6
     max_overshoot_ratio: 1.35
     round_dp: 6
-    snap_tol: 0.5
+    snap_tol: 1.5
     merge_layer_stack: true

@@ -1,28 +1,35 @@
 """
-JSON → three STLs (panel stock, collision trim, final).
+JSON → STLs with separate main/support stock and collision.
 
 Reuses panel_trimming/visualize/visualize_3d associations:
   - panel outline from units[]
-  - thickness offsets from non-border crease heights (+ shade layer_h)
+  - thickness offsets from non-border crease heights (+ non-support shade layer_h)
   - collision polygons from resolve_shaded_associations
-    (cleaned → fabric/cut; trimmed → dual-curve ribbon)
-  - physical + ghost shades included; side ribbons skipped
+  - side ribbons always skipped
 
-Geometry:
-  1) original   — full panel stock (unit outline extruded over panel Z span)
-  2) collision  — clean.py merge (h_lo→h_hi continuous stack) when present;
-                  else fallback min→max of sample layer_h (no panel clip)
-  3) final      — stock − that collision band
+Solids / order of operations:
+  1) original            — full physical panel stock
+  2) support             — full solid stock at missing global heights
+                           (tightly abuts original; collision.py membership)
+  3) collision           — main solid prism (largest cleaned ghost layer)
+  4) support-collision   — support solid prism (largest cleaned support layer;
+                           same clean → prism rules as main)
+  5) final               — (original − collision)
+                           ∪ (support − support-collision)
+                           then optional crease gap (last) on mountain/valley
 
 Writes under panel_trimming/trimmedData/:
   <stem>-original.stl
   <stem>-collision.stl
+  <stem>-support-collision.stl
   <stem>-final.stl
+  <stem>-support.stl
 
 Usage:
   python panel_trimming/json_to_stl/run.py
   python panel_trimming/json_to_stl/run.py --name miura-thick-trimmed
   python panel_trimming/json_to_stl/run.py --config panel_trimming/json_to_stl/config.yml
+  python panel_trimming/json_to_stl/run.py --crease-shrink 1
 """
 
 from __future__ import annotations
@@ -50,6 +57,10 @@ from shapely.validation import make_valid
 
 # Same association / offset logic as the 3D visualizer
 from panel_trimming.visualize.visualize_3d import (  # noqa: E402
+    TYPE_MOUNTAIN,
+    TYPE_VALLEY,
+    _edge_key,
+    _line_edge_table,
     _poly_xy,
     _shell_kind_of,
     panel_thickness_offsets,
@@ -68,7 +79,15 @@ DEFAULT_CONFIG = os.path.join(_THIS_DIR, "config.yml")
 DEFAULT_CONFIG_EXAMPLE = os.path.join(_THIS_DIR, "config.example.yml")
 
 DEFAULT_THICKNESS = 6.0
+# Inward shrink (mm) on each panel edge that is a mountain/valley crease.
+DEFAULT_CREASE_SIDE_SHRINK = 1.0
 VERTEX_EPS = 1e-9
+# Expand collision footprints slightly before panel − collision so a ~0.05–0.2 mm
+# shortfall at creases does not leave a super-thin residual wall.
+DEFAULT_CUT_OVERSHOOT_MM = 0.35
+# Drop residual pieces thinner / smaller than this after the boolean (mm / mm²).
+DEFAULT_MIN_RESIDUAL_WIDTH_MM = 0.4
+DEFAULT_MIN_RESIDUAL_AREA = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +321,147 @@ def _panel_z_span(
     return -half, half
 
 
+def _line_intersect_2d(
+    p1: Sequence[float],
+    d1: Sequence[float],
+    p2: Sequence[float],
+    d2: Sequence[float],
+) -> Optional[List[float]]:
+    """Intersection of lines p1+s*d1 and p2+t*d2, or None if parallel."""
+    cross = float(d1[0]) * float(d2[1]) - float(d1[1]) * float(d2[0])
+    if abs(cross) < 1e-15:
+        return None
+    dx = float(p2[0]) - float(p1[0])
+    dy = float(p2[1]) - float(p1[1])
+    s = (dx * float(d2[1]) - dy * float(d2[0])) / cross
+    return [float(p1[0]) + s * float(d1[0]), float(p1[1]) + s * float(d1[1])]
+
+
+def _edge_is_crease(
+    a: Sequence,
+    b: Sequence,
+    table: Dict[Tuple, List[Dict[str, Any]]],
+) -> bool:
+    """True if undirected design edge a–b is mountain or valley."""
+    for ent in table.get(_edge_key(a, b), []):
+        try:
+            t = int(ent.get("type", 2))
+        except (TypeError, ValueError):
+            continue
+        if t in (TYPE_MOUNTAIN, TYPE_VALLEY):
+            return True
+    return False
+
+
+def shrink_panel_on_crease_sides(
+    outer_xy: Sequence,
+    data: dict,
+    *,
+    amount: float = DEFAULT_CREASE_SIDE_SHRINK,
+    edge_table: Optional[Dict[Tuple, List[Dict[str, Any]]]] = None,
+) -> List[List[float]]:
+    """
+    Inset each panel side that carries a mountain/valley crease by ``amount`` mm.
+
+    Border (and unmatched) edges stay put. Vertices are recomputed as
+    intersections of consecutive offset edge lines so corners meet cleanly.
+    Returns the original ring if amount <= 0 or the shrink would collapse.
+    """
+    pts = _dedupe_closed(outer_xy)
+    if len(pts) < 3:
+        return pts
+    d = float(amount)
+    if d <= 1e-12:
+        return pts
+
+    table = edge_table if edge_table is not None else _line_edge_table(data)
+
+    # Work in CCW so "left of edge" is interior (inward normal).
+    if _poly_signed_area(pts) < 0:
+        pts = list(reversed(pts))
+
+    n = len(pts)
+    crease_flags = [
+        _edge_is_crease(pts[i], pts[(i + 1) % n], table) for i in range(n)
+    ]
+    if not any(crease_flags):
+        return pts
+
+    # Offset distance per edge (inward).
+    edge_d = [d if crease_flags[i] else 0.0 for i in range(n)]
+
+    # Unit direction and inward normal per edge.
+    dirs: List[Tuple[float, float]] = []
+    inorms: List[Tuple[float, float]] = []
+    for i in range(n):
+        a = pts[i]
+        b = pts[(i + 1) % n]
+        dx = float(b[0]) - float(a[0])
+        dy = float(b[1]) - float(a[1])
+        length = math.hypot(dx, dy)
+        if length < 1e-15:
+            dirs.append((0.0, 0.0))
+            inorms.append((0.0, 0.0))
+            continue
+        ux, uy = dx / length, dy / length
+        dirs.append((ux, uy))
+        # Rotate 90° CCW → inward for a CCW ring.
+        inorms.append((-uy, ux))
+
+    new_pts: List[List[float]] = []
+    for i in range(n):
+        prev = (i - 1) % n
+        # Offset line of edge prev: through pts[prev] + d*n, direction dirs[prev]
+        # Offset line of edge i:    through pts[i]    + d*n, direction dirs[i]
+        op = [
+            float(pts[prev][0]) + edge_d[prev] * inorms[prev][0],
+            float(pts[prev][1]) + edge_d[prev] * inorms[prev][1],
+        ]
+        oi = [
+            float(pts[i][0]) + edge_d[i] * inorms[i][0],
+            float(pts[i][1]) + edge_d[i] * inorms[i][1],
+        ]
+        dp = dirs[prev]
+        di = dirs[i]
+        # Prefer full edge vectors if unit dirs vanished on a degenerate edge.
+        if abs(dp[0]) + abs(dp[1]) < 1e-15:
+            dp = (
+                float(pts[i][0]) - float(pts[prev][0]),
+                float(pts[i][1]) - float(pts[prev][1]),
+            )
+        if abs(di[0]) + abs(di[1]) < 1e-15:
+            nxt = pts[(i + 1) % n]
+            di = (float(nxt[0]) - float(pts[i][0]), float(nxt[1]) - float(pts[i][1]))
+
+        hit = _line_intersect_2d(op, dp, oi, di)
+        if hit is None:
+            # Parallel edges: pull vertex along averaged inward normal.
+            nx = inorms[prev][0] + inorms[i][0]
+            ny = inorms[prev][1] + inorms[i][1]
+            nl = math.hypot(nx, ny)
+            avg_d = 0.5 * (edge_d[prev] + edge_d[i])
+            if nl < 1e-15:
+                hit = [float(pts[i][0]), float(pts[i][1])]
+            else:
+                hit = [
+                    float(pts[i][0]) + avg_d * nx / nl,
+                    float(pts[i][1]) + avg_d * ny / nl,
+                ]
+        new_pts.append(hit)
+
+    new_pts = _dedupe_closed(new_pts)
+    if len(new_pts) < 3:
+        return pts
+    if abs(_poly_signed_area(new_pts)) < 1e-12:
+        return pts
+    # Reject self-inverting shrink (area sign flip or area growth).
+    a0 = abs(_poly_signed_area(pts))
+    a1 = abs(_poly_signed_area(new_pts))
+    if a1 > a0 * 1.001 or a1 < 1e-12:
+        return pts
+    return new_pts
+
+
 def _polygon_to_rings(
     p: Polygon,
 ) -> Optional[Tuple[List[List[float]], List[List[List[float]]]]]:
@@ -386,25 +546,151 @@ def _collision_cut_geom(
     return cut if not cut.is_empty else None
 
 
-def boolean_panel_minus_collisions(
-    outer_xy: Sequence,
-    collision_polys: Sequence[Sequence],
-) -> List[Tuple[List[List[float]], List[List[List[float]]]]]:
-    """
-    2D boolean: panel outline − collision footprints.
-
-    Robust to invalid dual-curve rings (buffer(0) / make_valid + multi-part).
-    Subtracts sequentially if a single union/difference fails.
-    """
+def _as_shapely_union(outer_xy: Sequence):
+    """Repaired panel polygon(s) as a single shapely geometry, or None."""
     panel_parts = _repair_ring_polygons(outer_xy)
     if not panel_parts:
-        return []
+        return None
     panel = panel_parts[0] if len(panel_parts) == 1 else unary_union(panel_parts)
     try:
         if not panel.is_valid:
             panel = make_valid(panel)
     except Exception:
         pass
+    return panel
+
+
+def _clip_pieces_to_outline(
+    pieces: Sequence[Tuple[List[List[float]], List[List[List[float]]]]],
+    clip_outer: Sequence,
+) -> List[Tuple[List[List[float]], List[List[List[float]]]]]:
+    """
+    Clip 2D pieces to ``clip_outer`` (intersection).
+
+    Used to apply **crease gap last**: after collision cuts on the full
+    outline, intersect with the crease-shrunk outline so mountain/valley
+    sides pull in and leave a hinge gap.
+    """
+    clip = _as_shapely_union(clip_outer)
+    if clip is None or getattr(clip, "is_empty", True):
+        return list(pieces or [])
+    out: List[Tuple[List[List[float]], List[List[List[float]]]]] = []
+    for outer_r, holes_r in pieces or []:
+        parts = _repair_ring_polygons(outer_r)
+        if not parts:
+            continue
+        g = parts[0] if len(parts) == 1 else unary_union(parts)
+        # Punch existing holes
+        for hr in holes_r or []:
+            hp = _as_shapely_union(hr)
+            if hp is not None and not getattr(hp, "is_empty", True):
+                try:
+                    g = g.difference(hp)
+                except Exception:
+                    pass
+        try:
+            if not g.is_valid:
+                g = make_valid(g)
+            inter = g.intersection(clip)
+        except Exception:
+            continue
+        for p in _geom_to_polygon_list(inter):
+            rings = _polygon_to_rings(p)
+            if rings is not None:
+                out.append(rings)
+    return out if out else list(pieces or [])
+
+
+def _expand_cut_geom(cut, amount: float):
+    """Outward buffer of a cut geometry (closes hairline crease gaps)."""
+    if cut is None or getattr(cut, "is_empty", True):
+        return cut
+    d = float(amount)
+    if d <= 1e-12:
+        return cut
+    try:
+        expanded = cut.buffer(
+            d,
+            join_style=2,  # mitre — keeps straight crease-parallel edges
+            mitre_limit=5.0,
+        )
+        if expanded is not None and not expanded.is_empty:
+            if not getattr(expanded, "is_valid", True):
+                expanded = make_valid(expanded)
+            return expanded
+    except Exception:
+        pass
+    return cut
+
+
+def _is_thin_polygon(
+    poly: Polygon,
+    *,
+    min_width: float = DEFAULT_MIN_RESIDUAL_WIDTH_MM,
+    min_area: float = DEFAULT_MIN_RESIDUAL_AREA,
+) -> bool:
+    """True for sliver residuals that should not survive stock − collision."""
+    try:
+        area = float(poly.area)
+    except Exception:
+        return True
+    if area < float(min_area):
+        return True
+    # Erosion test: if a half-width buffer empties the poly, it is too thin
+    half = 0.5 * float(min_width)
+    if half <= 1e-12:
+        return False
+    try:
+        core = poly.buffer(-half)
+        if core is None or getattr(core, "is_empty", True):
+            return True
+        if float(getattr(core, "area", 0.0) or 0.0) < 1e-12:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _filter_residual_polygons(
+    result,
+    *,
+    min_width: float = DEFAULT_MIN_RESIDUAL_WIDTH_MM,
+    min_area: float = DEFAULT_MIN_RESIDUAL_AREA,
+):
+    """Drop super-thin residual walls from panel − collision."""
+    kept: List[Polygon] = []
+    for p in _geom_to_polygon_list(result):
+        if _is_thin_polygon(p, min_width=min_width, min_area=min_area):
+            continue
+        kept.append(p)
+    if not kept:
+        return result  # keep original if everything would vanish
+    if len(kept) == 1:
+        return kept[0]
+    try:
+        return unary_union(kept)
+    except Exception:
+        return kept[0]
+
+
+def boolean_panel_minus_collisions(
+    outer_xy: Sequence,
+    collision_polys: Sequence[Sequence],
+    *,
+    cut_overshoot: float = DEFAULT_CUT_OVERSHOOT_MM,
+    min_residual_width: float = DEFAULT_MIN_RESIDUAL_WIDTH_MM,
+    min_residual_area: float = DEFAULT_MIN_RESIDUAL_AREA,
+) -> List[Tuple[List[List[float]], List[List[List[float]]]]]:
+    """
+    2D boolean: panel outline − collision footprints.
+
+    Robust to invalid dual-curve rings (buffer(0) / make_valid + multi-part).
+    Expands the cut by ``cut_overshoot`` so near-crease shortfalls do not leave
+    super-thin walls, then drops any residual slivers that remain.
+    """
+    panel = _as_shapely_union(outer_xy)
+    if panel is None:
+        return []
 
     # Collect repaired cut pieces
     cut_parts: List[Polygon] = []
@@ -421,7 +707,8 @@ def boolean_panel_minus_collisions(
             if not cut.is_empty:
                 if not cut.is_valid:
                     cut = make_valid(cut)
-                # Clip cut to panel when possible (cleaner holes)
+                # Overshoot first (into crease gaps), then clip to panel
+                cut = _expand_cut_geom(cut, cut_overshoot)
                 try:
                     clipped = cut.intersection(panel)
                     if not clipped.is_empty and getattr(clipped, "area", 0) > 1e-12:
@@ -437,6 +724,7 @@ def boolean_panel_minus_collisions(
                     p = part
                     if not p.is_valid:
                         p = p.buffer(0)
+                    p = _expand_cut_geom(p, cut_overshoot)
                     try:
                         inter = p.intersection(result)
                         if not inter.is_empty and getattr(inter, "area", 0) > 1e-12:
@@ -454,8 +742,18 @@ def boolean_panel_minus_collisions(
     except Exception:
         pass
 
+    result = _filter_residual_polygons(
+        result,
+        min_width=min_residual_width,
+        min_area=min_residual_area,
+    )
+
     out: List[Tuple[List[List[float]], List[List[List[float]]]]] = []
     for p in _geom_to_polygon_list(result):
+        if _is_thin_polygon(
+            p, min_width=min_residual_width, min_area=min_residual_area
+        ):
+            continue
         rings = _polygon_to_rings(p)
         if rings is not None:
             out.append(rings)
@@ -806,8 +1104,8 @@ def collect_panel_collisions_by_layer(
     """
     Collision footprints: panel → layer_h → rings.
 
-    kinds: None → physical + ghost; or e.g. ("ghost",) for ghost-only.
-    Side ribbons always skipped. Same polys as visualize_3d.
+    kinds: None → physical + ghost + support; or e.g. ("physical","ghost")
+    for main-only, ("support",) for support-only. Side ribbons always skipped.
 
     Note: cleaned data from clean.py already merges layer stacks and stamps
     h_lo/h_hi; prefer :func:`collect_panel_collision_slabs` for extrusion.
@@ -1038,6 +1336,146 @@ def ghost_layer_slabs(
     return [(float(z_a), float(z_b), all_rings)]
 
 
+def _expand_support_collision_to_stock(
+    support_coll: Dict[int, List[Tuple[float, float, List[List[List[float]]]]]],
+    support_stock: Dict[int, List[Tuple[float, float, List[List[List[float]]]]]],
+) -> Dict[int, List[Tuple[float, float, List[List[List[float]]]]]]:
+    """
+    Expand zero-thickness support-collision pads into the matching support
+    stock Z band (solid prism). No-op when clean.py already wrote continuous
+    h_lo→h_hi spans that fill the support stock.
+    """
+    if not support_coll:
+        return support_coll
+    out: Dict[int, List[Tuple[float, float, List[List[List[float]]]]]] = {}
+    for pid, slabs in support_coll.items():
+        stock = list(support_stock.get(int(pid)) or [])
+        expanded: List[Tuple[float, float, List[List[List[float]]]]] = []
+        for za, zb, rings in slabs or []:
+            za_f, zb_f = float(za), float(zb)
+            if zb_f < za_f:
+                za_f, zb_f = zb_f, za_f
+            if zb_f - za_f > 1e-9 or not stock:
+                expanded.append((za_f, zb_f, rings))
+                continue
+            mid = 0.5 * (za_f + zb_f)
+            # Place the pad into every stock band that contains its sample height
+            hit = False
+            for sza, szb, _ in stock:
+                sza_f, szb_f = float(sza), float(szb)
+                if sza_f > szb_f:
+                    sza_f, szb_f = szb_f, sza_f
+                if sza_f - 1e-9 <= mid <= szb_f + 1e-9:
+                    expanded.append((sza_f, szb_f, rings))
+                    hit = True
+            if not hit:
+                # Nearest stock band (below/above pad)
+                best = min(
+                    stock,
+                    key=lambda s: min(
+                        abs(mid - float(s[0])), abs(mid - float(s[1]))
+                    ),
+                )
+                expanded.append((float(best[0]), float(best[1]), rings))
+        if expanded:
+            out[int(pid)] = expanded
+    return out
+
+
+def collect_support_panel_slabs(
+    data: dict,
+    *,
+    default_thickness: float = DEFAULT_THICKNESS,
+    half_thickness: Optional[float] = None,
+    phys_span_by_panel: Optional[Dict[int, Tuple[float, float]]] = None,
+) -> Dict[int, List[Tuple[float, float, List[List[List[float]]]]]]:
+    """
+    Full solid support stock tightly fitted to each panel's original solid.
+
+    Membership matches ``collision.py`` ``_build_support_collision_shells``:
+      global heights = union of per-panel physical (crease) shell heights
+      support where this panel has no shell but another panel does
+
+    STL solid (not thin pads, not free-floating blocks):
+      original fills continuous [phys_lo, phys_hi]
+      support only **outside** that span, abutting the original face:
+
+        miura global {-9, -3, 3}
+          P0 original [-3, 3]  → support [-9, -3]  tight under original
+          P2 original [-9, -3] → support [-3,  3]  tight above original
+
+    ``phys_span_by_panel`` forces the interface to the actual original extrusion
+    (needed when ``--thickness`` recenters the stock).
+    """
+    _ = half_thickness  # API compat; tight-fit does not use ±half pads
+    units = list(data.get("units") or [])
+    # Crease-shell heights only (same as collision.py unit Z), not shade layer_h
+    offsets = panel_thickness_offsets(units, data, shaded_regions=None)
+    n = len(units)
+    if n == 0:
+        return {}
+
+    height_keys: List[float] = []
+    seen = set()
+    for offs in offsets:
+        for h in offs:
+            key = round(float(h), 6)
+            if key in seen:
+                continue
+            seen.add(key)
+            height_keys.append(float(h))
+    height_keys.sort()
+    if not height_keys:
+        return {}
+
+    out: Dict[int, List[Tuple[float, float, List[List[List[float]]]]]] = {}
+    for pi, unit in enumerate(units):
+        outer = _dedupe_closed(_poly_xy(unit))
+        if len(outer) < 3:
+            continue
+        offs = list(offsets[pi]) if pi < len(offsets) else [0.0]
+        present = {round(float(h), 6) for h in offs}
+
+        if phys_span_by_panel is not None and pi in phys_span_by_panel:
+            phys_lo, phys_hi = (
+                float(phys_span_by_panel[pi][0]),
+                float(phys_span_by_panel[pi][1]),
+            )
+        else:
+            phys_lo, phys_hi = _panel_z_span(
+                offs, default_thickness=default_thickness
+            )
+
+        # Missing global shells strictly outside the original solid
+        below = [
+            float(h)
+            for h in height_keys
+            if round(float(h), 6) not in present
+            and float(h) < float(phys_lo) - 1e-9
+        ]
+        above = [
+            float(h)
+            for h in height_keys
+            if round(float(h), 6) not in present
+            and float(h) > float(phys_hi) + 1e-9
+        ]
+
+        slabs: List[Tuple[float, float, List[List[List[float]]]]] = []
+        # One solid block tightly under original
+        if below:
+            z_a, z_b = float(min(below)), float(phys_lo)
+            if z_b - z_a > 1e-12:
+                slabs.append((z_a, z_b, [outer]))
+        # One solid block tightly above original
+        if above:
+            z_a, z_b = float(phys_hi), float(max(above))
+            if z_b - z_a > 1e-12:
+                slabs.append((z_a, z_b, [outer]))
+        if slabs:
+            out[pi] = slabs
+    return out
+
+
 def _extrude_rings_raw(
     rings: Sequence[Sequence],
     *,
@@ -1063,47 +1501,270 @@ def _extrude_rings_raw(
     return V, F, N, n_ok
 
 
+def _expand_rings_xy(
+    rings: Sequence[Sequence],
+    amount: float = DEFAULT_CUT_OVERSHOOT_MM,
+) -> List[List[List[float]]]:
+    """Outward-buffer rings so exported collision solids seal to creases."""
+    d = float(amount)
+    if d <= 1e-12:
+        return [list(r) for r in (rings or []) if r is not None and len(r) >= 3]
+    out: List[List[List[float]]] = []
+    for ring in rings or []:
+        parts = _repair_ring_polygons(ring)
+        if not parts:
+            r = _dedupe_closed(ring)
+            if len(r) >= 3:
+                out.append(r)
+            continue
+        for p in parts:
+            try:
+                exp = p.buffer(d, join_style=2, mitre_limit=5.0)
+            except Exception:
+                exp = p
+            if exp is None or getattr(exp, "is_empty", True):
+                continue
+            if not getattr(exp, "is_valid", True):
+                try:
+                    exp = make_valid(exp)
+                except Exception:
+                    continue
+            for q in _geom_to_polygon_list(exp):
+                rings_q = _polygon_to_rings(q)
+                if rings_q is not None:
+                    out.append(rings_q[0])
+    return out
+
+
+def _extrude_collision_slabs(
+    slabs: Sequence[Tuple[float, float, Sequence[Sequence]]],
+    *,
+    cut_overshoot: float = DEFAULT_CUT_OVERSHOOT_MM,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """
+    Extrude collision slab rings → mesh.
+
+    Rings are expanded by ``cut_overshoot`` so the collision solid matches the
+    sealed cut used in final boolean (no hairline crease gap).
+
+    Returns (V, F, N, n_pieces_ok, n_failed_rings).
+    """
+    meshes: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    n_ok = 0
+    n_fail = 0
+    for za, zb, rings in slabs or []:
+        use_rings = _expand_rings_xy(rings, amount=cut_overshoot)
+        if not use_rings:
+            use_rings = list(rings or [])
+        merged_pieces = _union_rings_unclipped(use_rings)
+        if merged_pieces:
+            Vc, Fc, Nc = _extrude_pieces(merged_pieces, z_lo=za, z_hi=zb)
+            if len(Vc) and len(Fc):
+                n_ok += len(merged_pieces)
+                meshes.append((Vc, Fc, Nc))
+            else:
+                n_fail += len(use_rings)
+        else:
+            Vc, Fc, Nc, n_raw = _extrude_rings_raw(use_rings, z_lo=za, z_hi=zb)
+            n_ok += n_raw
+            n_fail += max(0, len(use_rings) - n_raw)
+            if len(Vc) and len(Fc):
+                meshes.append((Vc, Fc, Nc))
+    V, F, N = merge_meshes(meshes)
+    return V, F, N, n_ok, n_fail
+
+
+def _merge_slab_dicts(
+    *dicts: Dict[int, List[Tuple[float, float, List[List[List[float]]]]]],
+) -> Dict[int, List[Tuple[float, float, List[List[List[float]]]]]]:
+    """Union per-panel slab lists from several sources (main + support, …)."""
+    out: Dict[int, List[Tuple[float, float, List[List[List[float]]]]]] = {}
+    for d in dicts:
+        for pid, slabs in (d or {}).items():
+            out.setdefault(int(pid), []).extend(list(slabs or []))
+    return out
+
+
+def _stock_minus_collision_slabs(
+    outer: Sequence,
+    slabs: Sequence[Tuple[float, float, Sequence[Sequence]]],
+    *,
+    z_lo: float,
+    z_hi: float,
+    fallback_mesh: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    inset_outer: Optional[Sequence] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Extrude panel outline with collision bands boolean-subtracted in Z slabs.
+
+    Between collision Z bands the full outline is kept solid; inside each band
+    the 2D boolean panel − collision rings is extruded.
+
+    If ``inset_outer`` is set, **crease gap is applied last**: after collision
+    cuts on ``outer``, each 2D piece is intersected with the crease-shrunk
+    outline so mountain/valley sides leave a hinge gap.
+    """
+    use_inset = inset_outer is not None and len(_dedupe_closed(inset_outer)) >= 3
+
+    def _maybe_gap(
+        pieces: List[Tuple[List[List[float]], List[List[List[float]]]]],
+    ) -> List[Tuple[List[List[float]], List[List[List[float]]]]]:
+        if not use_inset:
+            return pieces
+        clipped = _clip_pieces_to_outline(pieces, inset_outer)
+        return clipped if clipped else pieces
+
+    if not slabs:
+        if use_inset:
+            pieces = _maybe_gap([(list(outer), [])])
+            V, F, N = _extrude_pieces(pieces, z_lo=z_lo, z_hi=z_hi)
+            if len(V) and len(F):
+                return V, F, N, len(pieces)
+        if fallback_mesh is not None and not use_inset:
+            V, F, N = fallback_mesh
+            return V, F, N, 1
+        outline = inset_outer if use_inset else outer
+        V, F, N = extrude_polygon_mesh(outline, z_lo=z_lo, z_hi=z_hi, holes=None)
+        return V, F, N, 1 if len(V) and len(F) else 0
+
+    meshes: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    n_pieces = 0
+    cursor = float(z_lo)
+    for za, zb, rings in sorted(slabs, key=lambda s: s[0]):
+        za_c = max(float(za), float(z_lo))
+        zb_c = min(float(zb), float(z_hi))
+        if za_c > cursor + 1e-12:
+            # Solid gap between collision bands — full outer, then crease gap last
+            pieces = _maybe_gap([(list(outer), [])])
+            Vgap, Fgap, Ngap = _extrude_pieces(pieces, z_lo=cursor, z_hi=za_c)
+            if len(Vgap) and len(Fgap):
+                meshes.append((Vgap, Fgap, Ngap))
+                n_pieces += len(pieces)
+        if zb_c - za_c > 1e-12 and rings:
+            # 1) cut collisions on full outline  2) crease gap last
+            pieces = boolean_panel_minus_collisions(outer, rings)
+            if not pieces:
+                pieces = [(list(outer), [])]
+            pieces = _maybe_gap(pieces)
+            Vf, Ff, Nf = _extrude_pieces(pieces, z_lo=za_c, z_hi=zb_c)
+            if len(Vf) and len(Ff):
+                meshes.append((Vf, Ff, Nf))
+                n_pieces += len(pieces)
+        cursor = max(cursor, zb_c)
+    if float(z_hi) > cursor + 1e-12:
+        pieces = _maybe_gap([(list(outer), [])])
+        Vgap, Fgap, Ngap = _extrude_pieces(pieces, z_lo=cursor, z_hi=z_hi)
+        if len(Vgap) and len(Fgap):
+            meshes.append((Vgap, Fgap, Ngap))
+            n_pieces += len(pieces)
+
+    V, F, N = merge_meshes(meshes)
+    if (len(V) == 0 or len(F) == 0) and fallback_mesh is not None and not use_inset:
+        return fallback_mesh[0], fallback_mesh[1], fallback_mesh[2], 1
+    return V, F, N, n_pieces
+
+
 def build_panel_meshes(
     data: dict,
     *,
     default_thickness: float = DEFAULT_THICKNESS,
     thickness: Optional[float] = None,
     panels: Optional[Sequence[int]] = None,
+    crease_side_shrink: float = DEFAULT_CREASE_SIDE_SHRINK,
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
     """
-    Build three mesh groups per design unit:
+    Build mesh groups per design unit (order of operations):
 
-      original   — full panel stock (no cuts)
-      collision  — clean.py layer-stack merge (h_lo→h_hi) when present;
-                   else fallback min→max of sample layer_h
-      final      — stock − that collision band
+      1 original            — full physical panel stock
+      2 support             — full solid stock at missing global heights
+      3 collision           — main collision (physical + ghost)
+      4 support_collision   — support-shade collision only
+      5 final               — original ∪ support
+                              − support-collision − collision
+                              then optional crease gap (last)
 
-    Thickness offsets match visualize_3d.panel_thickness_offsets.
+    Identity:
+      final = original + support − support-collision − collision
+              (− crease gap last if crease_side_shrink > 0)
     """
     units = list(data.get("units") or [])
     shades = list(data.get("shaded_regions") or [])
+    # Stock Z uses crease + shade (paint) offsets; support membership uses
+    # crease-only heights inside collect_support_panel_slabs (collision.py style).
     offsets = panel_thickness_offsets(units, data, shades)
-    # Prefer clean.py continuous spans (h_lo/h_hi); fallback min→max merge
-    all_slabs = collect_panel_collision_slabs(data, kinds=None)
+    # Separate collision streams (side always skipped inside collector).
+    # clean.py routes out-of-span ghosts into shell_kind=support with a
+    # continuous h_lo→h_hi prism (same treatment as main phys+ghost).
+    main_slabs_all = collect_panel_collision_slabs(
+        data, kinds=("physical", "ghost")
+    )
+    support_coll_slabs_all = collect_panel_collision_slabs(
+        data, kinds=("support",)
+    )
+    stock_th = (
+        float(thickness)
+        if thickness is not None and float(thickness) > 0
+        else float(default_thickness)
+    )
+    # Actual original extrusion spans — support abuts these faces tightly
+    phys_span_by_panel: Dict[int, Tuple[float, float]] = {}
+    for pi, offs in enumerate(offsets):
+        offs_i = list(offs) if offs else [0.0]
+        if thickness is not None and float(thickness) > 0:
+            z0, z1 = _panel_z_span(offs_i, default_thickness=float(thickness))
+            mid = 0.5 * (z0 + z1)
+            half = 0.5 * float(thickness)
+            phys_span_by_panel[pi] = (mid - half, mid + half)
+        else:
+            phys_span_by_panel[pi] = _panel_z_span(
+                offs_i, default_thickness=default_thickness
+            )
+    # Full solid support: tight blocks outside each original solid
+    support_stock_slabs_all = collect_support_panel_slabs(
+        data,
+        default_thickness=stock_th,
+        phys_span_by_panel=phys_span_by_panel,
+    )
+    # Safety: if support-collision still has a zero-thickness pad (unmerged /
+    # pre-clean input), expand it to the matching support-stock band so it is
+    # a real solid prism like main collision.
+    support_coll_slabs_all = _expand_support_collision_to_stock(
+        support_coll_slabs_all, support_stock_slabs_all
+    )
+    edge_table = _line_edge_table(data)
+    shrink_mm = float(crease_side_shrink)
 
     want: Optional[set] = set(int(p) for p in panels) if panels is not None else None
 
     groups: Dict[str, List[Dict[str, Any]]] = {
         "original": [],
         "collision": [],
+        "support_collision": [],
         "final": [],
+        "support": [],
     }
     report: Dict[str, Any] = {
         "n_panels": 0,
         "n_collisions_total": 0,
         "n_collision_layers": 0,
+        "n_support_collisions_total": 0,
+        "n_support_collision_layers": 0,
+        "n_support_slabs": 0,
         "n_triangles_original": 0,
         "n_triangles_collision": 0,
+        "n_triangles_support_collision": 0,
         "n_triangles_final": 0,
+        "n_triangles_support": 0,
+        "crease_side_shrink": shrink_mm,
         "panels": [],
         "build": (
-            "visualize_3d: original stock | collision from clean "
-            "h_lo→h_hi (or min→max fallback) | final = stock − collision"
+            "final = (original − collision) ∪ (support − support-collision)"
+            + (
+                f" then crease gap −{shrink_mm:g}mm (last)"
+                if shrink_mm > 1e-12
+                else ""
+            )
+            + "; each stream is a largest-layer solid prism"
         ),
     }
 
@@ -1113,6 +1774,19 @@ def build_panel_meshes(
         outer = _dedupe_closed(_poly_xy(unit))
         if len(outer) < 3:
             continue
+        outer_inset = shrink_panel_on_crease_sides(
+            outer,
+            data,
+            amount=shrink_mm,
+            edge_table=edge_table,
+        )
+        if len(outer_inset) < 3:
+            outer_inset = outer
+        n_crease_sides = sum(
+            1
+            for j in range(len(outer))
+            if _edge_is_crease(outer[j], outer[(j + 1) % len(outer)], edge_table)
+        )
 
         offs = list(offsets[pi]) if pi < len(offsets) else [0.0]
         if thickness is not None and float(thickness) > 0:
@@ -1125,80 +1799,98 @@ def build_panel_meshes(
             z_lo, z_hi = _panel_z_span(offs, default_thickness=default_thickness)
             th = float(z_hi - z_lo)
 
-        slabs = list(all_slabs.get(pi) or [])
-        n_coll = sum(len(rings) for _, _, rings in slabs)
-        n_layers = len(slabs)
+        main_slabs = list(main_slabs_all.get(pi) or [])
+        sup_coll_slabs = list(support_coll_slabs_all.get(pi) or [])
+        # Stream-local cuts: original − main only; support stock − support-coll only
+        n_coll = sum(len(rings) for _, _, rings in main_slabs)
+        n_layers = len(main_slabs)
+        n_sup_coll = sum(len(rings) for _, _, rings in sup_coll_slabs)
+        n_sup_coll_layers = len(sup_coll_slabs)
 
-        # 1) original stock
+        # 1) original stock — full outline, no cuts
         V_o, F_o, N_o = extrude_polygon_mesh(
             outer, z_lo=z_lo, z_hi=z_hi, holes=None
         )
         if len(V_o) == 0 or len(F_o) == 0:
             continue
 
-        # 2) collision STL — continuous h_lo→h_hi from clean (or fallback)
-        coll_meshes: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-        n_coll_pieces = 0
-        n_coll_failed = 0
-        for za, zb, rings in slabs:
-            # Prefer 2D union → single extrude; raw fallback
-            merged_pieces = _union_rings_unclipped(rings)
-            if merged_pieces:
-                Vc, Fc, Nc = _extrude_pieces(merged_pieces, z_lo=za, z_hi=zb)
-                if len(Vc) and len(Fc):
-                    n_coll_pieces += len(merged_pieces)
-                    coll_meshes.append((Vc, Fc, Nc))
-                else:
-                    n_coll_failed += len(rings)
-            else:
-                Vc, Fc, Nc, n_ok = _extrude_rings_raw(rings, z_lo=za, z_hi=zb)
-                n_coll_pieces += n_ok
-                n_coll_failed += max(0, len(rings) - n_ok)
-                if len(Vc) and len(Fc):
-                    coll_meshes.append((Vc, Fc, Nc))
-        V_c, F_c, N_c = merge_meshes(coll_meshes)
+        # 2) main collision — physical + ghost only
+        V_c, F_c, N_c, n_coll_pieces, n_coll_failed = _extrude_collision_slabs(
+            main_slabs
+        )
 
-        # 3) final — stock with one cut through the merged collision band
-        if not slabs:
+        # 2b) support collision — support shades only
+        V_sc, F_sc, N_sc, n_sc_pieces, n_sc_failed = _extrude_collision_slabs(
+            sup_coll_slabs
+        )
+
+        # 3) support — full solid tightly fitted under/over original stock
+        #    (collision.py membership; solid block abuts phys_lo/phys_hi)
+        sup_slabs = list(support_stock_slabs_all.get(pi) or [])
+        n_sup = sum(len(rings) for _, _, rings in sup_slabs)
+        sup_meshes: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        n_sup_pieces = 0
+        for za, zb, rings in sup_slabs:
+            for ring in rings:
+                Vs, Fs, Ns = extrude_polygon_mesh(
+                    ring, z_lo=za, z_hi=zb, holes=None
+                )
+                if len(Vs) and len(Fs):
+                    sup_meshes.append((Vs, Fs, Ns))
+                    n_sup_pieces += 1
+        V_s, F_s, N_s = merge_meshes(sup_meshes)
+
+        # 4) final = (original − main-collision) ∪ (support − support-collision)
+        #    then optional crease gap last. Streams stay separate so support
+        #    collision prisms do not carve the physical stock and vice versa.
+        apply_gap = (
+            shrink_mm > 1e-12
+            and n_crease_sides > 0
+            and len(outer_inset) >= 3
+        )
+        gap_clip = outer_inset if apply_gap else None
+        final_meshes: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        n_final_pieces = 0
+        V_fp, F_fp, N_fp, n_fp = _stock_minus_collision_slabs(
+            outer,
+            main_slabs,
+            z_lo=z_lo,
+            z_hi=z_hi,
+            fallback_mesh=(V_o, F_o, N_o),
+            inset_outer=gap_clip,
+        )
+        if len(V_fp) and len(F_fp):
+            final_meshes.append((V_fp, F_fp, N_fp))
+            n_final_pieces += n_fp
+        for za, zb, rings in sup_slabs:
+            for ring in rings:
+                Vs0, Fs0, Ns0 = extrude_polygon_mesh(
+                    ring, z_lo=za, z_hi=zb, holes=None
+                )
+                if not (len(Vs0) and len(Fs0)):
+                    continue
+                ring_inset = None
+                if gap_clip is not None:
+                    ring_inset = shrink_panel_on_crease_sides(
+                        ring, data, amount=shrink_mm, edge_table=edge_table
+                    )
+                    if len(ring_inset) < 3:
+                        ring_inset = outer_inset
+                Vsf, Fsf, Nsf, n_sf = _stock_minus_collision_slabs(
+                    ring,
+                    sup_coll_slabs,
+                    z_lo=za,
+                    z_hi=zb,
+                    fallback_mesh=(Vs0, Fs0, Ns0),
+                    inset_outer=ring_inset,
+                )
+                if len(Vsf) and len(Fsf):
+                    final_meshes.append((Vsf, Fsf, Nsf))
+                    n_final_pieces += n_sf
+        V_f, F_f, N_f = merge_meshes(final_meshes)
+        if len(V_f) == 0 or len(F_f) == 0:
             V_f, F_f, N_f = V_o, F_o, N_o
             n_final_pieces = 1
-        else:
-            final_meshes: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-            n_final_pieces = 0
-            cut_slabs_sorted = sorted(slabs, key=lambda s: s[0])
-            cursor = z_lo
-            for za, zb, rings in cut_slabs_sorted:
-                za_c = max(float(za), z_lo)
-                zb_c = min(float(zb), z_hi)
-                if za_c > cursor + 1e-12:
-                    Vgap, Fgap, Ngap = extrude_polygon_mesh(
-                        outer, z_lo=cursor, z_hi=za_c, holes=None
-                    )
-                    if len(Vgap) and len(Fgap):
-                        final_meshes.append((Vgap, Fgap, Ngap))
-                        n_final_pieces += 1
-                if zb_c - za_c > 1e-12 and rings:
-                    final_pieces = boolean_panel_minus_collisions(outer, rings)
-                    if not final_pieces:
-                        # clip wiped everything — keep solid stock for band
-                        final_pieces = [(outer, [])]
-                    Vf, Ff, Nf = _extrude_pieces(
-                        final_pieces, z_lo=za_c, z_hi=zb_c
-                    )
-                    if len(Vf) and len(Ff):
-                        final_meshes.append((Vf, Ff, Nf))
-                        n_final_pieces += len(final_pieces)
-                cursor = max(cursor, zb_c)
-            if z_hi > cursor + 1e-12:
-                Vgap, Fgap, Ngap = extrude_polygon_mesh(
-                    outer, z_lo=cursor, z_hi=z_hi, holes=None
-                )
-                if len(Vgap) and len(Fgap):
-                    final_meshes.append((Vgap, Fgap, Ngap))
-                    n_final_pieces += 1
-            V_f, F_f, N_f = merge_meshes(final_meshes)
-            if len(V_f) == 0 or len(F_f) == 0:
-                V_f, F_f, N_f = V_o, F_o, N_o
 
         base_meta = {
             "panel": pi,
@@ -1208,8 +1900,15 @@ def build_panel_meshes(
             "offsets": offs,
             "n_collisions": n_coll,
             "n_collision_layers": n_layers,
-            "n_z_slabs": len(slabs),
+            "n_z_slabs": len(main_slabs),
             "n_collision_failed": n_coll_failed,
+            "n_support_collisions": n_sup_coll,
+            "n_support_collision_layers": n_sup_coll_layers,
+            "n_support_collision_failed": n_sc_failed,
+            "n_crease_sides": n_crease_sides,
+            "crease_side_shrink": shrink_mm,
+            "n_support_slabs": len(sup_slabs),
+            "n_support_rings": n_sup,
         }
         groups["original"].append({
             **base_meta,
@@ -1232,6 +1931,17 @@ def build_panel_meshes(
                 "faces": F_c,
                 "normals": N_c,
             })
+        if len(V_sc) and len(F_sc):
+            groups["support_collision"].append({
+                **base_meta,
+                "kind": "support_collision",
+                "n_pieces": n_sc_pieces,
+                "n_verts": int(len(V_sc)),
+                "n_faces": int(len(F_sc)),
+                "vertices": V_sc,
+                "faces": F_sc,
+                "normals": N_sc,
+            })
         groups["final"].append({
             **base_meta,
             "kind": "final",
@@ -1242,13 +1952,29 @@ def build_panel_meshes(
             "faces": F_f,
             "normals": N_f,
         })
+        if len(V_s) and len(F_s):
+            groups["support"].append({
+                **base_meta,
+                "kind": "support",
+                "n_pieces": n_sup_pieces,
+                "n_verts": int(len(V_s)),
+                "n_faces": int(len(F_s)),
+                "vertices": V_s,
+                "faces": F_s,
+                "normals": N_s,
+            })
 
         report["n_panels"] += 1
         report["n_collisions_total"] += n_coll
         report["n_collision_layers"] += n_layers
+        report["n_support_collisions_total"] += n_sup_coll
+        report["n_support_collision_layers"] += n_sup_coll_layers
+        report["n_support_slabs"] += len(sup_slabs)
         report["n_triangles_original"] += int(len(F_o))
         report["n_triangles_collision"] += int(len(F_c))
+        report["n_triangles_support_collision"] += int(len(F_sc))
         report["n_triangles_final"] += int(len(F_f))
+        report["n_triangles_support"] += int(len(F_s))
         report["panels"].append({
             "panel": pi,
             "thickness": th,
@@ -1257,13 +1983,23 @@ def build_panel_meshes(
             "offsets": offs,
             "n_collisions": n_coll,
             "n_collision_layers": n_layers,
-            "n_z_slabs": len(slabs),
+            "n_z_slabs": len(main_slabs),
             "n_collision_pieces": n_coll_pieces,
             "n_collision_failed": n_coll_failed,
+            "n_support_collisions": n_sup_coll,
+            "n_support_collision_layers": n_sup_coll_layers,
+            "n_support_collision_pieces": n_sc_pieces,
+            "n_support_collision_failed": n_sc_failed,
             "n_final_pieces": n_final_pieces,
+            "n_support_pieces": n_sup_pieces,
+            "n_support_slabs": len(sup_slabs),
+            "n_crease_sides": n_crease_sides,
+            "crease_side_shrink": shrink_mm,
             "n_faces_original": int(len(F_o)),
             "n_faces_collision": int(len(F_c)),
+            "n_faces_support_collision": int(len(F_sc)),
             "n_faces_final": int(len(F_f)),
+            "n_faces_support": int(len(F_s)),
         })
 
     return groups, report
@@ -1274,26 +2010,37 @@ def _output_paths(base_path: str) -> Dict[str, str]:
     Map role → path.
 
     base_path may be:
-      .../stem.stl           → stem-original / -collision / -final
-      .../stem-final.stl     → same stem family
-      .../stem (no ext)      → treated as stem
+      .../stem.stl  → stem-original / -collision / -support-collision /
+                      -final / -support
+      .../stem-final.stl → same stem family
     """
     directory = os.path.dirname(os.path.abspath(base_path)) or "."
     name = os.path.basename(base_path)
     stem, ext = os.path.splitext(name)
     if not ext:
         stem = name
-    # If user already passed *-final / *-original / *-collision, strip role suffix
+    # If user already passed a role suffix, strip it to get the family stem
     lower = stem.lower()
-    for suffix in ("-final", "_final", "-original", "_original",
-                   "-collision", "_collision", "-trim", "_trim"):
+    # Longer suffixes first so -support-collision wins over -collision / -support
+    for suffix in (
+        "-support-collision", "_support_collision",
+        "-final", "_final",
+        "-original", "_original",
+        "-collision", "_collision",
+        "-support", "_support",
+        "-trim", "_trim",
+    ):
         if lower.endswith(suffix):
             stem = stem[: -len(suffix)]
             break
     return {
         "original": os.path.join(directory, f"{stem}-original.stl"),
         "collision": os.path.join(directory, f"{stem}-collision.stl"),
+        "support_collision": os.path.join(
+            directory, f"{stem}-support-collision.stl"
+        ),
         "final": os.path.join(directory, f"{stem}-final.stl"),
+        "support": os.path.join(directory, f"{stem}-support.stl"),
     }
 
 
@@ -1304,6 +2051,7 @@ def export_stl(
     default_thickness: float = DEFAULT_THICKNESS,
     thickness: Optional[float] = None,
     panels: Optional[Sequence[int]] = None,
+    crease_side_shrink: float = DEFAULT_CREASE_SIDE_SHRINK,
     source_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     groups, report = build_panel_meshes(
@@ -1311,6 +2059,7 @@ def export_stl(
         default_thickness=default_thickness,
         thickness=thickness,
         panels=panels,
+        crease_side_shrink=crease_side_shrink,
     )
     report["input"] = source_path
     report["outputs"] = {}
@@ -1320,12 +2069,18 @@ def export_stl(
     paths = _output_paths(output_path)
     os.makedirs(os.path.dirname(os.path.abspath(paths["final"])) or ".", exist_ok=True)
 
-    for role in ("original", "collision", "final"):
+    for role in (
+        "original",
+        "collision",
+        "support_collision",
+        "final",
+        "support",
+    ):
         meshes = groups.get(role) or []
         path = paths[role]
         if not meshes:
-            # Empty collision set: still write a minimal empty-ish solid? skip file.
-            if role == "collision":
+            # Empty optional streams: skip file.
+            if role in ("collision", "support_collision", "support"):
                 report["outputs"][role] = None
                 report[f"n_verts_{role}"] = 0
                 report[f"n_faces_{role}"] = 0
@@ -1360,9 +2115,10 @@ def export_file(input_path: str, output_path: str, **kwargs: Any) -> Dict[str, A
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Write 3 STLs per design: original stock, collision trim-away, "
-            "and final (stock − collision). Same associations as visualize_3d. "
-            "Outputs: <stem>-original.stl, <stem>-collision.stl, <stem>-final.stl"
+            "Write STLs per design: original stock, main collision "
+            "(phys+ghost), support-collision (support shades), final, "
+            "and support solid. Outputs: <stem>-original/collision/"
+            "support-collision/final/support.stl"
         )
     )
     parser.add_argument("path", nargs="?", default=None, help="Input JSON path")
@@ -1377,7 +2133,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--output",
         default=None,
         help=(
-            "Base .stl path (writes <stem>-original / -collision / -final). "
+            "Base .stl path (writes <stem>-original / -collision / "
+            "-support-collision / -final / -support). "
             "Default: trimmedData/<input-stem>-*.stl"
         ),
     )
@@ -1395,6 +2152,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         type=float,
         default=None,
         help=f"Thickness when a panel has a single offset (default {DEFAULT_THICKNESS:g})",
+    )
+    parser.add_argument(
+        "--crease-shrink",
+        type=float,
+        default=None,
+        help=(
+            "Inward shrink (mm) on each panel side that is a mountain/valley "
+            f"crease (default {DEFAULT_CREASE_SIDE_SHRINK:g}; config crease.gap)"
+        ),
     )
     parser.add_argument(
         "--all",
@@ -1416,6 +2182,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[stl] config {cfg_path}")
 
     stl_cfg = dict(cfg.get("stl") or {})
+    crease_cfg = dict(cfg.get("crease") or stl_cfg.get("crease") or {})
     defaults = {
         "thickness": stl_cfg.get("thickness", cfg.get("thickness")),
         "default_thickness": float(
@@ -1424,11 +2191,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                 cfg.get("default_thickness", DEFAULT_THICKNESS),
             )
         ),
+        "crease_side_shrink": float(
+            crease_cfg.get(
+                "gap",
+                cfg.get(
+                    "crease_side_shrink",
+                    cfg.get("crease_shrink", DEFAULT_CREASE_SIDE_SHRINK),
+                ),
+            )
+        ),
     }
     if args.thickness is not None:
         defaults["thickness"] = float(args.thickness)
     if args.default_thickness is not None:
         defaults["default_thickness"] = float(args.default_thickness)
+    if args.crease_shrink is not None:
+        defaults["crease_side_shrink"] = float(args.crease_shrink)
 
     exact_output: Optional[str] = None
     if args.output is not None:
@@ -1472,9 +2250,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not isinstance(job, dict) or not job.get("name"):
                     continue
                 settings = dict(defaults)
-                for k in ("thickness", "default_thickness"):
+                for k in ("thickness", "default_thickness", "crease_side_shrink"):
                     if k in job and job[k] is not None:
                         settings[k] = job[k]
+                if job.get("crease_shrink") is not None and "crease_side_shrink" not in job:
+                    settings["crease_side_shrink"] = job["crease_shrink"]
+                job_crease = job.get("crease")
+                if isinstance(job_crease, dict) and job_crease.get("gap") is not None:
+                    settings["crease_side_shrink"] = job_crease["gap"]
                 try:
                     in_path = _resolve_input(str(job["name"]))
                 except FileNotFoundError as exc:
@@ -1520,6 +2303,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 default_thickness=float(
                     settings.get("default_thickness", DEFAULT_THICKNESS)
                 ),
+                crease_side_shrink=float(
+                    settings.get(
+                        "crease_side_shrink", DEFAULT_CREASE_SIDE_SHRINK
+                    )
+                ),
             )
         except Exception as exc:
             print(f"[stl] FAILED {in_path}: {exc}", file=sys.stderr)
@@ -1531,33 +2319,52 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(
                 f"[stl] {os.path.basename(in_path)} → "
                 f"panels={report.get('n_panels')} "
-                f"collisions={report.get('n_collisions_total')} "
-                f"tris[orig/coll/final]="
+                f"main_coll={report.get('n_collisions_total')} "
+                f"sup_coll={report.get('n_support_collisions_total')} "
+                f"support_slabs={report.get('n_support_slabs')} "
+                f"tris[orig/coll/supcoll/final/support]="
                 f"{report.get('n_triangles_original')}/"
                 f"{report.get('n_triangles_collision')}/"
-                f"{report.get('n_triangles_final')} "
+                f"{report.get('n_triangles_support_collision')}/"
+                f"{report.get('n_triangles_final')}/"
+                f"{report.get('n_triangles_support')} "
                 f"({report.get('build')})"
             )
-            for role in ("original", "collision", "final"):
+            for role in (
+                "original",
+                "collision",
+                "support_collision",
+                "final",
+                "support",
+            ):
                 p = outs.get(role)
+                label = role.replace("_", "-")
                 if p:
-                    print(f"[stl] wrote {role:10s} {p}")
+                    print(f"[stl] wrote {label:18s} {p}")
                 else:
-                    print(f"[stl] wrote {role:10s} (empty — skipped)")
+                    print(f"[stl] wrote {label:18s} (empty — skipped)")
             for pe in report.get("panels") or []:
                 fail = pe.get("n_collision_failed", 0)
                 fail_s = f" fail={fail}" if fail else ""
+                sc_fail = pe.get("n_support_collision_failed", 0)
+                sc_fail_s = f" sc_fail={sc_fail}" if sc_fail else ""
                 print(
                     f"      panel {pe['panel']}: "
                     f"z=[{pe['z_lo']:g},{pe['z_hi']:g}] "
                     f"T={pe['thickness']:g} "
-                    f"collisions={pe['n_collisions']} "
-                    f"layers={pe.get('n_collision_layers', 0)} "
-                    f"pieces={pe.get('n_collision_pieces', 0)}{fail_s} "
-                    f"faces[o/c/f]="
+                    f"crease_sides={pe.get('n_crease_sides', 0)}"
+                    f"(-{pe.get('crease_side_shrink', 0):g}mm) "
+                    f"main_coll={pe['n_collisions']} "
+                    f"sup_coll={pe.get('n_support_collisions', 0)} "
+                    f"support={pe.get('n_support_slabs', 0)} "
+                    f"pieces={pe.get('n_collision_pieces', 0)}{fail_s}"
+                    f"{sc_fail_s} "
+                    f"faces[o/c/sc/f/s]="
                     f"{pe['n_faces_original']}/"
                     f"{pe['n_faces_collision']}/"
-                    f"{pe['n_faces_final']}"
+                    f"{pe.get('n_faces_support_collision', 0)}/"
+                    f"{pe['n_faces_final']}/"
+                    f"{pe.get('n_faces_support', 0)}"
                 )
     return rc
 

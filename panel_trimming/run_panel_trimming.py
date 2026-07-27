@@ -91,6 +91,9 @@ def run_simulations(
 
         # Vertical side panels (unique indices, collision-only). Default on.
         thick_side_panels = bool(sim.get("thick_side_panels", True))
+        # Support panels: pad every layer height to full design-panel count
+        # (collision-only, ghost-like, green). Default on.
+        thick_support_panels = bool(sim.get("thick_support_panels", True))
 
         ori = PD_Origami_Simulator(
             origami_name=name,
@@ -106,6 +109,7 @@ def run_simulations(
             collision_shading=True,
             thick_ghost_spacing_mm=thick_ghost_spacing_mm,
             thick_side_panels=thick_side_panels,
+            thick_support_panels=thick_support_panels,
         )
 
         ori.start(
@@ -120,6 +124,7 @@ def run_simulations(
             f"[collision-shading] thick_mode={bool(thick_mode)}; "
             f"thick_ghost_spacing_mm={thick_ghost_spacing_mm:g} (ghost); "
             f"thick_side_panels={thick_side_panels}; "
+            f"thick_support_panels={thick_support_panels}; "
             f"{mode}; export panel_trimming/trimmedData/{name}-trimmed.json at π"
         )
         ori.run()

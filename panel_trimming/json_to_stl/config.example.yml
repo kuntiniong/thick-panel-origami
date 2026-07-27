@@ -7,16 +7,24 @@
 #   1) panel outline from units[]
 #   2) stock Z from thickness offsets (non-border crease heights + shade layer_h)
 #   3) collision polys from resolve_shaded_associations (fabric/dual-curve)
-#   4) three extrusions:
-#        original  = panel stock
-#        collision = clean.py layer-stack merge (h_lo→h_hi) when present;
-#                    else min→max of sample layer_h
-#        final     = original − collision band
+#   4) extrusions (order):
+#        original            = full physical panel stock
+#        support             = full solid at missing global heights
+#        collision           = main phys+ghost solid prism (largest ghost layer)
+#        support-collision   = support solid prism (largest support layer;
+#                              same clean → prism rules as main)
+#        final               = original + support − both collisions
+#                              (optional crease gap last)
 #
-# Outputs: <stem>-original.stl, <stem>-collision.stl, <stem>-final.stl
+# Outputs: <stem>-original/collision/support-collision/final/support.stl
 
 default_thickness: 6            # when panel has a single thickness offset
 # thickness: 6                  # force uniform thickness (optional)
+
+# Inset each panel edge that is a mountain/valley crease (mm).
+# Border edges are not moved. Applied only to *-inset.stl.
+crease:
+  gap: 1
 
 jobs:
   - name: miura-thick-trimmed

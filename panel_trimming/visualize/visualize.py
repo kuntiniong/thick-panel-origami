@@ -7,6 +7,7 @@ Primary shade (design plane only, no 3D) = **dual-curve export** (preferred):
 
 Shell classification (stack depth):
   shell_kind == "ghost"     → collision-only intermediate Z shell (no PD)
+  shell_kind == "support"   → collision-only pad shell so every layer has all panels
   shell_kind == "side"      → collision-only vertical side panel (unique idx, no PD)
   shell_kind == "physical"  → real thick-panel shell (default if missing)
 
@@ -26,9 +27,10 @@ Data sources (in order):
 
 Layer mapping:
   Each subplot is a thickness offset (layer_h), stacked vertically from
-  highest offset (top) to lowest (bottom). Only panels that actually
-  have that offset (crease thick_panel_height, same rule as phys_sim thick
-  mode) are drawn. Shades are filtered by export panel + layer_h.
+  highest offset (top) to lowest (bottom). Every design panel is drawn on
+  every offset: physical shells (gray) where the panel has that
+  thick_panel_height, support pads (green) where it does not — same idea as
+  the simulator support shells. Shades are filtered by export panel + layer_h.
 
 Usage:
   python panel-trimming/visualize/visualize.py
@@ -78,14 +80,23 @@ GHOST_POLY_FACE = "#4c78a8"
 GHOST_POLY_ALPHA = 0.45
 GHOST_POLY_EDGE = "#1f4e79"
 GHOST_STROKE_COLOR = "#5b8db8"
-# Vertical side panels (collision-only, unique panel indices)
+# Support shells (collision-only pad to full panel count per layer) — green
+SUPPORT_POLY_FACE = "#2ca02c"
+SUPPORT_POLY_ALPHA = 0.42
+SUPPORT_POLY_EDGE = "#1a6b1a"
+SUPPORT_STROKE_COLOR = "#5ec75e"
+# Design panel outline when it is a support pad at this offset (not physical)
+SUPPORT_PANEL_FACE = "#c6efc6"
+SUPPORT_PANEL_EDGE = "#148a14"
+SUPPORT_PANEL_ALPHA = 0.55
+# Vertical side panels (collision-only, unique panel indices) — olive green
 SIDE_POLY_FACE = "#59a14f"
 SIDE_POLY_ALPHA = 0.42
 SIDE_POLY_EDGE = "#2d6a2d"
 SIDE_STROKE_COLOR = "#6bb86b"
 SIDE_PANEL_FACE = "#dcefd8"
 SIDE_PANEL_EDGE = "#5a9a52"
-FIRST_LINE_COLOR = "#2ca02c"
+FIRST_LINE_COLOR = "#1f77b4"
 LAST_LINE_COLOR = "#d62728"
 CUT_LINE_COLOR = "#c41e3a"
 CREASE_COLOR = "#888888"
@@ -269,6 +280,9 @@ def panel_thickness_offsets(
         per_panel[pi] = heights
 
     for sh in shaded_regions or []:
+        # Support / side do not define physical thickness offsets
+        if _shell_kind_of(sh) in ("support", "side"):
+            continue
         p = sh.get("panel")
         lh = sh.get("layer_h")
         if p is None or lh is None:
@@ -295,12 +309,48 @@ def _panels_at_height(
     h: float,
     eps: float = 1e-6,
 ) -> set:
-    """Design panel indices that have a thick-panel layer at offset h."""
+    """Design panel indices that have a **physical** thick-panel layer at offset h."""
     out = set()
     for i, offs in enumerate(panel_offsets):
         if any(abs(float(h) - float(x)) <= eps for x in offs):
             out.add(i)
     return out
+
+
+def _global_layer_heights(
+    panel_offsets: Sequence[Sequence[float]],
+    shaded_regions: Optional[Sequence[dict]] = None,
+    eps: float = 1e-6,
+) -> List[float]:
+    """
+    Union of all physical thickness offsets (and non-support shade heights).
+
+    This is the set of subplot layers; every design panel is drawn on each,
+    with support pads where the panel lacks a physical shell.
+    """
+    heights: List[float] = []
+    for offs in panel_offsets or []:
+        heights.extend(float(h) for h in offs)
+    for sh in shaded_regions or []:
+        if _shell_kind_of(sh) in ("support", "side"):
+            continue
+        if sh.get("layer_h") is not None:
+            try:
+                heights.append(float(sh["layer_h"]))
+            except (TypeError, ValueError):
+                pass
+    uniq: List[float] = []
+    seen = set()
+    for h in sorted(heights):
+        key = round(float(h), 6)
+        if key in seen:
+            continue
+        # de-dupe near-duplicates
+        if any(abs(float(h) - float(u)) <= eps for u in uniq):
+            continue
+        seen.add(key)
+        uniq.append(float(h))
+    return uniq if uniq else [0.0]
 
 
 def _layer_keys(units_by_layer: dict) -> List[str]:
@@ -846,7 +896,7 @@ def _samples_from_dual_curves(
 
 
 def _shell_kind_of(entry: Optional[dict]) -> str:
-    """Normalize shell_kind: 'ghost' | 'side' | 'physical' (legacy → physical)."""
+    """Normalize shell_kind: 'ghost' | 'support' | 'side' | 'physical'."""
     if not entry:
         return "physical"
     raw = entry.get("shell_kind")
@@ -855,6 +905,8 @@ def _shell_kind_of(entry: Optional[dict]) -> str:
     s = str(raw).strip().lower()
     if s in ("ghost", "g", "intermediate", "collision_only"):
         return "ghost"
+    if s in ("support", "sup", "pad", "filler"):
+        return "support"
     if s in ("side", "s", "vertical", "wall"):
         return "side"
     return "physical"
@@ -1348,13 +1400,14 @@ def _draw_layer(
     show_polygon_nodes: bool = True,
     show_fabric_offset: bool = True,
     panels_on_layer: Optional[set] = None,
+    show_support_panels: bool = True,
 ):
     """
     Draw one thickness-offset subplot.
 
-    ``panels_on_layer``: design panel indices that exist at this layer_h
-    (thick-panel offset). If None, all panels in layer_units are drawn
-    (legacy behaviour).
+    ``panels_on_layer``: design panel indices with a **physical** shell at this
+    layer_h. All design panels are drawn: physical = gray, missing =
+    green support pad (when ``show_support_panels``).
     ``show_polygon_nodes``: mark every vertex of each closed dual-curve ribbon.
     ``show_fabric_offset``: outline fabric_ring (fabrication allowance) in purple.
     """
@@ -1369,19 +1422,29 @@ def _draw_layer(
 
     # Panels that own a shade here (for ids / draw set only — no special fill color)
     shade_panel_ids = set()
+    support_shade_ids = set()
     for p in closed_polys:
-        if p.get("panel") is not None:
-            try:
-                shade_panel_ids.add(int(p["panel"]))
-            except (TypeError, ValueError):
-                pass
+        if p.get("panel") is None:
+            continue
+        try:
+            pid = int(p["panel"])
+        except (TypeError, ValueError):
+            continue
+        shade_panel_ids.add(pid)
+        if _shell_kind_of(p) == "support":
+            support_shade_ids.add(pid)
 
-    # Only draw panels that have this thickness offset
-    draw_ids = set(range(n)) if panels_on_layer is None else set(panels_on_layer)
-    # Always include panels that own a shade here (export is source of truth)
+    # Physical shells at this offset (from crease heights)
+    physical_ids = (
+        set(range(n)) if panels_on_layer is None else set(panels_on_layer)
+    )
+    # Always draw the full design panel set so every layer has the same count
+    # (miura: h=-3 has all four; h=3 / h=-9 pad missing ones as support).
+    draw_ids = set(range(n))
     draw_ids |= shade_panel_ids
 
     n_drawn = 0
+    n_support_panels = 0
     for i in sorted(draw_ids):
         if i < 0:
             continue
@@ -1392,10 +1455,28 @@ def _draw_layer(
         else:
             continue
         n_drawn += 1
-        _draw_poly(
-            ax, xy, facecolor=PANEL_FACE, edgecolor=PANEL_EDGE,
-            linewidth=0.7, zorder=1,
-        )
+        is_support_panel = show_support_panels and (i not in physical_ids)
+        if is_support_panel:
+            n_support_panels += 1
+            _draw_poly(
+                ax, xy,
+                facecolor=SUPPORT_PANEL_FACE,
+                edgecolor=SUPPORT_PANEL_EDGE,
+                linewidth=1.4, alpha=SUPPORT_PANEL_ALPHA,
+                zorder=1.5, linestyle="-",
+            )
+            # Emphasize support outline
+            ax.plot(
+                list(xy[:, 0]) + [float(xy[0, 0])],
+                list(xy[:, 1]) + [float(xy[0, 1])],
+                color=SUPPORT_PANEL_EDGE, linewidth=1.8,
+                linestyle="--", zorder=2.0, alpha=0.95,
+            )
+        else:
+            _draw_poly(
+                ax, xy, facecolor=PANEL_FACE, edgecolor=PANEL_EDGE,
+                linewidth=0.7, zorder=1,
+            )
 
     if show_lines and all_lines:
         for idx, ln in enumerate(all_lines):
@@ -1441,6 +1522,7 @@ def _draw_layer(
 
     n_shaded = 0
     n_ghost = 0
+    n_support_shade = 0
     n_physical = 0
     if show_closed_polys:
         for item in closed_polys:
@@ -1448,7 +1530,7 @@ def _draw_layer(
             if poly is None or len(poly) < 3:
                 continue
             sk = _shell_kind_of(item)
-            # Side panel shades not drawn (physical + ghost only)
+            # Side panel shades not drawn (physical + ghost + support)
             if sk == "side":
                 continue
             n_shaded += 1
@@ -1456,10 +1538,13 @@ def _draw_layer(
                 item.get("viz_merged_stack") or item.get("layer_stack_merged")
             )
             is_ghost = sk == "ghost"
+            is_support = sk == "support"
             if is_merged:
                 pass  # counted via n_shaded only
             elif is_ghost:
                 n_ghost += 1
+            elif is_support:
+                n_support_shade += 1
             else:
                 n_physical += 1
             is_sweep = (
@@ -1471,6 +1556,12 @@ def _draw_layer(
                 face, edge, alpha = "#e8d5f5", FABRIC_EDGE_COLOR, 0.18
                 hatch = None
                 lw = 2.0
+            elif is_support:
+                face, edge, alpha = (
+                    SUPPORT_POLY_FACE, SUPPORT_POLY_EDGE, SUPPORT_POLY_ALPHA
+                )
+                hatch = "xxx"
+                lw = 1.2
             elif is_ghost:
                 face, edge, alpha = GHOST_POLY_FACE, GHOST_POLY_EDGE, GHOST_POLY_ALPHA
                 hatch = "..."
@@ -1523,7 +1614,7 @@ def _draw_layer(
                             linestyle="-", alpha=0.98, zorder=7.3,
                             solid_capstyle="butt", solid_joinstyle="miter",
                         )
-            # Panel tag on shade; ·G = ghost, ·M = merged stack
+            # Panel tag on shade; ·G = ghost, ·Sup = support, ·M = merged stack
             pid = item.get("panel")
             if pid is not None and len(poly) >= 1:
                 c = poly.mean(axis=0)
@@ -1534,6 +1625,9 @@ def _draw_layer(
                     else:
                         tag = f"P{int(pid)}·M"
                     tag_color = "#6a0dad"
+                elif is_support:
+                    tag = f"P{int(pid)}·Sup"
+                    tag_color = "#0a4a0a"
                 elif is_ghost:
                     tag = f"P{int(pid)}·G"
                     tag_color = "#0a2a5a"
@@ -1551,7 +1645,12 @@ def _draw_layer(
                 )
             # Draw intermediate two-node line samples (the actual sweep stroke)
             samples = item.get("sweep_samples") or []
-            stroke = GHOST_STROKE_COLOR if is_ghost else "#e45756"
+            if is_support:
+                stroke = SUPPORT_STROKE_COLOR
+            elif is_ghost:
+                stroke = GHOST_STROKE_COLOR
+            else:
+                stroke = "#e45756"
             if is_sweep and len(samples) >= 2:
                 for s in samples:
                     if "p0" not in s or "p1" not in s:
@@ -1668,14 +1767,19 @@ def _draw_layer(
             else:
                 continue
             c = xy.mean(axis=0)
+            is_sup = show_support_panels and (i not in physical_ids)
+            label = f"{i}·Sup" if is_sup else str(i)
             ax.text(
-                c[0], c[1], str(i), ha="center", va="center",
-                fontsize=7.5, color=TEXT_COLOR, zorder=12,
-                fontweight="bold" if i in shade_panel_ids else "normal",
+                c[0], c[1], label, ha="center", va="center",
+                fontsize=7.5,
+                color=SUPPORT_PANEL_EDGE if is_sup else TEXT_COLOR,
+                zorder=12,
+                fontweight="bold" if (i in shade_panel_ids or is_sup) else "normal",
             )
 
     ax.set_aspect("equal", adjustable="box")
     n_panels = len(draw_ids)
+    n_phys_panels = len(physical_ids & draw_ids)
     if n_shaded > 0:
         src = "shaded"
         for it in closed_polys:
@@ -1691,17 +1795,21 @@ def _draw_layer(
             )
         )
         kind = f"{n_sw} sweeps" if n_sw else "tris/quads"
-        shell_bits = f"phys={n_physical} ghost={n_ghost}"
+        shell_bits = (
+            f"phys={n_physical} ghost={n_ghost} support={n_support_shade}"
+        )
         ax.set_title(
             f"offset h = {layer_h:g}   "
-            f"({n_panels} panels, {n_shaded} paints [{shell_bits}], "
+            f"({n_phys_panels} phys + {n_support_panels} support panels, "
+            f"{n_shaded} paints [{shell_bits}], "
             f"{kind}, src={src})",
             fontsize=11,
         )
     else:
         ax.set_title(
             f"offset h = {layer_h:g}   "
-            f"({n_panels} panels, no trims on this offset)",
+            f"({n_phys_panels} phys + {n_support_panels} support panels, "
+            f"no trims on this offset)",
             fontsize=11, color="#666666",
         )
     ax.set_xlabel("x")
@@ -1886,6 +1994,8 @@ def visualize_trimmed(
     total_polys = 0
     sources = set()
     drew_ghost = False
+    drew_support = False
+    n_design = len(orig_units)
 
     for idx, (key, layer_h, layer_units, closed, panels_on_layer, cut_segs) in enumerate(
         layer_payload
@@ -1894,8 +2004,16 @@ def visualize_trimmed(
         total_polys += len(closed)
         for p in closed:
             sources.add(p.get("source", "?"))
-            if _shell_kind_of(p) == "ghost":
+            sk = _shell_kind_of(p)
+            if sk == "ghost":
                 drew_ghost = True
+            elif sk == "support":
+                drew_support = True
+        n_sup_panels = sum(
+            1 for i in range(n_design) if i not in panels_on_layer
+        )
+        if n_sup_panels > 0:
+            drew_support = True
 
         n_sh = _draw_layer(
             ax,
@@ -1914,11 +2032,17 @@ def visualize_trimmed(
             show_polygon_nodes=show_polygon_nodes,
             show_fabric_offset=show_fabric_offset,
             panels_on_layer=panels_on_layer,
+            show_support_panels=True,
         )
         n_g_draw = sum(
             1 for p in closed
             if p.get("poly") is not None and len(p["poly"]) >= 3
             and _shell_kind_of(p) == "ghost"
+        )
+        n_s_draw = sum(
+            1 for p in closed
+            if p.get("poly") is not None and len(p["poly"]) >= 3
+            and _shell_kind_of(p) == "support"
         )
         n_p_draw = sum(
             1 for p in closed
@@ -1927,13 +2051,17 @@ def visualize_trimmed(
         )
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
-        panel_list = ",".join(str(i) for i in sorted(panels_on_layer))
+        phys_list = ",".join(str(i) for i in sorted(panels_on_layer))
+        sup_ids = sorted(i for i in range(n_design) if i not in panels_on_layer)
+        sup_list = ",".join(str(i) for i in sup_ids) if sup_ids else "—"
         ax.text(
             0.02, 0.98,
-            f"panels @ h: [{panel_list}]\n"
-            f"shades: {n_sh}  (phys={n_p_draw} · ghost={n_g_draw})\n"
-            f"P# = physical · P#·G = ghost\n"
-            f"first=green · last=red",
+            f"phys @ h: [{phys_list}]\n"
+            f"support @ h: [{sup_list}]\n"
+            f"shades: {n_sh}  (phys={n_p_draw} · ghost={n_g_draw} · "
+            f"support={n_s_draw})\n"
+            f"P# = physical · P#·Sup = support · P#·G = ghost\n"
+            f"first=blue · last=red",
             transform=ax.transAxes, ha="left", va="top",
             fontsize=7.5, color="#333333",
             bbox=dict(boxstyle="round,pad=0.28", facecolor="white",
@@ -1944,7 +2072,11 @@ def visualize_trimmed(
         axes[idx][0].axis("off")
 
     legend_handles = [
-        Patch(facecolor=PANEL_FACE, edgecolor=PANEL_EDGE, label="Panel at this offset"),
+        Patch(facecolor=PANEL_FACE, edgecolor=PANEL_EDGE, label="Physical panel"),
+        Patch(
+            facecolor=SUPPORT_PANEL_FACE, edgecolor=SUPPORT_PANEL_EDGE,
+            alpha=SUPPORT_PANEL_ALPHA, label="Support panel (pad to full set)",
+        ),
         Patch(
             facecolor=TRIM_POLY_FACE, edgecolor=TRIM_POLY_EDGE, alpha=TRIM_POLY_ALPHA,
             label="Physical shell shade (P#)",
@@ -1955,6 +2087,14 @@ def visualize_trimmed(
             Patch(
                 facecolor=GHOST_POLY_FACE, edgecolor=GHOST_POLY_EDGE, alpha=GHOST_POLY_ALPHA,
                 hatch="...", label="Ghost shell shade (P#·G)",
+            )
+        )
+    if drew_support:
+        legend_handles.append(
+            Patch(
+                facecolor=SUPPORT_POLY_FACE, edgecolor=SUPPORT_POLY_EDGE,
+                alpha=SUPPORT_POLY_ALPHA, hatch="xxx",
+                label="Support shell shade (P#·Sup)",
             )
         )
     legend_handles.extend([
@@ -1994,17 +2134,22 @@ def visualize_trimmed(
     if show_fabric_offset:
         fig_title += (
             "\nshaded = dual-curve contact · fabric offset optional · "
-            "red=physical · blue=ghost · top→bottom = highest→lowest offset"
+            "red=physical · green=support · blue=ghost · "
+            "top→bottom = highest→lowest offset"
         )
     else:
         fig_title += (
             "\nshaded = dual-curve contact regions · "
-            "red=physical · blue=ghost · top→bottom = highest→lowest offset"
+            "red=physical · green=support · blue=ghost · "
+            "top→bottom = highest→lowest offset"
         )
     meta = trimmed.get("trim_3d_metadata") or {}
     bits = [f"shaded={total_polys}"]
     n_ghost_all = sum(
         1 for sh in (shaded_regions or []) if _shell_kind_of(sh) == "ghost"
+    )
+    n_support_all = sum(
+        1 for sh in (shaded_regions or []) if _shell_kind_of(sh) == "support"
     )
     n_phys_all = sum(
         1 for sh in (shaded_regions or []) if _shell_kind_of(sh) == "physical"
@@ -2012,6 +2157,7 @@ def visualize_trimmed(
     if shaded_regions is not None:
         bits.append(f"phys={n_phys_all}")
         bits.append(f"ghost={n_ghost_all}")
+        bits.append(f"support={n_support_all}")
     if meta:
         bits.append(f"trimmer_cuts={meta.get('n_cuts', '?')}")
     n_dual = sum(
@@ -2026,6 +2172,8 @@ def visualize_trimmed(
         )
         if stats.get("n_ghost_regions") is not None:
             bits.append(f"stats_ghost={stats.get('n_ghost_regions')}")
+        if stats.get("n_support_regions") is not None:
+            bits.append(f"stats_support={stats.get('n_support_regions')}")
     if sources:
         bits.append("src=" + ",".join(sorted(s.split(".")[0] for s in sources)))
     fig_title += "  (" + ", ".join(bits) + ")"
@@ -2071,6 +2219,10 @@ def _run_one(sim: dict, output_dir: str) -> str:
         1 for sh in (trimmed.get("shaded_regions") or [])
         if _shell_kind_of(sh) == "ghost"
     )
+    n_support = sum(
+        1 for sh in (trimmed.get("shaded_regions") or [])
+        if _shell_kind_of(sh) == "support"
+    )
     n_phys = sum(
         1 for sh in (trimmed.get("shaded_regions") or [])
         if _shell_kind_of(sh) == "physical"
@@ -2093,7 +2245,7 @@ def _run_one(sim: dict, output_dir: str) -> str:
         f"[panel-trimming] {os.path.basename(trimmed_path)}  "
         f"collision_stats={'yes' if has_stats else 'no'}  "
         f"segs={n_segs} shaded={n_poly} dual_curve={n_dual}  "
-        f"phys={n_phys} ghost={n_ghost}  "
+        f"phys={n_phys} ghost={n_ghost} support={n_support}  "
         f"nodes={show_nodes} fabric={show_fabric}  "
         f"units_by_layer={'yes' if has_ubl else 'synth-from-units'}"
     )

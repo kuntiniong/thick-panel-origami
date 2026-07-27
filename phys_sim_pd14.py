@@ -20,7 +20,7 @@ else:
 
 @ti.data_oriented
 class PD_Origami_Simulator(CollisionMixin):
-    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.975, material_type=1, ref_target=False, verbose=False, collision_shading=False, thick_ghost_spacing_mm=0.0, thick_side_panels=True):
+    def __init__(self, origami_name, use_gui=True, fast=1, pd_local_time=1, pd_global_time=1, pd_iter_time=5, damping=0.975, material_type=1, ref_target=False, verbose=False, collision_shading=False, thick_ghost_spacing_mm=0.0, thick_side_panels=True, thick_support_panels=True):
         self.use_gui = use_gui
         self.collision_shading = collision_shading
         # Collision-only ghost Z shells every this many mm between physical
@@ -31,10 +31,22 @@ class PD_Origami_Simulator(CollisionMixin):
         # (unique panel indices, no PD / mass / springs). Config can disable.
         self.thick_side_panels = bool(thick_side_panels)
         self._collision_side_panels = []
+        # Collision-only support shells: pad every design panel to the full set of
+        # global physical heights so each layer has the same panel count.
+        # No PD / mass / springs (ghost-like). Visualized as green "support".
+        self.thick_support_panels = bool(thick_support_panels)
+        self._collision_support_shells = []
         # GUI render: index buffer into live self.vertices + edge line verts
         self._side_panel_index_count = 0
         self._side_panel_edge_vert_count = 0
         self._side_panel_edge_kp_pairs = None  # (n_edges, 2) int kp indices
+        # Support panel draw (host-blended verts → own mesh buffer; green)
+        # Ghost intermediate shells are never drawn here.
+        self._support_panel_vert_count = 0
+        self._support_panel_index_count = 0
+        self._support_panel_edge_vert_count = 0
+        self._support_draw_meta = []
+        self._support_edge_pairs = []
         self._panel_stock_span = {}
         self._unit_coll_layer_idx = {}
         self._collision_contact_count = 0
@@ -462,6 +474,23 @@ class PD_Origami_Simulator(CollisionMixin):
                 self.side_edge_kp = ti.field(dtype=ti.i32, shape=(max_side_edges, 2))
                 self.side_panel_edge_verts = ti.Vector.field(
                     3, dtype=ti.f32, shape=max_side_edges * 2
+                )
+                # Support shells: own vertex buffer (live blend, not physical kps)
+                # Budget: up to ~one shell per physical tri-set; cap for GGUI.
+                max_support_verts = min(max(int(self.maximum_kp_number) * 4, 1024), 16384)
+                max_support_idx = min(max(int(self.maximum_indice_num) * 2, 3072), 49152)
+                max_support_edge_v = min(max(max_support_verts * 2, 512), 32768)
+                self._support_max_verts = int(max_support_verts)
+                self._support_max_idx = int(max_support_idx)
+                self._support_max_edge_v = int(max_support_edge_v)
+                self.support_panel_verts = ti.Vector.field(
+                    3, dtype=ti.f32, shape=max_support_verts
+                )
+                self.support_panel_indices = ti.field(
+                    dtype=ti.i32, shape=max_support_idx
+                )
+                self.support_panel_edge_verts = ti.Vector.field(
+                    3, dtype=ti.f32, shape=max_support_edge_v
                 )
                 # Side-panel contact hits (separate from physical coll_hit_*)
                 self.side_hit_count = ti.field(dtype=ti.i32, shape=())

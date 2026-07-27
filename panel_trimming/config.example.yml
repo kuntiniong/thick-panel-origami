@@ -2,6 +2,9 @@ simulations:
   - name: miura-thick
     thick_side_panels: true
     thick_ghost_spacing_mm: 0
+    # Support panels: collision-only shells so every layer has every design panel
+    # (missing heights filled like ghosts; green in visualizer). Default true.
+    thick_support_panels: true
     headless: false
 
     use_gpu: auto
