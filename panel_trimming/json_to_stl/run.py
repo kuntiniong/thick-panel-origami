@@ -18,18 +18,30 @@ Solids / order of operations:
                            ∪ (support − support-collision)
                            then optional crease gap (last) on mountain/valley
 
-Writes under panel_trimming/trimmedData/:
-  <stem>-original.stl
-  <stem>-collision.stl
-  <stem>-support-collision.stl
-  <stem>-final.stl
-  <stem>-support.stl
+Writes under panel_trimming/trimmedData/stl-<stem>/:
+  original.stl
+  collision.stl
+  support-collision.stl
+  final.stl
+  support.stl
+  hinges.stl / hinges-mountain.stl / hinges-valley.stl
+  ref.stl       (final ∪ hinges — check hinge heights)
+
+TPU crease connectors (living hinges):
+  creases remapped by thick_panel_height
+  panels remapped AFTER final.stl build from residual bands
+  (main + support streams) recorded during stock−collision
+  mountain → thin film on BOTTOM face
+  valley   → thin film on TOP face
+  main/support face interfaces straddle H
+  border / side-wall creases skipped
 
 Usage:
   python panel_trimming/json_to_stl/run.py
   python panel_trimming/json_to_stl/run.py --name miura-thick-trimmed
   python panel_trimming/json_to_stl/run.py --config panel_trimming/json_to_stl/config.yml
   python panel_trimming/json_to_stl/run.py --crease-shrink 1
+  python panel_trimming/json_to_stl/run.py --hinge-thickness 0.6 --hinge-width 4
 """
 
 from __future__ import annotations
@@ -66,6 +78,16 @@ from panel_trimming.visualize.visualize_3d import (  # noqa: E402
     panel_thickness_offsets,
     resolve_shaded_associations,
 )
+from panel_trimming.json_to_stl.hinges import (  # noqa: E402
+    DEFAULT_HINGE_EMBED_MM,
+    DEFAULT_HINGE_ENABLED,
+    DEFAULT_HINGE_END_INSET_MM,
+    DEFAULT_HINGE_THICKNESS_MM,
+    DEFAULT_HINGE_WIDTH_MM,
+    build_hinge_meshes,
+    collect_crease_hinges,
+    final_z_span_by_panel,
+)
 
 try:
     from scipy.spatial import Delaunay as _Delaunay
@@ -74,6 +96,7 @@ except Exception:  # pragma: no cover
 
 TRIMMED_DIR = os.path.join(_PANEL_TRIM_DIR, "trimmedData")
 DESCRIPTION_DIR = os.path.join(_PROJECT_ROOT, "descriptionData")
+# All STL outputs land in trimmedData/stl-<design-stem>/
 DEFAULT_OUTPUT_DIR = TRIMMED_DIR
 DEFAULT_CONFIG = os.path.join(_THIS_DIR, "config.yml")
 DEFAULT_CONFIG_EXAMPLE = os.path.join(_THIS_DIR, "config.example.yml")
@@ -1585,6 +1608,18 @@ def _merge_slab_dicts(
     return out
 
 
+def _pieces_to_outer_rings(
+    pieces: Sequence[Tuple[List[List[float]], List[List[List[float]]]]],
+) -> List[List[List[float]]]:
+    """Outer rings only from boolean residual pieces (for hinge remap)."""
+    out: List[List[List[float]]] = []
+    for outer_r, _holes in pieces or []:
+        ring = _dedupe_closed(outer_r)
+        if len(ring) >= 3:
+            out.append(ring)
+    return out
+
+
 def _stock_minus_collision_slabs(
     outer: Sequence,
     slabs: Sequence[Tuple[float, float, Sequence[Sequence]]],
@@ -1593,7 +1628,14 @@ def _stock_minus_collision_slabs(
     z_hi: float,
     fallback_mesh: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     inset_outer: Optional[Sequence] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    stream: str = "main",
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    int,
+    List[Dict[str, Any]],
+]:
     """
     Extrude panel outline with collision bands boolean-subtracted in Z slabs.
 
@@ -1603,8 +1645,14 @@ def _stock_minus_collision_slabs(
     If ``inset_outer`` is set, **crease gap is applied last**: after collision
     cuts on ``outer``, each 2D piece is intersected with the crease-shrunk
     outline so mountain/valley sides leave a hinge gap.
+
+    Also returns ``bands``: the exact 2D residual footprints used to build final
+    stock, one entry per Z band:
+      {z_lo, z_hi, rings, stream, cut}
+    Hinges remap panels from these bands (post-final geometry).
     """
     use_inset = inset_outer is not None and len(_dedupe_closed(inset_outer)) >= 3
+    bands: List[Dict[str, Any]] = []
 
     def _maybe_gap(
         pieces: List[Tuple[List[List[float]], List[List[List[float]]]]],
@@ -1614,18 +1662,44 @@ def _stock_minus_collision_slabs(
         clipped = _clip_pieces_to_outline(pieces, inset_outer)
         return clipped if clipped else pieces
 
+    def _record_band(
+        za: float,
+        zb: float,
+        pieces: Sequence[Tuple[List[List[float]], List[List[List[float]]]]],
+        *,
+        cut: bool,
+    ) -> None:
+        rings = _pieces_to_outer_rings(pieces)
+        if not rings:
+            return
+        bands.append({
+            "z_lo": float(min(za, zb)),
+            "z_hi": float(max(za, zb)),
+            "rings": rings,
+            "stream": str(stream),
+            "cut": bool(cut),
+            "n_rings": len(rings),
+        })
+
     if not slabs:
         if use_inset:
             pieces = _maybe_gap([(list(outer), [])])
             V, F, N = _extrude_pieces(pieces, z_lo=z_lo, z_hi=z_hi)
             if len(V) and len(F):
-                return V, F, N, len(pieces)
+                _record_band(z_lo, z_hi, pieces, cut=False)
+                return V, F, N, len(pieces), bands
         if fallback_mesh is not None and not use_inset:
             V, F, N = fallback_mesh
-            return V, F, N, 1
+            # Approximate one band with the stock outline
+            pieces = [(list(outer), [])]
+            _record_band(z_lo, z_hi, pieces, cut=False)
+            return V, F, N, 1, bands
         outline = inset_outer if use_inset else outer
         V, F, N = extrude_polygon_mesh(outline, z_lo=z_lo, z_hi=z_hi, holes=None)
-        return V, F, N, 1 if len(V) and len(F) else 0
+        if len(V) and len(F):
+            pieces = [(list(outline), [])]
+            _record_band(z_lo, z_hi, pieces, cut=False)
+        return V, F, N, (1 if len(V) and len(F) else 0), bands
 
     meshes: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     n_pieces = 0
@@ -1640,6 +1714,7 @@ def _stock_minus_collision_slabs(
             if len(Vgap) and len(Fgap):
                 meshes.append((Vgap, Fgap, Ngap))
                 n_pieces += len(pieces)
+                _record_band(cursor, za_c, pieces, cut=False)
         if zb_c - za_c > 1e-12 and rings:
             # 1) cut collisions on full outline  2) crease gap last
             pieces = boolean_panel_minus_collisions(outer, rings)
@@ -1650,6 +1725,7 @@ def _stock_minus_collision_slabs(
             if len(Vf) and len(Ff):
                 meshes.append((Vf, Ff, Nf))
                 n_pieces += len(pieces)
+                _record_band(za_c, zb_c, pieces, cut=True)
         cursor = max(cursor, zb_c)
     if float(z_hi) > cursor + 1e-12:
         pieces = _maybe_gap([(list(outer), [])])
@@ -1657,11 +1733,14 @@ def _stock_minus_collision_slabs(
         if len(Vgap) and len(Fgap):
             meshes.append((Vgap, Fgap, Ngap))
             n_pieces += len(pieces)
+            _record_band(cursor, z_hi, pieces, cut=False)
 
     V, F, N = merge_meshes(meshes)
     if (len(V) == 0 or len(F) == 0) and fallback_mesh is not None and not use_inset:
-        return fallback_mesh[0], fallback_mesh[1], fallback_mesh[2], 1
-    return V, F, N, n_pieces
+        pieces = [(list(outer), [])]
+        _record_band(z_lo, z_hi, pieces, cut=False)
+        return fallback_mesh[0], fallback_mesh[1], fallback_mesh[2], 1, bands
+    return V, F, N, n_pieces, bands
 
 
 def build_panel_meshes(
@@ -1851,17 +1930,22 @@ def build_panel_meshes(
         gap_clip = outer_inset if apply_gap else None
         final_meshes: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         n_final_pieces = 0
-        V_fp, F_fp, N_fp, n_fp = _stock_minus_collision_slabs(
+        # Exact residual footprints used to build final.stl (main + support).
+        # Hinges remap panels from these bands — not a re-derivation from JSON.
+        final_bands: List[Dict[str, Any]] = []
+        V_fp, F_fp, N_fp, n_fp, bands_main = _stock_minus_collision_slabs(
             outer,
             main_slabs,
             z_lo=z_lo,
             z_hi=z_hi,
             fallback_mesh=(V_o, F_o, N_o),
             inset_outer=gap_clip,
+            stream="main",
         )
         if len(V_fp) and len(F_fp):
             final_meshes.append((V_fp, F_fp, N_fp))
             n_final_pieces += n_fp
+            final_bands.extend(bands_main)
         for za, zb, rings in sup_slabs:
             for ring in rings:
                 Vs0, Fs0, Ns0 = extrude_polygon_mesh(
@@ -1876,21 +1960,32 @@ def build_panel_meshes(
                     )
                     if len(ring_inset) < 3:
                         ring_inset = outer_inset
-                Vsf, Fsf, Nsf, n_sf = _stock_minus_collision_slabs(
+                Vsf, Fsf, Nsf, n_sf, bands_sup = _stock_minus_collision_slabs(
                     ring,
                     sup_coll_slabs,
                     z_lo=za,
                     z_hi=zb,
                     fallback_mesh=(Vs0, Fs0, Ns0),
                     inset_outer=ring_inset,
+                    stream="support",
                 )
                 if len(Vsf) and len(Fsf):
                     final_meshes.append((Vsf, Fsf, Nsf))
                     n_final_pieces += n_sf
+                    final_bands.extend(bands_sup)
         V_f, F_f, N_f = merge_meshes(final_meshes)
         if len(V_f) == 0 or len(F_f) == 0:
             V_f, F_f, N_f = V_o, F_o, N_o
             n_final_pieces = 1
+            if not final_bands:
+                final_bands.append({
+                    "z_lo": float(z_lo),
+                    "z_hi": float(z_hi),
+                    "rings": [_dedupe_closed(outer)],
+                    "stream": "main",
+                    "cut": False,
+                    "n_rings": 1,
+                })
 
         base_meta = {
             "panel": pi,
@@ -1909,6 +2004,8 @@ def build_panel_meshes(
             "crease_side_shrink": shrink_mm,
             "n_support_slabs": len(sup_slabs),
             "n_support_rings": n_sup,
+            "final_bands": final_bands,
+            "n_final_bands": len(final_bands),
         }
         groups["original"].append({
             **base_meta,
@@ -2005,25 +2102,27 @@ def build_panel_meshes(
     return groups, report
 
 
-def _output_paths(base_path: str) -> Dict[str, str]:
+def _design_stem_from_path(base_path: str) -> str:
     """
-    Map role → path.
+    Resolve design family stem from a base path or role-suffixed name.
 
-    base_path may be:
-      .../stem.stl  → stem-original / -collision / -support-collision /
-                      -final / -support
-      .../stem-final.stl → same stem family
+    miura-thick-cleaned.stl           → miura-thick-cleaned
+    miura-thick-cleaned-final.stl     → miura-thick-cleaned
+    .../stl/miura-thick-cleaned/      → miura-thick-cleaned
     """
-    directory = os.path.dirname(os.path.abspath(base_path)) or "."
-    name = os.path.basename(base_path)
+    path = os.path.abspath(base_path)
+    if os.path.isdir(path):
+        return os.path.basename(path.rstrip("\\/")) or "export"
+    name = os.path.basename(path)
     stem, ext = os.path.splitext(name)
     if not ext:
         stem = name
-    # If user already passed a role suffix, strip it to get the family stem
     lower = stem.lower()
-    # Longer suffixes first so -support-collision wins over -collision / -support
     for suffix in (
         "-support-collision", "_support_collision",
+        "-hinges-mountain", "_hinges_mountain",
+        "-hinges-valley", "_hinges_valley",
+        "-hinges", "_hinges",
         "-final", "_final",
         "-original", "_original",
         "-collision", "_collision",
@@ -2033,14 +2132,71 @@ def _output_paths(base_path: str) -> Dict[str, str]:
         if lower.endswith(suffix):
             stem = stem[: -len(suffix)]
             break
+    return stem or "export"
+
+
+def _stl_folder_name(stem: str) -> str:
+    """miura-thick-cleaned → stl-miura-thick-cleaned"""
+    s = str(stem or "export").strip()
+    if s.lower().startswith("stl-"):
+        return s
+    return f"stl-{s}"
+
+
+def _output_dir_for(base_path: str) -> str:
+    """
+    Folder that holds every STL for one design.
+
+    Default layout:
+      panel_trimming/trimmedData/stl-<stem>/
+
+    If base_path already is/is inside that folder, reuse it.
+    """
+    path = os.path.abspath(base_path)
+    stem = _design_stem_from_path(path)
+    folder = _stl_folder_name(stem)
+
+    if os.path.isdir(path):
+        base = os.path.basename(path.rstrip("\\/"))
+        # Already the stl-<stem> folder, or any explicit directory -o
+        if base.lower().startswith("stl-") or base == stem:
+            return path
+        return os.path.join(path, folder)
+
+    parent = os.path.dirname(path) or "."
+    parent_base = os.path.basename(parent)
+    # .../stl-<stem>/something.stl → keep parent
+    if parent_base.lower() == folder.lower() or parent_base.lower().startswith("stl-"):
+        return parent
+    return os.path.join(parent, folder)
+
+
+def _output_paths(base_path: str) -> Dict[str, str]:
+    """
+    Map role → path inside the design STL folder.
+
+      .../stl-<stem>/original.stl
+      .../stl-<stem>/collision.stl
+      .../stl-<stem>/support-collision.stl
+      .../stl-<stem>/final.stl
+      .../stl-<stem>/support.stl
+      .../stl-<stem>/hinges.stl
+      .../stl-<stem>/hinges-mountain.stl
+      .../stl-<stem>/hinges-valley.stl
+      .../stl-<stem>/ref.stl            (final ∪ hinges — height check)
+    """
+    out_dir = _output_dir_for(base_path)
     return {
-        "original": os.path.join(directory, f"{stem}-original.stl"),
-        "collision": os.path.join(directory, f"{stem}-collision.stl"),
-        "support_collision": os.path.join(
-            directory, f"{stem}-support-collision.stl"
-        ),
-        "final": os.path.join(directory, f"{stem}-final.stl"),
-        "support": os.path.join(directory, f"{stem}-support.stl"),
+        "dir": out_dir,
+        "original": os.path.join(out_dir, "original.stl"),
+        "collision": os.path.join(out_dir, "collision.stl"),
+        "support_collision": os.path.join(out_dir, "support-collision.stl"),
+        "final": os.path.join(out_dir, "final.stl"),
+        "support": os.path.join(out_dir, "support.stl"),
+        "hinges": os.path.join(out_dir, "hinges.stl"),
+        "hinges_mountain": os.path.join(out_dir, "hinges-mountain.stl"),
+        "hinges_valley": os.path.join(out_dir, "hinges-valley.stl"),
+        "ref": os.path.join(out_dir, "ref.stl"),
     }
 
 
@@ -2052,6 +2208,11 @@ def export_stl(
     thickness: Optional[float] = None,
     panels: Optional[Sequence[int]] = None,
     crease_side_shrink: float = DEFAULT_CREASE_SIDE_SHRINK,
+    export_hinges: bool = DEFAULT_HINGE_ENABLED,
+    hinge_thickness: float = DEFAULT_HINGE_THICKNESS_MM,
+    hinge_width: float = DEFAULT_HINGE_WIDTH_MM,
+    hinge_end_inset: float = DEFAULT_HINGE_END_INSET_MM,
+    hinge_embed: float = DEFAULT_HINGE_EMBED_MM,
     source_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     groups, report = build_panel_meshes(
@@ -2067,7 +2228,13 @@ def export_stl(
         raise RuntimeError("no panel meshes generated")
 
     paths = _output_paths(output_path)
-    os.makedirs(os.path.dirname(os.path.abspath(paths["final"])) or ".", exist_ok=True)
+    out_dir = paths["dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    report["output_dir"] = out_dir
+
+    # Keep final mesh for ref.stl (final ∪ hinges)
+    final_mesh: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+    hinges_mesh: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
 
     for role in (
         "original",
@@ -2099,6 +2266,78 @@ def export_stl(
         report["outputs"][role] = path
         report[f"n_verts_{role}"] = int(len(V))
         report[f"n_faces_{role}"] = int(len(F))
+        if role == "final":
+            final_mesh = (V, F, N)
+
+    # Flexible TPU crease connectors — remapped AFTER final.stl is built.
+    # Panel footprints come from final_bands recorded during stock − collision
+    # (main + support streams), so hinges match the actual final residual,
+    # including faces that run across main/support interfaces.
+    if bool(export_hinges):
+        final_parts = list(groups.get("final") or [])
+        final_z = final_z_span_by_panel(final_parts)
+        hinges, hinfo = collect_crease_hinges(
+            data,
+            final_meshes=final_parts,
+            final_z_by_panel=final_z,
+            hinge_thickness=hinge_thickness,
+            hinge_width=hinge_width,
+            end_inset=hinge_end_inset,
+            embed=hinge_embed,
+            crease_gap=crease_side_shrink,
+        )
+        h_groups = build_hinge_meshes(
+            hinges,
+            extrude_polygon_mesh=extrude_polygon_mesh,
+            merge_meshes=merge_meshes,
+            data=data,
+            boolean_panel_minus_collisions=boolean_panel_minus_collisions,
+        )
+        report["hinges"] = hinfo
+        report["hinges"]["n_meshes"] = {
+            k: len(v) for k, v in h_groups.items()
+        }
+        for role in ("hinges", "hinges_mountain", "hinges_valley"):
+            meshes = h_groups.get(role) or []
+            path = paths.get(role)
+            if not path or not meshes:
+                report["outputs"][role] = None
+                report[f"n_verts_{role}"] = 0
+                report[f"n_faces_{role}"] = 0
+                continue
+            V, F, N = merge_meshes(
+                [(m["vertices"], m["faces"], m["normals"]) for m in meshes]
+            )
+            write_stl_binary(
+                path, V, F, N, header=f"json_to_stl {role} TPU living hinge"
+            )
+            report["outputs"][role] = path
+            report[f"n_verts_{role}"] = int(len(V))
+            report[f"n_faces_{role}"] = int(len(F))
+            if role == "hinges":
+                hinges_mesh = (V, F, N)
+    else:
+        report["hinges"] = {"enabled": False}
+
+    # ref.stl = final ∪ hinges — visual check of hinge Z placement
+    ref_path = paths.get("ref")
+    if ref_path and final_mesh is not None:
+        parts: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = [final_mesh]
+        if hinges_mesh is not None and len(hinges_mesh[0]) and len(hinges_mesh[1]):
+            parts.append(hinges_mesh)
+        V_ref, F_ref, N_ref = merge_meshes(parts)
+        write_stl_binary(
+            ref_path,
+            V_ref,
+            F_ref,
+            N_ref,
+            header="json_to_stl ref final+hinges",
+        )
+        report["outputs"]["ref"] = ref_path
+        report["n_verts_ref"] = int(len(V_ref))
+        report["n_faces_ref"] = int(len(F_ref))
+    else:
+        report["outputs"]["ref"] = None
 
     return report
 
@@ -2115,10 +2354,10 @@ def export_file(input_path: str, output_path: str, **kwargs: Any) -> Dict[str, A
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Write STLs per design: original stock, main collision "
-            "(phys+ghost), support-collision (support shades), final, "
-            "and support solid. Outputs: <stem>-original/collision/"
-            "support-collision/final/support.stl"
+            "Write STLs per design into trimmedData/stl-<stem>/: "
+            "original, collision, support-collision, final, support, "
+            "and TPU crease living hinges (mountain=bottom, valley=top; "
+            "face-to-face interfaces straddle H)."
         )
     )
     parser.add_argument("path", nargs="?", default=None, help="Input JSON path")
@@ -2133,9 +2372,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--output",
         default=None,
         help=(
-            "Base .stl path (writes <stem>-original / -collision / "
-            "-support-collision / -final / -support). "
-            "Default: trimmedData/<input-stem>-*.stl"
+            "Base .stl path or design folder. All role STLs are written into "
+            "a single folder (default: trimmedData/stl-<stem>/)."
         ),
     )
     parser.add_argument(
@@ -2163,6 +2401,44 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--no-hinges",
+        action="store_true",
+        help="Skip TPU crease living-hinge export",
+    )
+    parser.add_argument(
+        "--hinge-thickness",
+        type=float,
+        default=None,
+        help=f"TPU film thickness mm (default {DEFAULT_HINGE_THICKNESS_MM:g})",
+    )
+    parser.add_argument(
+        "--hinge-width",
+        type=float,
+        default=None,
+        help=(
+            "Legacy fallback strip width mm if panel-union footprint fails "
+            f"(default {DEFAULT_HINGE_WIDTH_MM:g})"
+        ),
+    )
+    parser.add_argument(
+        "--hinge-end-inset",
+        type=float,
+        default=None,
+        help=(
+            "Erode film from panel outer borders/corners mm "
+            f"(default {DEFAULT_HINGE_END_INSET_MM:g})"
+        ),
+    )
+    parser.add_argument(
+        "--hinge-embed",
+        type=float,
+        default=None,
+        help=(
+            "How far the film bites into the rigid face for bonding "
+            f"(default {DEFAULT_HINGE_EMBED_MM:g} mm)"
+        ),
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         help="Convert every *-trimmed / *-cleaned JSON in trimmedData/",
@@ -2183,6 +2459,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     stl_cfg = dict(cfg.get("stl") or {})
     crease_cfg = dict(cfg.get("crease") or stl_cfg.get("crease") or {})
+    hinge_cfg = dict(cfg.get("hinges") or stl_cfg.get("hinges") or {})
     defaults = {
         "thickness": stl_cfg.get("thickness", cfg.get("thickness")),
         "default_thickness": float(
@@ -2200,6 +2477,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ),
             )
         ),
+        "export_hinges": bool(
+            hinge_cfg.get("enabled", cfg.get("export_hinges", DEFAULT_HINGE_ENABLED))
+        ),
+        "hinge_thickness": float(
+            hinge_cfg.get("thickness", DEFAULT_HINGE_THICKNESS_MM)
+        ),
+        "hinge_width": float(hinge_cfg.get("width", DEFAULT_HINGE_WIDTH_MM)),
+        "hinge_end_inset": float(
+            hinge_cfg.get("end_inset", DEFAULT_HINGE_END_INSET_MM)
+        ),
+        "hinge_embed": float(hinge_cfg.get("embed", DEFAULT_HINGE_EMBED_MM)),
     }
     if args.thickness is not None:
         defaults["thickness"] = float(args.thickness)
@@ -2207,6 +2495,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         defaults["default_thickness"] = float(args.default_thickness)
     if args.crease_shrink is not None:
         defaults["crease_side_shrink"] = float(args.crease_shrink)
+    if args.no_hinges:
+        defaults["export_hinges"] = False
+    if args.hinge_thickness is not None:
+        defaults["hinge_thickness"] = float(args.hinge_thickness)
+    if args.hinge_width is not None:
+        defaults["hinge_width"] = float(args.hinge_width)
+    if args.hinge_end_inset is not None:
+        defaults["hinge_end_inset"] = float(args.hinge_end_inset)
+    if args.hinge_embed is not None:
+        defaults["hinge_embed"] = float(args.hinge_embed)
 
     exact_output: Optional[str] = None
     if args.output is not None:
@@ -2250,7 +2548,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not isinstance(job, dict) or not job.get("name"):
                     continue
                 settings = dict(defaults)
-                for k in ("thickness", "default_thickness", "crease_side_shrink"):
+                for k in (
+                    "thickness",
+                    "default_thickness",
+                    "crease_side_shrink",
+                    "export_hinges",
+                    "hinge_thickness",
+                    "hinge_width",
+                    "hinge_end_inset",
+                    "hinge_embed",
+                ):
                     if k in job and job[k] is not None:
                         settings[k] = job[k]
                 if job.get("crease_shrink") is not None and "crease_side_shrink" not in job:
@@ -2258,6 +2565,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 job_crease = job.get("crease")
                 if isinstance(job_crease, dict) and job_crease.get("gap") is not None:
                     settings["crease_side_shrink"] = job_crease["gap"]
+                job_hinges = job.get("hinges")
+                if isinstance(job_hinges, dict):
+                    if job_hinges.get("enabled") is not None:
+                        settings["export_hinges"] = bool(job_hinges["enabled"])
+                    if job_hinges.get("thickness") is not None:
+                        settings["hinge_thickness"] = float(job_hinges["thickness"])
+                    if job_hinges.get("width") is not None:
+                        settings["hinge_width"] = float(job_hinges["width"])
+                    if job_hinges.get("end_inset") is not None:
+                        settings["hinge_end_inset"] = float(job_hinges["end_inset"])
+                    if job_hinges.get("embed") is not None:
+                        settings["hinge_embed"] = float(job_hinges["embed"])
                 try:
                     in_path = _resolve_input(str(job["name"]))
                 except FileNotFoundError as exc:
@@ -2308,6 +2627,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "crease_side_shrink", DEFAULT_CREASE_SIDE_SHRINK
                     )
                 ),
+                export_hinges=bool(
+                    settings.get("export_hinges", DEFAULT_HINGE_ENABLED)
+                ),
+                hinge_thickness=float(
+                    settings.get(
+                        "hinge_thickness", DEFAULT_HINGE_THICKNESS_MM
+                    )
+                ),
+                hinge_width=float(
+                    settings.get("hinge_width", DEFAULT_HINGE_WIDTH_MM)
+                ),
+                hinge_end_inset=float(
+                    settings.get(
+                        "hinge_end_inset", DEFAULT_HINGE_END_INSET_MM
+                    )
+                ),
+                hinge_embed=float(
+                    settings.get("hinge_embed", DEFAULT_HINGE_EMBED_MM)
+                ),
             )
         except Exception as exc:
             print(f"[stl] FAILED {in_path}: {exc}", file=sys.stderr)
@@ -2316,12 +2654,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if not args.quiet:
             outs = report.get("outputs") or {}
+            hinfo = report.get("hinges") or {}
+            out_dir = report.get("output_dir") or ""
             print(
                 f"[stl] {os.path.basename(in_path)} → "
+                f"dir={out_dir} "
                 f"panels={report.get('n_panels')} "
                 f"main_coll={report.get('n_collisions_total')} "
                 f"sup_coll={report.get('n_support_collisions_total')} "
                 f"support_slabs={report.get('n_support_slabs')} "
+                f"hinges={hinfo.get('n_hinges', 0)}"
+                f"(M{hinfo.get('n_mountain', 0)}/V{hinfo.get('n_valley', 0)}) "
                 f"tris[orig/coll/supcoll/final/support]="
                 f"{report.get('n_triangles_original')}/"
                 f"{report.get('n_triangles_collision')}/"
@@ -2336,13 +2679,30 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "support_collision",
                 "final",
                 "support",
+                "hinges",
+                "hinges_mountain",
+                "hinges_valley",
+                "ref",
             ):
                 p = outs.get(role)
                 label = role.replace("_", "-")
                 if p:
                     print(f"[stl] wrote {label:18s} {p}")
+                elif role.startswith("hinges") and not settings.get(
+                    "export_hinges", True
+                ):
+                    continue
                 else:
-                    print(f"[stl] wrote {label:18s} (empty — skipped)")
+                    if role in (
+                        "collision",
+                        "support_collision",
+                        "support",
+                        "hinges",
+                        "hinges_mountain",
+                        "hinges_valley",
+                        "ref",
+                    ):
+                        print(f"[stl] wrote {label:18s} (empty — skipped)")
             for pe in report.get("panels") or []:
                 fail = pe.get("n_collision_failed", 0)
                 fail_s = f" fail={fail}" if fail else ""

@@ -16,15 +16,35 @@
 #        final               = original + support − both collisions
 #                              (optional crease gap last)
 #
-# Outputs: <stem>-original/collision/support-collision/final/support.stl
+# Outputs (all STLs in one folder per design):
+#   panel_trimming/trimmedData/stl-<stem>/
+#     original.stl
+#     collision.stl
+#     support-collision.stl
+#     final.stl
+#     support.stl
+#     hinges.stl / hinges-mountain.stl / hinges-valley.stl
+#     ref.stl            (final ∪ hinges — check hinge heights)
 
 default_thickness: 6            # when panel has a single thickness offset
 # thickness: 6                  # force uniform thickness (optional)
 
 # Inset each panel edge that is a mountain/valley crease (mm).
-# Border edges are not moved. Applied only to *-inset.stl.
+# Border edges are not moved. Applied last on final.
 crease:
   gap: 1
+
+# Flexible TPU living hinges along mountain/valley creases.
+# After final.stl: remap each panel at H as main∪support residual face,
+# then hinge = faces of the two panels the crease connects. Border skipped.
+# mountain → bottom face film; valley → top face film;
+# face-to-face interfaces (stacked stocks) straddle H.
+hinges:
+  enabled: true
+  thickness: 0.6    # TPU film (mm) — 0.5–0.8 typical for laser film / 95A FDM
+  width: 4.0        # strip fallback only if final remap fails
+  end_inset: 1.5    # inset hinge outline (mm) — shrinks faces, no vertex holes
+  embed: 0.15       # bites into rigid face for bonding area
 
 jobs:
   - name: miura-thick-trimmed
