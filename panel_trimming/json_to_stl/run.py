@@ -22,18 +22,14 @@ Writes under panel_trimming/trimmedData/stl-<stem>/:
   original.stl
   collision.stl
   support-collision.stl
-  final.stl
+  final.stl            (panels + 0.2 mm crease connectors)
   support.stl
   hinges.stl / hinges-mountain.stl / hinges-valley.stl
-  ref.stl       (final ∪ hinges — check hinge heights)
 
-TPU crease connectors (living hinges):
-  creases remapped by thick_panel_height
-  panels remapped AFTER final.stl build from residual bands
-  (main + support streams) recorded during stock−collision
-  mountain → thin film on BOTTOM face
-  valley   → thin film on TOP face
-  main/support face interfaces straddle H
+Crease connectors (living hinges):
+  mountain → 0.2 mm film on BOTTOM of crease height H
+  valley   → 0.2 mm film on TOP of crease height H
+  strip bridges crease.gap so both panels stay connected
   border / side-wall creases skipped
 
 Usage:
@@ -41,7 +37,7 @@ Usage:
   python panel_trimming/json_to_stl/run.py --name miura-thick-trimmed
   python panel_trimming/json_to_stl/run.py --config panel_trimming/json_to_stl/config.yml
   python panel_trimming/json_to_stl/run.py --crease-shrink 1
-  python panel_trimming/json_to_stl/run.py --hinge-thickness 0.6 --hinge-width 4
+  python panel_trimming/json_to_stl/run.py --hinge-thickness 0.2
 """
 
 from __future__ import annotations
@@ -78,16 +74,6 @@ from panel_trimming.visualize.visualize_3d import (  # noqa: E402
     panel_thickness_offsets,
     resolve_shaded_associations,
 )
-from panel_trimming.json_to_stl.hinges import (  # noqa: E402
-    DEFAULT_HINGE_EMBED_MM,
-    DEFAULT_HINGE_ENABLED,
-    DEFAULT_HINGE_END_INSET_MM,
-    DEFAULT_HINGE_THICKNESS_MM,
-    DEFAULT_HINGE_WIDTH_MM,
-    build_hinge_meshes,
-    collect_crease_hinges,
-    final_z_span_by_panel,
-)
 
 try:
     from scipy.spatial import Delaunay as _Delaunay
@@ -104,6 +90,11 @@ DEFAULT_CONFIG_EXAMPLE = os.path.join(_THIS_DIR, "config.example.yml")
 DEFAULT_THICKNESS = 6.0
 # Inward shrink (mm) on each panel edge that is a mountain/valley crease.
 DEFAULT_CREASE_SIDE_SHRINK = 1.0
+# Thin reserved film connecting both panels across the crease gap.
+DEFAULT_HINGE_THICKNESS_MM = 0.2
+DEFAULT_HINGE_EMBED_MM = 0.3
+DEFAULT_HINGE_END_INSET_MM = 1.0
+DEFAULT_HINGE_ENABLED = True
 VERTEX_EPS = 1e-9
 # Expand collision footprints slightly before panel − collision so a ~0.05–0.2 mm
 # shortfall at creases does not leave a super-thin residual wall.
@@ -485,6 +476,248 @@ def shrink_panel_on_crease_sides(
     return new_pts
 
 
+# ---------------------------------------------------------------------------
+# Crease connectors (hinges): thin film joining both panels
+#   mountain → bottom of H; valley → top of H; thickness default 0.2 mm
+# ---------------------------------------------------------------------------
+
+def _panels_owning_edge(
+    units: Sequence,
+    a: Sequence[float],
+    b: Sequence[float],
+) -> List[int]:
+    """Design panel indices whose outline contains undirected edge a–b."""
+    key = _edge_key(a, b)
+    owned: List[int] = []
+    for pi, unit in enumerate(units):
+        outer = _dedupe_closed(_poly_xy(unit))
+        n = len(outer)
+        if n < 2:
+            continue
+        for j in range(n):
+            if _edge_key(outer[j], outer[(j + 1) % n]) == key:
+                owned.append(int(pi))
+                break
+    return owned
+
+
+def _hinge_z_span(
+    kind: str,
+    H: float,
+    *,
+    t_film: float,
+) -> Tuple[float, float, str]:
+    """
+    mountain → bottom of H  (H − t … H)
+    valley   → top of H     (H … H + t)
+    """
+    face = float(H)
+    t = max(float(t_film), 1e-6)
+    if kind == "mountain":
+        return face - t, face, "bottom"
+    return face, face + t, "top"
+
+
+def _hinge_strip_ring(
+    a: Sequence[float],
+    b: Sequence[float],
+    *,
+    width: float,
+    end_inset: float,
+) -> Optional[List[List[float]]]:
+    """
+    Rectangle covering crease segment a→b, inset at ends.
+    Width is full strip width (perpendicular to the crease).
+    """
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    dx, dy = bx - ax, by - ay
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return None
+
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux
+
+    inset = max(float(end_inset), 0.0)
+    if length - 2.0 * inset < 1e-6:
+        inset = max(0.0, 0.2 * length)
+    if length - 2.0 * inset < 1e-6:
+        return None
+
+    a2x, a2y = ax + ux * inset, ay + uy * inset
+    b2x, b2y = bx - ux * inset, by - uy * inset
+    half_w = 0.5 * max(float(width), 1e-6)
+
+    ring = [
+        [a2x + nx * half_w, a2y + ny * half_w],
+        [b2x + nx * half_w, b2y + ny * half_w],
+        [b2x - nx * half_w, b2y - ny * half_w],
+        [a2x - nx * half_w, a2y - ny * half_w],
+    ]
+    if _poly_signed_area(ring) < 0:
+        ring = list(reversed(ring))
+    return ring
+
+
+def collect_crease_hinges(
+    data: dict,
+    *,
+    hinge_thickness: float = DEFAULT_HINGE_THICKNESS_MM,
+    embed: float = DEFAULT_HINGE_EMBED_MM,
+    end_inset: float = DEFAULT_HINGE_END_INSET_MM,
+    crease_gap: float = 0.0,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    One thin connecting film per mountain/valley crease.
+
+    Strip width = 2·crease_gap + 2·embed so the film bridges the gap left by
+    panel side-shrink and slightly overlaps both panels.
+    """
+    units = list(data.get("units") or [])
+    lines = list(data.get("lines") or [])
+    feats = list(data.get("line_features") or [])
+
+    gap = max(float(crease_gap), 0.0)
+    emb = max(float(embed), 0.0)
+    # Both panels pull in by ``gap`` → open gap ≈ 2·gap; plus embed into each.
+    width = max(2.0 * gap + 2.0 * emb, 2.0 * emb, 0.4)
+    t_film = max(float(hinge_thickness), 1e-4)
+    inset = max(float(end_inset), 0.0)
+
+    hinges: List[Dict[str, Any]] = []
+    n_skip_border = 0
+    n_skip_short = 0
+    n_skip_no_panel = 0
+    n_skip_no_height = 0
+    n_skip_geom = 0
+
+    for i, ln in enumerate(lines):
+        if not ln or len(ln) < 2:
+            continue
+        ft = feats[i] if i < len(feats) else {}
+        try:
+            ctype = int(ft.get("type", 2))
+        except (TypeError, ValueError):
+            ctype = 2
+        if ctype not in (TYPE_MOUNTAIN, TYPE_VALLEY):
+            n_skip_border += 1
+            continue
+
+        a, b = ln[0], ln[1]
+        panels = _panels_owning_edge(units, a, b)
+        if not panels:
+            n_skip_no_panel += 1
+            continue
+
+        try:
+            H = float(ft["thick_panel_height"])
+        except (KeyError, TypeError, ValueError):
+            n_skip_no_height += 1
+            continue
+
+        kind = "mountain" if ctype == TYPE_MOUNTAIN else "valley"
+        ring = _hinge_strip_ring(a, b, width=width, end_inset=inset)
+        if ring is None:
+            n_skip_short += 1
+            continue
+        poly = _as_shapely_union(ring)
+        if poly is None or getattr(poly, "is_empty", True):
+            n_skip_geom += 1
+            continue
+        try:
+            area = float(poly.area)
+        except Exception:
+            area = 0.0
+        if area < 1e-8:
+            n_skip_geom += 1
+            continue
+
+        z_lo, z_hi, side = _hinge_z_span(kind, H, t_film=t_film)
+        hinges.append({
+            "id": int(i),
+            "kind": kind,
+            "side": side,
+            "panels": list(panels),
+            "crease_a": [float(a[0]), float(a[1])],
+            "crease_b": [float(b[0]), float(b[1])],
+            "face_z": float(H),
+            "z_lo": float(z_lo),
+            "z_hi": float(z_hi),
+            "thickness_mm": float(t_film),
+            "width_mm": float(width),
+            "embed_mm": float(emb),
+            "end_inset_mm": float(inset),
+            "ring": ring,
+            "area": area,
+        })
+
+    info: Dict[str, Any] = {
+        "enabled": True,
+        "n_hinges": len(hinges),
+        "n_mountain": sum(1 for h in hinges if h["kind"] == "mountain"),
+        "n_valley": sum(1 for h in hinges if h["kind"] == "valley"),
+        "n_skip_border": int(n_skip_border),
+        "n_skip_short": int(n_skip_short),
+        "n_skip_no_panel": int(n_skip_no_panel),
+        "n_skip_no_height": int(n_skip_no_height),
+        "n_skip_geom": int(n_skip_geom),
+        "hinge_thickness_mm": float(t_film),
+        "hinge_width_mm": float(width),
+        "embed_mm": float(emb),
+        "end_inset_mm": float(inset),
+        "crease_gap_mm": float(gap),
+        "rule": (
+            "reserve thin film connecting both panels; "
+            "mountain=bottom of H, valley=top of H"
+        ),
+    }
+    return hinges, info
+
+
+def build_hinge_meshes(
+    hinges: Sequence[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Extrude hinge strips into mesh groups (all / mountain / valley)."""
+    groups: Dict[str, List[Dict[str, Any]]] = {
+        "hinges": [],
+        "hinges_mountain": [],
+        "hinges_valley": [],
+    }
+    for h in hinges or []:
+        ring = h.get("ring") or []
+        if len(ring) < 3:
+            continue
+        V, F, N = extrude_polygon_mesh(
+            ring,
+            z_lo=float(h["z_lo"]),
+            z_hi=float(h["z_hi"]),
+            holes=None,
+        )
+        if not (len(V) and len(F)):
+            continue
+        entry = {
+            "kind": f"hinge_{h['kind']}",
+            "hinge_id": h["id"],
+            "panel": (h.get("panels") or [None])[0],
+            "panels": list(h.get("panels") or []),
+            "thickness": float(h["thickness_mm"]),
+            "z_lo": float(h["z_lo"]),
+            "z_hi": float(h["z_hi"]),
+            "n_verts": int(len(V)),
+            "n_faces": int(len(F)),
+            "vertices": V,
+            "faces": F,
+            "normals": N,
+        }
+        groups["hinges"].append(entry)
+        if h["kind"] == "mountain":
+            groups["hinges_mountain"].append(entry)
+        else:
+            groups["hinges_valley"].append(entry)
+    return groups
+
+
 def _polygon_to_rings(
     p: Polygon,
 ) -> Optional[Tuple[List[List[float]], List[List[List[float]]]]]:
@@ -592,7 +825,7 @@ def _clip_pieces_to_outline(
 
     Used to apply **crease gap last**: after collision cuts on the full
     outline, intersect with the crease-shrunk outline so mountain/valley
-    sides pull in and leave a hinge gap.
+    sides pull in and leave a fabrication gap.
     """
     clip = _as_shapely_union(clip_outer)
     if clip is None or getattr(clip, "is_empty", True):
@@ -1608,18 +1841,6 @@ def _merge_slab_dicts(
     return out
 
 
-def _pieces_to_outer_rings(
-    pieces: Sequence[Tuple[List[List[float]], List[List[List[float]]]]],
-) -> List[List[List[float]]]:
-    """Outer rings only from boolean residual pieces (for hinge remap)."""
-    out: List[List[List[float]]] = []
-    for outer_r, _holes in pieces or []:
-        ring = _dedupe_closed(outer_r)
-        if len(ring) >= 3:
-            out.append(ring)
-    return out
-
-
 def _stock_minus_collision_slabs(
     outer: Sequence,
     slabs: Sequence[Tuple[float, float, Sequence[Sequence]]],
@@ -1628,14 +1849,7 @@ def _stock_minus_collision_slabs(
     z_hi: float,
     fallback_mesh: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     inset_outer: Optional[Sequence] = None,
-    stream: str = "main",
-) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    int,
-    List[Dict[str, Any]],
-]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """
     Extrude panel outline with collision bands boolean-subtracted in Z slabs.
 
@@ -1644,15 +1858,9 @@ def _stock_minus_collision_slabs(
 
     If ``inset_outer`` is set, **crease gap is applied last**: after collision
     cuts on ``outer``, each 2D piece is intersected with the crease-shrunk
-    outline so mountain/valley sides leave a hinge gap.
-
-    Also returns ``bands``: the exact 2D residual footprints used to build final
-    stock, one entry per Z band:
-      {z_lo, z_hi, rings, stream, cut}
-    Hinges remap panels from these bands (post-final geometry).
+    outline so mountain/valley sides leave a fabrication gap.
     """
     use_inset = inset_outer is not None and len(_dedupe_closed(inset_outer)) >= 3
-    bands: List[Dict[str, Any]] = []
 
     def _maybe_gap(
         pieces: List[Tuple[List[List[float]], List[List[List[float]]]]],
@@ -1662,44 +1870,18 @@ def _stock_minus_collision_slabs(
         clipped = _clip_pieces_to_outline(pieces, inset_outer)
         return clipped if clipped else pieces
 
-    def _record_band(
-        za: float,
-        zb: float,
-        pieces: Sequence[Tuple[List[List[float]], List[List[List[float]]]]],
-        *,
-        cut: bool,
-    ) -> None:
-        rings = _pieces_to_outer_rings(pieces)
-        if not rings:
-            return
-        bands.append({
-            "z_lo": float(min(za, zb)),
-            "z_hi": float(max(za, zb)),
-            "rings": rings,
-            "stream": str(stream),
-            "cut": bool(cut),
-            "n_rings": len(rings),
-        })
-
     if not slabs:
         if use_inset:
             pieces = _maybe_gap([(list(outer), [])])
             V, F, N = _extrude_pieces(pieces, z_lo=z_lo, z_hi=z_hi)
             if len(V) and len(F):
-                _record_band(z_lo, z_hi, pieces, cut=False)
-                return V, F, N, len(pieces), bands
+                return V, F, N, len(pieces)
         if fallback_mesh is not None and not use_inset:
             V, F, N = fallback_mesh
-            # Approximate one band with the stock outline
-            pieces = [(list(outer), [])]
-            _record_band(z_lo, z_hi, pieces, cut=False)
-            return V, F, N, 1, bands
+            return V, F, N, 1
         outline = inset_outer if use_inset else outer
         V, F, N = extrude_polygon_mesh(outline, z_lo=z_lo, z_hi=z_hi, holes=None)
-        if len(V) and len(F):
-            pieces = [(list(outline), [])]
-            _record_band(z_lo, z_hi, pieces, cut=False)
-        return V, F, N, (1 if len(V) and len(F) else 0), bands
+        return V, F, N, (1 if len(V) and len(F) else 0)
 
     meshes: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     n_pieces = 0
@@ -1714,7 +1896,6 @@ def _stock_minus_collision_slabs(
             if len(Vgap) and len(Fgap):
                 meshes.append((Vgap, Fgap, Ngap))
                 n_pieces += len(pieces)
-                _record_band(cursor, za_c, pieces, cut=False)
         if zb_c - za_c > 1e-12 and rings:
             # 1) cut collisions on full outline  2) crease gap last
             pieces = boolean_panel_minus_collisions(outer, rings)
@@ -1725,7 +1906,6 @@ def _stock_minus_collision_slabs(
             if len(Vf) and len(Ff):
                 meshes.append((Vf, Ff, Nf))
                 n_pieces += len(pieces)
-                _record_band(za_c, zb_c, pieces, cut=True)
         cursor = max(cursor, zb_c)
     if float(z_hi) > cursor + 1e-12:
         pieces = _maybe_gap([(list(outer), [])])
@@ -1733,14 +1913,11 @@ def _stock_minus_collision_slabs(
         if len(Vgap) and len(Fgap):
             meshes.append((Vgap, Fgap, Ngap))
             n_pieces += len(pieces)
-            _record_band(cursor, z_hi, pieces, cut=False)
 
     V, F, N = merge_meshes(meshes)
     if (len(V) == 0 or len(F) == 0) and fallback_mesh is not None and not use_inset:
-        pieces = [(list(outer), [])]
-        _record_band(z_lo, z_hi, pieces, cut=False)
-        return fallback_mesh[0], fallback_mesh[1], fallback_mesh[2], 1, bands
-    return V, F, N, n_pieces, bands
+        return fallback_mesh[0], fallback_mesh[1], fallback_mesh[2], 1
+    return V, F, N, n_pieces
 
 
 def build_panel_meshes(
@@ -1930,22 +2107,17 @@ def build_panel_meshes(
         gap_clip = outer_inset if apply_gap else None
         final_meshes: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         n_final_pieces = 0
-        # Exact residual footprints used to build final.stl (main + support).
-        # Hinges remap panels from these bands — not a re-derivation from JSON.
-        final_bands: List[Dict[str, Any]] = []
-        V_fp, F_fp, N_fp, n_fp, bands_main = _stock_minus_collision_slabs(
+        V_fp, F_fp, N_fp, n_fp = _stock_minus_collision_slabs(
             outer,
             main_slabs,
             z_lo=z_lo,
             z_hi=z_hi,
             fallback_mesh=(V_o, F_o, N_o),
             inset_outer=gap_clip,
-            stream="main",
         )
         if len(V_fp) and len(F_fp):
             final_meshes.append((V_fp, F_fp, N_fp))
             n_final_pieces += n_fp
-            final_bands.extend(bands_main)
         for za, zb, rings in sup_slabs:
             for ring in rings:
                 Vs0, Fs0, Ns0 = extrude_polygon_mesh(
@@ -1960,32 +2132,21 @@ def build_panel_meshes(
                     )
                     if len(ring_inset) < 3:
                         ring_inset = outer_inset
-                Vsf, Fsf, Nsf, n_sf, bands_sup = _stock_minus_collision_slabs(
+                Vsf, Fsf, Nsf, n_sf = _stock_minus_collision_slabs(
                     ring,
                     sup_coll_slabs,
                     z_lo=za,
                     z_hi=zb,
                     fallback_mesh=(Vs0, Fs0, Ns0),
                     inset_outer=ring_inset,
-                    stream="support",
                 )
                 if len(Vsf) and len(Fsf):
                     final_meshes.append((Vsf, Fsf, Nsf))
                     n_final_pieces += n_sf
-                    final_bands.extend(bands_sup)
         V_f, F_f, N_f = merge_meshes(final_meshes)
         if len(V_f) == 0 or len(F_f) == 0:
             V_f, F_f, N_f = V_o, F_o, N_o
             n_final_pieces = 1
-            if not final_bands:
-                final_bands.append({
-                    "z_lo": float(z_lo),
-                    "z_hi": float(z_hi),
-                    "rings": [_dedupe_closed(outer)],
-                    "stream": "main",
-                    "cut": False,
-                    "n_rings": 1,
-                })
 
         base_meta = {
             "panel": pi,
@@ -2004,8 +2165,6 @@ def build_panel_meshes(
             "crease_side_shrink": shrink_mm,
             "n_support_slabs": len(sup_slabs),
             "n_support_rings": n_sup,
-            "final_bands": final_bands,
-            "n_final_bands": len(final_bands),
         }
         groups["original"].append({
             **base_meta,
@@ -2120,9 +2279,6 @@ def _design_stem_from_path(base_path: str) -> str:
     lower = stem.lower()
     for suffix in (
         "-support-collision", "_support_collision",
-        "-hinges-mountain", "_hinges_mountain",
-        "-hinges-valley", "_hinges_valley",
-        "-hinges", "_hinges",
         "-final", "_final",
         "-original", "_original",
         "-collision", "_collision",
@@ -2183,7 +2339,6 @@ def _output_paths(base_path: str) -> Dict[str, str]:
       .../stl-<stem>/hinges.stl
       .../stl-<stem>/hinges-mountain.stl
       .../stl-<stem>/hinges-valley.stl
-      .../stl-<stem>/ref.stl            (final ∪ hinges — height check)
     """
     out_dir = _output_dir_for(base_path)
     return {
@@ -2196,7 +2351,6 @@ def _output_paths(base_path: str) -> Dict[str, str]:
         "hinges": os.path.join(out_dir, "hinges.stl"),
         "hinges_mountain": os.path.join(out_dir, "hinges-mountain.stl"),
         "hinges_valley": os.path.join(out_dir, "hinges-valley.stl"),
-        "ref": os.path.join(out_dir, "ref.stl"),
     }
 
 
@@ -2210,9 +2364,8 @@ def export_stl(
     crease_side_shrink: float = DEFAULT_CREASE_SIDE_SHRINK,
     export_hinges: bool = DEFAULT_HINGE_ENABLED,
     hinge_thickness: float = DEFAULT_HINGE_THICKNESS_MM,
-    hinge_width: float = DEFAULT_HINGE_WIDTH_MM,
-    hinge_end_inset: float = DEFAULT_HINGE_END_INSET_MM,
     hinge_embed: float = DEFAULT_HINGE_EMBED_MM,
+    hinge_end_inset: float = DEFAULT_HINGE_END_INSET_MM,
     source_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     groups, report = build_panel_meshes(
@@ -2232,9 +2385,9 @@ def export_stl(
     os.makedirs(out_dir, exist_ok=True)
     report["output_dir"] = out_dir
 
-    # Keep final mesh for ref.stl (final ∪ hinges)
-    final_mesh: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
-    hinges_mesh: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+    # Panel meshes for final (hinge connectors merged in after hinge export).
+    final_parts: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    hinge_parts: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
     for role in (
         "original",
@@ -2256,6 +2409,10 @@ def export_stl(
         V, F, N = merge_meshes(
             [(m["vertices"], m["faces"], m["normals"]) for m in meshes]
         )
+        if role == "final":
+            # Defer write until after hinge merge so final stays connected.
+            final_parts.append((V, F, N))
+            continue
         write_stl_binary(
             path,
             V,
@@ -2266,33 +2423,18 @@ def export_stl(
         report["outputs"][role] = path
         report[f"n_verts_{role}"] = int(len(V))
         report[f"n_faces_{role}"] = int(len(F))
-        if role == "final":
-            final_mesh = (V, F, N)
 
-    # Flexible TPU crease connectors — remapped AFTER final.stl is built.
-    # Panel footprints come from final_bands recorded during stock − collision
-    # (main + support streams), so hinges match the actual final residual,
-    # including faces that run across main/support interfaces.
+    # Thin 0.2 mm crease connectors: mountain=bottom of H, valley=top of H.
+    # Strip bridges crease.gap so both panels stay physically connected.
     if bool(export_hinges):
-        final_parts = list(groups.get("final") or [])
-        final_z = final_z_span_by_panel(final_parts)
         hinges, hinfo = collect_crease_hinges(
             data,
-            final_meshes=final_parts,
-            final_z_by_panel=final_z,
             hinge_thickness=hinge_thickness,
-            hinge_width=hinge_width,
-            end_inset=hinge_end_inset,
             embed=hinge_embed,
+            end_inset=hinge_end_inset,
             crease_gap=crease_side_shrink,
         )
-        h_groups = build_hinge_meshes(
-            hinges,
-            extrude_polygon_mesh=extrude_polygon_mesh,
-            merge_meshes=merge_meshes,
-            data=data,
-            boolean_panel_minus_collisions=boolean_panel_minus_collisions,
-        )
+        h_groups = build_hinge_meshes(hinges)
         report["hinges"] = hinfo
         report["hinges"]["n_meshes"] = {
             k: len(v) for k, v in h_groups.items()
@@ -2309,35 +2451,37 @@ def export_stl(
                 [(m["vertices"], m["faces"], m["normals"]) for m in meshes]
             )
             write_stl_binary(
-                path, V, F, N, header=f"json_to_stl {role} TPU living hinge"
+                path,
+                V,
+                F,
+                N,
+                header=f"json_to_stl {role} 0.2mm crease connector",
             )
             report["outputs"][role] = path
             report[f"n_verts_{role}"] = int(len(V))
             report[f"n_faces_{role}"] = int(len(F))
             if role == "hinges":
-                hinges_mesh = (V, F, N)
+                hinge_parts.append((V, F, N))
     else:
         report["hinges"] = {"enabled": False}
 
-    # ref.stl = final ∪ hinges — visual check of hinge Z placement
-    ref_path = paths.get("ref")
-    if ref_path and final_mesh is not None:
-        parts: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = [final_mesh]
-        if hinges_mesh is not None and len(hinges_mesh[0]) and len(hinges_mesh[1]):
-            parts.append(hinges_mesh)
-        V_ref, F_ref, N_ref = merge_meshes(parts)
-        write_stl_binary(
-            ref_path,
-            V_ref,
-            F_ref,
-            N_ref,
-            header="json_to_stl ref final+hinges",
-        )
-        report["outputs"]["ref"] = ref_path
-        report["n_verts_ref"] = int(len(V_ref))
-        report["n_faces_ref"] = int(len(F_ref))
-    else:
-        report["outputs"]["ref"] = None
+    # final.stl = panel residuals ∪ hinge connectors (connected assembly)
+    if not final_parts:
+        raise RuntimeError("no meshes for role=final")
+    merged_final = list(final_parts)
+    merged_final.extend(hinge_parts)
+    V_f, F_f, N_f = merge_meshes(merged_final)
+    write_stl_binary(
+        paths["final"],
+        V_f,
+        F_f,
+        N_f,
+        header="json_to_stl final panels+hinges",
+    )
+    report["outputs"]["final"] = paths["final"]
+    report["n_verts_final"] = int(len(V_f))
+    report["n_faces_final"] = int(len(F_f))
+    report["n_triangles_final"] = int(len(F_f))
 
     return report
 
@@ -2355,9 +2499,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Write STLs per design into trimmedData/stl-<stem>/: "
-            "original, collision, support-collision, final, support, "
-            "and TPU crease living hinges (mountain=bottom, valley=top; "
-            "face-to-face interfaces straddle H)."
+            "original, collision, support-collision, final (panels + "
+            "0.2 mm crease connectors), support, hinges."
         )
     )
     parser.add_argument("path", nargs="?", default=None, help="Input JSON path")
@@ -2403,30 +2546,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--no-hinges",
         action="store_true",
-        help="Skip TPU crease living-hinge export",
+        help="Skip crease-connector export (final stays unconnected)",
     )
     parser.add_argument(
         "--hinge-thickness",
         type=float,
         default=None,
-        help=f"TPU film thickness mm (default {DEFAULT_HINGE_THICKNESS_MM:g})",
-    )
-    parser.add_argument(
-        "--hinge-width",
-        type=float,
-        default=None,
         help=(
-            "Legacy fallback strip width mm if panel-union footprint fails "
-            f"(default {DEFAULT_HINGE_WIDTH_MM:g})"
-        ),
-    )
-    parser.add_argument(
-        "--hinge-end-inset",
-        type=float,
-        default=None,
-        help=(
-            "Erode film from panel outer borders/corners mm "
-            f"(default {DEFAULT_HINGE_END_INSET_MM:g})"
+            "Reserved film thickness mm connecting both panels "
+            f"(default {DEFAULT_HINGE_THICKNESS_MM:g}; mountain=bottom, valley=top)"
         ),
     )
     parser.add_argument(
@@ -2434,8 +2562,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         type=float,
         default=None,
         help=(
-            "How far the film bites into the rigid face for bonding "
+            "How far the strip bites into each panel beyond the crease gap "
             f"(default {DEFAULT_HINGE_EMBED_MM:g} mm)"
+        ),
+    )
+    parser.add_argument(
+        "--hinge-end-inset",
+        type=float,
+        default=None,
+        help=(
+            "Inset connector ends from crease endpoints mm "
+            f"(default {DEFAULT_HINGE_END_INSET_MM:g})"
         ),
     )
     parser.add_argument(
@@ -2483,11 +2620,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "hinge_thickness": float(
             hinge_cfg.get("thickness", DEFAULT_HINGE_THICKNESS_MM)
         ),
-        "hinge_width": float(hinge_cfg.get("width", DEFAULT_HINGE_WIDTH_MM)),
+        "hinge_embed": float(hinge_cfg.get("embed", DEFAULT_HINGE_EMBED_MM)),
         "hinge_end_inset": float(
             hinge_cfg.get("end_inset", DEFAULT_HINGE_END_INSET_MM)
         ),
-        "hinge_embed": float(hinge_cfg.get("embed", DEFAULT_HINGE_EMBED_MM)),
     }
     if args.thickness is not None:
         defaults["thickness"] = float(args.thickness)
@@ -2499,12 +2635,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         defaults["export_hinges"] = False
     if args.hinge_thickness is not None:
         defaults["hinge_thickness"] = float(args.hinge_thickness)
-    if args.hinge_width is not None:
-        defaults["hinge_width"] = float(args.hinge_width)
-    if args.hinge_end_inset is not None:
-        defaults["hinge_end_inset"] = float(args.hinge_end_inset)
     if args.hinge_embed is not None:
         defaults["hinge_embed"] = float(args.hinge_embed)
+    if args.hinge_end_inset is not None:
+        defaults["hinge_end_inset"] = float(args.hinge_end_inset)
 
     exact_output: Optional[str] = None
     if args.output is not None:
@@ -2554,9 +2688,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "crease_side_shrink",
                     "export_hinges",
                     "hinge_thickness",
-                    "hinge_width",
-                    "hinge_end_inset",
                     "hinge_embed",
+                    "hinge_end_inset",
                 ):
                     if k in job and job[k] is not None:
                         settings[k] = job[k]
@@ -2571,12 +2704,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         settings["export_hinges"] = bool(job_hinges["enabled"])
                     if job_hinges.get("thickness") is not None:
                         settings["hinge_thickness"] = float(job_hinges["thickness"])
-                    if job_hinges.get("width") is not None:
-                        settings["hinge_width"] = float(job_hinges["width"])
-                    if job_hinges.get("end_inset") is not None:
-                        settings["hinge_end_inset"] = float(job_hinges["end_inset"])
                     if job_hinges.get("embed") is not None:
                         settings["hinge_embed"] = float(job_hinges["embed"])
+                    if job_hinges.get("end_inset") is not None:
+                        settings["hinge_end_inset"] = float(job_hinges["end_inset"])
                 try:
                     in_path = _resolve_input(str(job["name"]))
                 except FileNotFoundError as exc:
@@ -2631,20 +2762,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     settings.get("export_hinges", DEFAULT_HINGE_ENABLED)
                 ),
                 hinge_thickness=float(
-                    settings.get(
-                        "hinge_thickness", DEFAULT_HINGE_THICKNESS_MM
-                    )
-                ),
-                hinge_width=float(
-                    settings.get("hinge_width", DEFAULT_HINGE_WIDTH_MM)
-                ),
-                hinge_end_inset=float(
-                    settings.get(
-                        "hinge_end_inset", DEFAULT_HINGE_END_INSET_MM
-                    )
+                    settings.get("hinge_thickness", DEFAULT_HINGE_THICKNESS_MM)
                 ),
                 hinge_embed=float(
                     settings.get("hinge_embed", DEFAULT_HINGE_EMBED_MM)
+                ),
+                hinge_end_inset=float(
+                    settings.get("hinge_end_inset", DEFAULT_HINGE_END_INSET_MM)
                 ),
             )
         except Exception as exc:
@@ -2664,7 +2788,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"sup_coll={report.get('n_support_collisions_total')} "
                 f"support_slabs={report.get('n_support_slabs')} "
                 f"hinges={hinfo.get('n_hinges', 0)}"
-                f"(M{hinfo.get('n_mountain', 0)}/V{hinfo.get('n_valley', 0)}) "
+                f"(M{hinfo.get('n_mountain', 0)}/V{hinfo.get('n_valley', 0)} "
+                f"t={hinfo.get('hinge_thickness_mm', 0):g}mm) "
                 f"tris[orig/coll/supcoll/final/support]="
                 f"{report.get('n_triangles_original')}/"
                 f"{report.get('n_triangles_collision')}/"
@@ -2682,7 +2807,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "hinges",
                 "hinges_mountain",
                 "hinges_valley",
-                "ref",
             ):
                 p = outs.get(role)
                 label = role.replace("_", "-")
@@ -2692,17 +2816,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "export_hinges", True
                 ):
                     continue
-                else:
-                    if role in (
-                        "collision",
-                        "support_collision",
-                        "support",
-                        "hinges",
-                        "hinges_mountain",
-                        "hinges_valley",
-                        "ref",
-                    ):
-                        print(f"[stl] wrote {label:18s} (empty — skipped)")
+                elif role in (
+                    "collision",
+                    "support_collision",
+                    "support",
+                    "hinges",
+                    "hinges_mountain",
+                    "hinges_valley",
+                ):
+                    print(f"[stl] wrote {label:18s} (empty — skipped)")
             for pe in report.get("panels") or []:
                 fail = pe.get("n_collision_failed", 0)
                 fail_s = f" fail={fail}" if fail else ""

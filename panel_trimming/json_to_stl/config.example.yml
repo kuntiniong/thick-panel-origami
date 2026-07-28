@@ -11,20 +11,18 @@
 #        original            = full physical panel stock
 #        support             = full solid at missing global heights
 #        collision           = main phys+ghost solid prism (largest ghost layer)
-#        support-collision   = support solid prism (largest support layer;
-#                              same clean → prism rules as main)
+#        support-collision   = support solid prism (largest support layer)
 #        final               = original + support − both collisions
-#                              (optional crease gap last)
+#                              + crease connectors (optional)
 #
 # Outputs (all STLs in one folder per design):
 #   panel_trimming/trimmedData/stl-<stem>/
 #     original.stl
 #     collision.stl
 #     support-collision.stl
-#     final.stl
+#     final.stl              (panels ∪ connectors)
 #     support.stl
 #     hinges.stl / hinges-mountain.stl / hinges-valley.stl
-#     ref.stl            (final ∪ hinges — check hinge heights)
 
 default_thickness: 6            # when panel has a single thickness offset
 # thickness: 6                  # force uniform thickness (optional)
@@ -34,17 +32,14 @@ default_thickness: 6            # when panel has a single thickness offset
 crease:
   gap: 1
 
-# Flexible TPU living hinges along mountain/valley creases.
-# After final.stl: remap each panel at H as main∪support residual face,
-# then hinge = faces of the two panels the crease connects. Border skipped.
-# mountain → bottom face film; valley → top face film;
-# face-to-face interfaces (stacked stocks) straddle H.
+# Thin reserved film connecting both panels across the crease gap.
+# mountain → bottom of crease height H; valley → top of H.
+# Strip width = 2·crease.gap + 2·embed so both stocks stay joined.
 hinges:
   enabled: true
-  thickness: 0.6    # TPU film (mm) — 0.5–0.8 typical for laser film / 95A FDM
-  width: 4.0        # strip fallback only if final remap fails
-  end_inset: 1.5    # inset hinge outline (mm) — shrinks faces, no vertex holes
-  embed: 0.15       # bites into rigid face for bonding area
+  thickness: 0.2    # film thickness (mm)
+  embed: 0.3        # bite into each panel beyond the gap (mm)
+  end_inset: 1.0    # inset ends from crease endpoints (mm)
 
 jobs:
   - name: miura-thick-trimmed
