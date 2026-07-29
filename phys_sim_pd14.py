@@ -65,10 +65,23 @@ class PD_Origami_Simulator(CollisionMixin):
         self._collision_active_points = {}
         self._collision_fixed_segments = {}    # finalized when that pair's contact ended
         self._collision_fixed_points = {}
-        self._collision_coords_exported = False  # sealed at π (no more trail growth)
-        self._sweep_draw_stopped = False  # True once θ hits π — no more paint growth
-        self._trimmed_json_exported = False  # one-shot write of *-trimmed.json at π
+        self._collision_coords_exported = False  # sealed when fold complete (no more trail growth)
+        self._sweep_draw_stopped = False  # True once creases full-fold — no more paint growth
+        self._trimmed_json_exported = False  # one-shot write of *-trimmed.json
         self._trimmed_json_path = None
+        # Export trigger: all measured creases near ±π (not the drive slider θ).
+        # crease_angle[i] is signed_theta/π so |angle|≈1 means fully folded.
+        self.creases_at_pi_eps = 0.05  # require |crease_angle| >= 1 - eps (or target - eps)
+        # After drive θ hits π, wait this many mesh-advanced steps for creases to
+        # catch up; then force-export so headless jobs cannot hang forever.
+        self.creases_at_pi_max_settle_steps = 3000
+        # Pause collision/paint growth while any crease overshoots π (|angle| > 1).
+        # Resumes when all creases are back to |angle| ≤ 1 (existing locus kept).
+        self.creases_overshoot_eps = 1e-3  # treat |θ/π| > 1 + eps as overshoot
+        self._crease_overshoot_paused = False
+        self._drive_theta_at_pi = False
+        self._creases_settle_steps = 0
+        self._creases_at_pi_status_logged = False
         # Locus paint: path of two contact nodes + the line (design xy → panel).
         # Phase-1 SoA: per-unit dense arrays of bary locs (reprojected onto live x).
         # unit_id -> {n, cap, loc0(N,6), loc1(N,6), p0(N,2), p1(N,2)}
@@ -81,6 +94,11 @@ class PD_Origami_Simulator(CollisionMixin):
         # Collision postprocess is still host-side — throttle when not folding
         self._collision_frame_i = 0
         self._collision_every_n = 4      # run broadphase every N render frames
+        # Collision locus density: target increments of drive θ over 0→π.
+        # Larger = slower fold / denser samples. Set via config or apply_collision_sampling_config.
+        self.collision_sample_steps = 1000
+        self._collision_fold_step = math.pi / 1000.0  # max |Δθ| per mesh step
+        self._collision_rate_limit_fold = True  # clamp slider / auto-step jumps
         self._paint_dirty = False
         # Per-frame host cache of x (shared by collision / paint)
         self._frame_positions = None
@@ -1533,6 +1551,10 @@ class PD_Origami_Simulator(CollisionMixin):
         self._sweep_draw_stopped = False
         self._trimmed_json_exported = False
         self._trimmed_json_path = None
+        self._drive_theta_at_pi = False
+        self._creases_settle_steps = 0
+        self._creases_at_pi_status_logged = False
+        self._crease_overshoot_paused = False
         self._collision_contact_count = 0
         self._collision_segment_count = 0
         self._collision_contact_points_list = []
@@ -1709,16 +1731,17 @@ class PD_Origami_Simulator(CollisionMixin):
             self.folding_angle += math.pi
             if self.folding_angle >= math.pi:
                 self.folding_angle = math.pi
-                if self.collision_shading:
-                    self._stop_sweep_drawing_at_pi()
+                # Drive θ only — seal/export waits until all creases reach ±π
                 if float(getattr(self, "enable_add_folding_angle", 0.0)) > 0.0:
                     self.enable_add_folding_angle = 0.0
         elif key == 'j': 
             self.folding_angle -= math.pi
             if self.folding_angle <= 0:
                 self.folding_angle = 0
+                self._drive_theta_at_pi = False
+                self._creases_settle_steps = 0
         elif key == 'i': 
-            # Do not resume auto-fold past a sealed π fold without restart
+            # Do not resume auto-fold past a sealed full-fold without restart
             if getattr(self, "_sweep_draw_stopped", False):
                 self.enable_add_folding_angle = 0.0
             else:
@@ -2623,18 +2646,85 @@ class PD_Origami_Simulator(CollisionMixin):
             for j in ti.static(range(3)):
                 b[idx4 * 3 + j] += f4[j]
     
+    def apply_collision_sampling_config(
+        self,
+        sample_steps=None,
+        rate_limit=None,
+    ):
+        """
+        Control collision locus density with one knob: sample_steps.
+
+        :param sample_steps: target drive-θ increments from 0→π.
+            Higher = slower fold / denser samples. Contact runs every frame.
+        :param rate_limit: if True, cap auto-fold / i-key |Δθ| to π/sample_steps.
+            Does **not** touch the GUI slider (clamping after slider_float fights
+            the widget and snaps θ back toward 0).
+        """
+        if not getattr(self, "collision_shading", False):
+            return
+        if sample_steps is not None:
+            n = max(10, int(sample_steps))
+            self.collision_sample_steps = n
+        else:
+            n = max(10, int(getattr(self, "collision_sample_steps", 1000) or 1000))
+            self.collision_sample_steps = n
+
+        step = math.pi / float(n)
+        # Keep a sane range so configs cannot freeze or explode the fold
+        step = min(max(step, math.pi / 10000.0), math.pi / 50.0)
+        self._collision_fold_step = step
+        # Always detect every frame for collision shading (no separate every_n knob)
+        self._collision_every_n = 1
+
+        if rate_limit is not None:
+            self._collision_rate_limit_fold = bool(rate_limit)
+
+        # 'i' / 'm' keys and headless auto-fold use folding_micro_step
+        try:
+            if hasattr(self, "folding_micro_step"):
+                self.folding_micro_step[None] = step
+        except Exception:
+            pass
+        # If already auto-folding, adopt the new step immediately
+        try:
+            cur = float(getattr(self, "enable_add_folding_angle", 0.0) or 0.0)
+            if abs(cur) > 1e-15:
+                self.enable_add_folding_angle = math.copysign(step, cur)
+        except Exception:
+            pass
+
+        print(
+            f"[Contact] sampling: collision_sample_steps={self.collision_sample_steps} "
+            f"(dθ={step:.6g} rad ≈ {step * 180.0 / math.pi:.4f}°/step, every frame), "
+            f"rate_limit={bool(getattr(self, '_collision_rate_limit_fold', True))} "
+            f"(auto/i only; slider unrestricted)"
+        )
+
     def update_folding_target(self):
-        self.folding_angle += self.enable_add_folding_angle
+        prev = float(self.folding_angle)
+        delta = float(self.enable_add_folding_angle)
+        # Cap auto-fold / key step size to the sampling budget (not the slider)
+        if (
+            self.collision_shading
+            and getattr(self, "_collision_rate_limit_fold", True)
+            and abs(delta) > 1e-15
+        ):
+            max_d = float(getattr(self, "_collision_fold_step", math.pi / 1000.0))
+            if abs(delta) > max_d:
+                delta = math.copysign(max_d, delta)
+                self.enable_add_folding_angle = delta
+        self.folding_angle = prev + delta
         if self.folding_angle >= 3.1415:
             self.folding_angle = 3.1415
-            # Hit π this step → freeze paint immediately (not next render)
-            if self.collision_shading:
-                self._stop_sweep_drawing_at_pi()
-            # Stop auto-fold so θ does not keep “driving” past clamp
+            # Clamp drive θ at π and stop auto-increment. Seal/export is separate:
+            # waits until all measured creases reach ±π (see _maybe_seal_export_on_full_fold).
             if float(getattr(self, "enable_add_folding_angle", 0.0)) > 0.0:
                 self.enable_add_folding_angle = 0.0
         if self.folding_angle <= 0:
             self.folding_angle = 0
+            if self.collision_shading:
+                self._drive_theta_at_pi = False
+                self._creases_settle_steps = 0
 
     @ti.kernel
     def forward(self, dt: data_type):
@@ -2737,32 +2827,28 @@ class PD_Origami_Simulator(CollisionMixin):
         #     return True
         # self.backup_energy[None] = self.energy[None]
 
-        # Collision-shading GUI: never auto-quit after π — export is one-shot;
-        # user closes the window when done inspecting.
-        if self.collision_shading and self.use_gui:
+        # Collision-shading: seal/export when all creases reach ±π (not drive θ).
+        if self.collision_shading:
+            try:
+                self._maybe_seal_export_on_full_fold()
+            except Exception as exc:
+                if not getattr(self, "_creases_seal_error_logged", False):
+                    self._creases_seal_error_logged = True
+                    print(f"[Contact] crease-based seal check failed: {exc}")
+            # GUI: never auto-quit — user closes the window when done inspecting.
+            if self.use_gui:
+                return False
+            # Headless: exit only after export (creases at π or settle timeout).
+            if getattr(self, "_trimmed_json_exported", False):
+                return True
+            angle_sum = self.calculateCreaseAngleSum()
+            self.backup_crease_angle_sum[None] = angle_sum
             return False
 
         angle_sum = self.calculateCreaseAngleSum()
         at_pi = float(self.folding_angle) >= 3.1415 - 1e-6
         if abs(angle_sum - self.backup_crease_angle_sum[None]) < 1e-3 * angle_sum and (
             self.folding_angle > 3.14 or at_pi
-        ):
-            # Seal every pair's final coords (including still-active)
-            if self.collision_shading:
-                if not self._collision_coords_exported:
-                    self._seal_fixed_flat_contacts(reason="stop")
-                if not getattr(self, "_trimmed_json_exported", False):
-                    try:
-                        self.export_trimmed_json(reason="stop")
-                    except Exception as exc:
-                        print(f"[Contact] trimmed export @stop failed: {exc}")
-            return True
-        # Headless collision-shading: exit only after export so batch jobs finish
-        if (
-            self.collision_shading
-            and not self.use_gui
-            and at_pi
-            and getattr(self, "_trimmed_json_exported", False)
         ):
             return True
         self.backup_crease_angle_sum[None] = angle_sum
@@ -2799,6 +2885,14 @@ class PD_Origami_Simulator(CollisionMixin):
                 if not getattr(self, "_headless_coll_error_logged", False):
                     self._headless_coll_error_logged = True
                     print(f"[Contact] headless collision step failed: {exc}")
+        # After PD advances: count settle steps at θ=π and seal when creases full-fold
+        if self.collision_shading and self._mesh_advanced:
+            try:
+                self._tick_crease_settle_and_maybe_export()
+            except Exception as exc:
+                if not getattr(self, "_creases_seal_error_logged", False):
+                    self._creases_seal_error_logged = True
+                    print(f"[Contact] crease settle/export failed: {exc}")
 
     def reward(self):
         reward_list = np.zeros(self.split_origami_num)
@@ -2856,12 +2950,9 @@ class PD_Origami_Simulator(CollisionMixin):
         # for i in range(self.split_origami_num):
         #     self.gui.text(f"Sub-energy: {round(self.split_energy[i], 3)}")
 
+        # Free slider — do not clamp after slider_float (that fights the widget
+        # and snaps folding_angle back toward 0). Density uses i / headless step.
         self.folding_angle = self.gui.slider_float('Folding angle', self.folding_angle, 0, 3.1415)
-        if (
-            self.collision_shading
-            and float(self.folding_angle) >= 3.1415 - 1e-6
-        ):
-            self._stop_sweep_drawing_at_pi()
 
         self.spring_k = self.gui.slider_float('Spring k', self.spring_k, 40., 5000.)
         self.bending_k = self.gui.slider_float('Crease k', self.bending_k, 0.01, 1.)
@@ -2903,34 +2994,44 @@ class PD_Origami_Simulator(CollisionMixin):
 
     def run(self):
         self.initializeRunning()
+        # Apply sampling density after fields exist (folding_micro_step, etc.)
+        if self.collision_shading:
+            self.apply_collision_sampling_config(
+                sample_steps=getattr(self, "collision_sample_steps", 1000),
+                rate_limit=getattr(self, "_collision_rate_limit_fold", True),
+            )
         # GUI: never auto-increment θ — user drives slider / i / k / m / u.
-        # Headless: auto-drive 0→π (export still fires when θ hits π either way).
+        # Headless: auto-drive 0→π; export fires when all creases reach ±π.
+        eps = float(getattr(self, "creases_at_pi_eps", 0.05))
+        max_settle = int(getattr(self, "creases_at_pi_max_settle_steps", 3000))
+        step = float(getattr(self, "_collision_fold_step", math.pi / 1000.0))
         if self.use_gui:
             self.enable_add_folding_angle = 0.0
             if self.collision_shading:
                 print(
                     f"[Contact] collision_shading GUI: fold manually "
-                    f"(i=start, k=stop, u=jump π, slider). "
-                    f"Writes {self._default_trimmed_json_path()} at π"
+                    f"(i=start, k=stop, u=jump π, slider; max dθ/step={step:.6g}). "
+                    f"Exports when all creases |θ/π|≥{1.0 - eps:g} "
+                    f"(timeout {max_settle} steps after drive π) → "
+                    f"{self._default_trimmed_json_path()}"
                 )
         else:
-            try:
-                step = float(self.folding_micro_step[None])
-            except Exception:
-                step = 0.0
-            if step <= 1e-12:
-                step = math.pi / 100.0
-            if self.collision_shading:
-                # Slow headless fold so contact locus stays dense (not as slow as π/2000)
-                # (~π/1000 rad/step ≈ 0.18° → ~1000 steps from 0 to π)
-                step = min(step * 0.1, math.pi / 1000.0)
-                step = max(step, math.pi / 2500.0)  # floor so it still finishes
+            if not self.collision_shading:
+                try:
+                    step = float(self.folding_micro_step[None])
+                except Exception:
+                    step = 0.0
+                if step <= 1e-12:
+                    step = math.pi / 100.0
             self.enable_add_folding_angle = step
             if self.collision_shading:
                 print(
-                    f"[Contact] collision_shading headless: slow auto-fold 0→π "
-                    f"(dθ={step:.6g} rad ≈ {step * 180.0 / math.pi:.3f}°/step); "
-                    f"will write {self._default_trimmed_json_path()} at π"
+                    f"[Contact] collision_shading headless: auto-fold 0→π "
+                    f"(dθ={step:.6g} rad ≈ {step * 180.0 / math.pi:.3f}°/step, "
+                    f"sample_steps={getattr(self, 'collision_sample_steps', 1000)}); "
+                    f"exports when all creases |θ/π|≥{1.0 - eps:g} "
+                    f"(timeout {max_settle} settle steps) → "
+                    f"{self._default_trimmed_json_path()}"
                 )
         while self.window.running:
             self.step()
@@ -2945,10 +3046,12 @@ class PD_Origami_Simulator(CollisionMixin):
         if (
             self.collision_shading
             and not getattr(self, "_trimmed_json_exported", False)
-            and float(getattr(self, "folding_angle", 0.0)) >= 3.1415 - 1e-6
         ):
             try:
-                self.export_trimmed_json(reason="run_exit")
+                if not getattr(self, "_sweep_draw_stopped", False):
+                    self._stop_sweep_drawing_at_pi(reason="run_exit")
+                else:
+                    self.export_trimmed_json(reason="run_exit")
             except Exception as exc:
                 print(f"[Contact] trimmed export @run_exit failed: {exc}")
         if not self.ref_target:

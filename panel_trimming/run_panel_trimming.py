@@ -4,14 +4,18 @@ Collision-shading runner for phys_sim_pd14.
   headless: true  → use_gui=False (run() auto-drives θ 0→π)
   headless: false → use_gui=True  (interactive GUI)
 
-When θ hits π, phys_sim_pd14 auto-writes:
+Exports when all creases full-fold (see phys_sim_pd14 collision_shading):
   panel_trimming/trimmedData/<name>-trimmed.json
   (source descriptionData JSON is left alone; dual-curve shaded_regions appended)
 
+Config (per simulation entry in config.yml):
+  collision_sample_steps: 1000   # higher = slower fold / denser locus (0→π)
+                                 # (auto-fold + i/m only; GUI slider is free)
+
 Usage:
-  python panel-trimming/run_panel_trimming.py
-  python panel-trimming/run_panel_trimming.py --name mountain-thick
-  python panel-trimming/run_panel_trimming.py --name mountain-thick --headless
+  python panel_trimming/run_panel_trimming.py
+  python panel_trimming/run_panel_trimming.py --name mountain-thick
+  python panel_trimming/run_panel_trimming.py --name mountain-thick --headless
 """
 
 from __future__ import annotations
@@ -95,6 +99,11 @@ def run_simulations(
         # (collision-only, ghost-like, green). Default on.
         thick_support_panels = bool(sim.get("thick_support_panels", True))
 
+        # Locus density: one knob — higher sample_steps = slower auto-fold = denser trails.
+        # Contact every frame. Slider is unrestricted; use i or headless for paced sampling.
+        collision_sample_steps = int(sim.get("collision_sample_steps", 1000) or 1000)
+        collision_sample_steps = max(10, collision_sample_steps)
+
         ori = PD_Origami_Simulator(
             origami_name=name,
             use_gui=use_gui,
@@ -111,21 +120,27 @@ def run_simulations(
             thick_side_panels=thick_side_panels,
             thick_support_panels=thick_support_panels,
         )
+        ori.collision_sample_steps = collision_sample_steps
 
         ori.start(
             filepath=name,
             unit_edge_max=sim.get("unit_edge_max", 4),
             thick_mode=bool(thick_mode),
         )
+        ori.apply_collision_sampling_config(sample_steps=collision_sample_steps)
 
-        # headless: auto 0→π → export; GUI: manual fold, export when θ hits π
+        # headless: auto 0→π → export when all creases full-fold;
+        # GUI: manual fold, export when all creases |θ/π|≈1 (not the drive slider)
         mode = "headless auto-fold" if headless else "GUI manual fold"
+        dth = float(getattr(ori, "_collision_fold_step", 0.0) or 0.0)
         print(
             f"[collision-shading] thick_mode={bool(thick_mode)}; "
             f"thick_ghost_spacing_mm={thick_ghost_spacing_mm:g} (ghost); "
             f"thick_side_panels={thick_side_panels}; "
             f"thick_support_panels={thick_support_panels}; "
-            f"{mode}; export panel_trimming/trimmedData/{name}-trimmed.json at π"
+            f"collision_sample_steps={collision_sample_steps} (dθ={dth:.6g} rad); "
+            f"{mode}; export panel_trimming/trimmedData/{name}-trimmed.json "
+            f"when all creases full-fold"
         )
         ori.run()
 

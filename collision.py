@@ -11,7 +11,7 @@ Architecture (collision_shading=True)
    main & ghost & support → AABB + tri-tri
    side                   → OBB  + tri-tri
 3. Sweeping visualization (main, ghost, support, side)  [host]
-4. JSON export helper (dual-curve shaded_regions)              [host]
+4. JSON export when all creases |θ/π|≈1 (dual-curve shaded_regions) [host]
 
 Pure geometry helpers: collision_util.
 """
@@ -61,6 +61,8 @@ class CollisionMixin:
       _build_collision_topology, _maybe_detect_panel_collisions,
       detect_panel_collisions, _render_panel_meshes,
       _stop_sweep_drawing_at_pi, _seal_fixed_flat_contacts,
+      _all_creases_at_pi, _maybe_seal_export_on_full_fold,
+      _update_crease_overshoot_gate,
       export_trimmed_json, build_shaded_regions, get_collision_groups
     """
 
@@ -2954,18 +2956,23 @@ class CollisionMixin:
 
         When the mesh did not advance this frame (paused), skip entirely — same
         contacts, same sample density when it was last running.
+
+        Drive θ at π does **not** stop sampling — seal waits for all creases
+        to reach ±π so the locus can keep growing while the mesh settles.
+
+        If any crease overshoots π (|θ/π| > 1), pause detection and new paint
+        until all creases are back ≤ π (existing locus strokes are kept).
         """
         self._collision_frame_i = int(getattr(self, "_collision_frame_i", 0)) + 1
-        # Drawing sealed at π → no more collision / paint work
-        if getattr(self, "_sweep_draw_stopped", False) or (
-            float(getattr(self, "folding_angle", 0.0)) >= 3.1415 - 1e-6
-            and getattr(self, "_collision_coords_exported", False)
-        ):
+        # Drawing sealed (creases full-fold / timeout) → no more collision / paint
+        if getattr(self, "_sweep_draw_stopped", False):
             return
-        # Hit π but not sealed yet (e.g. headless jumped) → freeze now
-        at_pi = float(getattr(self, "folding_angle", 0.0)) >= 3.1415 - 1e-6
-        if at_pi:
-            self._stop_sweep_drawing_at_pi()
+        # Refresh overshoot gate every frame (even when mesh paused)
+        try:
+            self._update_crease_overshoot_gate()
+        except Exception:
+            pass
+        if getattr(self, "_crease_overshoot_paused", False):
             return
         if (
             not getattr(self, "_mesh_advanced", True)
@@ -2973,9 +2980,10 @@ class CollisionMixin:
         ):
             return
         n = max(1, int(getattr(self, "_collision_every_n", 4)))
-        # While folding: sample every frame so the locus trail is not sparse
+        # While folding (or settling at θ=π): sample every frame so locus is dense
         folding = abs(float(getattr(self, "enable_add_folding_angle", 0.0))) > 1e-12
-        if folding:
+        drive_at_pi = float(getattr(self, "folding_angle", 0.0)) >= 3.1415 - 1e-6
+        if folding or drive_at_pi:
             n = 1
         if (self._collision_frame_i % n) != 0 and self._collision_frame_i > 1:
             return
@@ -3339,8 +3347,11 @@ class CollisionMixin:
         Multiple concurrent segments between the same unit pair are all kept
         (keyed by tri_a/tri_b), matching the GUI red lines.
         """
-        # Drawing frozen at π — never record more samples
+        # Drawing frozen at full-fold seal — never record more samples
         if getattr(self, "_sweep_draw_stopped", False):
+            return
+        # Overshoot π: keep existing trails, do not grow them
+        if getattr(self, "_crease_overshoot_paused", False):
             return
         # Recover from a premature empty seal (exported=True with no fixed data)
         if self._collision_coords_exported:
@@ -3349,8 +3360,8 @@ class CollisionMixin:
             )
             if has_fixed:
                 return
-            # Empty seal — reopen tracking until we have real contacts or hit π
-            if float(getattr(self, "folding_angle", 0.0)) < 3.1415 - 1e-6:
+            # Empty seal — reopen until we have real contacts or creases full-fold
+            if not self._all_creases_at_pi():
                 self._collision_coords_exported = False
             else:
                 return
@@ -3467,21 +3478,325 @@ class CollisionMixin:
             if key in self._collision_fixed_segments:
                 del self._collision_fixed_points[key]
 
-        # Freeze sweeping immediately at π (also handled in update_folding_target;
-        # keep this as a safety net if track runs without that path).
-        if angle >= 3.1415 - 1e-6:
-            self._stop_sweep_drawing_at_pi()
+        # Seal when all measured creases are near ±π (not drive slider θ).
+        self._maybe_seal_export_on_full_fold()
 
-    def _stop_sweep_drawing_at_pi(self):
+    # ------------------------------------------------------------------
+    # Full-fold gate: all creases |θ/π| ≈ 1 (export trigger)
+    # ------------------------------------------------------------------
+
+    def _crease_full_fold_threshold(self, crease_i, eps=None):
         """
-        Immediately freeze locus paint when θ hits π.
+        Minimum |crease_angle[i]| required for crease i to count as full-fold.
 
-        Called from update_folding_target / slider / 'u' so drawing stops on the
-        same step the clamp happens — not delayed until the next collision frame.
+        crease_angle stores signed_theta/π, so 1.0 means ±π. With ref_target,
+        use each crease's target fraction instead of 1.0.
+        """
+        if eps is None:
+            eps = float(getattr(self, "creases_at_pi_eps", 0.05))
+        eps = float(eps)
+        if bool(getattr(self, "ref_target", False)) and hasattr(self, "target_crease_angle"):
+            try:
+                t = abs(float(self.target_crease_angle[crease_i]))
+            except Exception:
+                t = 1.0
+            if t < 1e-9:
+                return 0.0  # not scheduled to fold
+            return max(0.0, t - eps)
+        return max(0.0, 1.0 - eps)
+
+    def _crease_fold_progress(self, eps=None):
+        """
+        Snapshot of measured crease fold progress.
+
+        Returns dict:
+          n, n_ok, min_abs, max_abs, thr_default,
+          lagging (list of (i, abs_val, thr)),
+          overshooting (list of (i, abs_val)),
+          any_overshoot (bool), all_ok (bool; full-fold and no overshoot)
+        """
+        if eps is None:
+            eps = float(getattr(self, "creases_at_pi_eps", 0.05))
+        over_eps = float(getattr(self, "creases_overshoot_eps", 1e-3) or 0.0)
+        over_limit = 1.0 + over_eps
+        n = int(getattr(self, "crease_pairs_num", 0) or 0)
+        lagging = []
+        overshooting = []
+        min_abs = 1.0
+        max_abs = 0.0
+        n_ok = 0
+        if n <= 0 or not hasattr(self, "crease_angle"):
+            return {
+                "n": 0,
+                "n_ok": 0,
+                "min_abs": 0.0,
+                "max_abs": 0.0,
+                "thr_default": max(0.0, 1.0 - float(eps)),
+                "lagging": [],
+                "overshooting": [],
+                "any_overshoot": False,
+                "all_ok": False,
+            }
+        for i in range(n):
+            thr = self._crease_full_fold_threshold(i, eps=eps)
+            try:
+                a = abs(float(self.crease_angle[i]))
+            except Exception:
+                a = 0.0
+            if a < min_abs:
+                min_abs = a
+            if a > max_abs:
+                max_abs = a
+            if a > over_limit:
+                overshooting.append((i, a))
+            if a + 1e-15 >= thr:
+                n_ok += 1
+            else:
+                lagging.append((i, a, thr))
+        any_overshoot = len(overshooting) > 0
+        return {
+            "n": n,
+            "n_ok": n_ok,
+            "min_abs": float(min_abs if n > 0 else 0.0),
+            "max_abs": float(max_abs if n > 0 else 0.0),
+            "thr_default": max(0.0, 1.0 - float(eps)),
+            "lagging": lagging,
+            "overshooting": overshooting,
+            "any_overshoot": any_overshoot,
+            "all_ok": n > 0 and len(lagging) == 0 and not any_overshoot,
+        }
+
+    def _all_creases_at_pi(self, eps=None):
+        """True when every design crease is full-fold and none overshoot π."""
+        return bool(self._crease_fold_progress(eps=eps).get("all_ok"))
+
+    def _clear_live_collision_markers(self):
+        """Drop live red contact markers (locus paint strokes are left alone)."""
+        self._collision_contact_count = 0
+        self._collision_segment_count = 0
+        self._collision_contact_points_list = []
+        self._collision_contact_segments_list = []
+        self._collision_contact_points_flat = []
+        self._collision_contact_segments_flat = []
+        self._stamp_paint_needed = False
+        # Zero draw buffers so last-frame red markers vanish while paused
+        try:
+            if hasattr(self, "collision_contact_points"):
+                self.collision_contact_points.fill(0)
+            if hasattr(self, "collision_contact_lines"):
+                self.collision_contact_lines.fill(0)
+        except Exception:
+            pass
+
+    def _update_crease_overshoot_gate(self):
+        """
+        Pause collision detection + new locus paint while any crease overshoots π.
+
+        crease_angle is signed_theta/π: overshoot when |angle| > 1 + eps.
+        Resume when every crease is back to |angle| ≤ 1 (at or below π).
+        Existing sealed/active locus strokes are kept; only growth is paused.
+        """
+        if not getattr(self, "collision_shading", False):
+            return False
+        if getattr(self, "_sweep_draw_stopped", False):
+            # Final seal already won — leave overshoot flag clear for cleanliness
+            self._crease_overshoot_paused = False
+            return False
+        if not hasattr(self, "crease_angle"):
+            return False
+
+        over_eps = float(getattr(self, "creases_overshoot_eps", 1e-3) or 0.0)
+        over_limit = 1.0 + over_eps
+        n = int(getattr(self, "crease_pairs_num", 0) or 0)
+        offenders = []
+        max_abs = 0.0
+        for i in range(n):
+            try:
+                a = abs(float(self.crease_angle[i]))
+            except Exception:
+                a = 0.0
+            if a > max_abs:
+                max_abs = a
+            if a > over_limit:
+                offenders.append((i, a))
+
+        was_paused = bool(getattr(self, "_crease_overshoot_paused", False))
+        if offenders:
+            if not was_paused:
+                sample = offenders[:6]
+                bits = ", ".join(f"c{i}={a:.4f}" for i, a in sample)
+                more = f" (+{len(offenders) - 6} more)" if len(offenders) > 6 else ""
+                print(
+                    f"[Contact] crease overshoot π: pause collision/paint growth "
+                    f"(max|θ/π|={max_abs:.4f} > {over_limit:g}); "
+                    f"offenders [{bits}{more}]. Existing locus kept."
+                )
+                self._clear_live_collision_markers()
+            self._crease_overshoot_paused = True
+            return True
+
+        # No overshoot: resume if we were paused (back at or below π)
+        if was_paused:
+            print(
+                f"[Contact] creases back ≤π (max|θ/π|={max_abs:.4f}) "
+                f"→ resume collision detection + paint growth"
+            )
+            self._crease_overshoot_paused = False
+            return False
+
+        self._crease_overshoot_paused = False
+        return False
+
+    def _tick_crease_settle_and_maybe_export(self):
+        """
+        After each mesh-advanced step: track settle time at drive θ=π, then
+        seal/export when all creases full-fold (or settle timeout).
+        """
+        if not getattr(self, "collision_shading", False):
+            return False
+        if getattr(self, "_sweep_draw_stopped", False) and getattr(
+            self, "_trimmed_json_exported", False
+        ):
+            return True
+        # Update overshoot pause/resume before settle/export decisions
+        try:
+            self._update_crease_overshoot_gate()
+        except Exception:
+            pass
+        at_drive_pi = float(getattr(self, "folding_angle", 0.0)) >= 3.1415 - 1e-6
+        if at_drive_pi:
+            if not getattr(self, "_drive_theta_at_pi", False):
+                self._drive_theta_at_pi = True
+                self._creases_settle_steps = 0
+                prog = self._crease_fold_progress()
+                print(
+                    f"[Contact] drive θ=π; waiting for all creases full-fold "
+                    f"(|θ/π|≥{prog['thr_default']:g}): "
+                    f"{prog['n_ok']}/{prog['n']} ok, min|θ/π|={prog['min_abs']:.4f}"
+                )
+            # Do not count settle while overshoot-paused (wait for recovery)
+            if (
+                getattr(self, "_mesh_advanced", False)
+                and not getattr(self, "_crease_overshoot_paused", False)
+            ):
+                self._creases_settle_steps = int(
+                    getattr(self, "_creases_settle_steps", 0)
+                ) + 1
+        return self._maybe_seal_export_on_full_fold()
+
+    def _maybe_seal_export_on_full_fold(self, force=False):
+        """
+        Seal locus + write trimmed JSON when all creases reach ±π.
+
+        Unlike the old drive-slider gate, this uses measured ``crease_angle``
+        (signed_theta/π). Falls back to a settle timeout after drive θ hits π
+        so thick models that never quite hit 1.0 still finish headless runs.
+
+        Export is blocked while any crease overshoots π (unless force=True).
+
+        :param force: if True, seal/export immediately (run exit safety net)
+        :return: True if sealed/exported (or already done)
+        """
+        if not getattr(self, "collision_shading", False):
+            return False
+        if getattr(self, "_sweep_draw_stopped", False) and getattr(
+            self, "_trimmed_json_exported", False
+        ):
+            return True
+
+        # Keep gate fresh (in case called without tick)
+        try:
+            self._update_crease_overshoot_gate()
+        except Exception:
+            pass
+
+        prog = self._crease_fold_progress()
+        reason = None
+        if force:
+            reason = "run_exit"
+        elif getattr(self, "_crease_overshoot_paused", False) or prog.get(
+            "any_overshoot"
+        ):
+            # Wait until creases return ≤π before accepting full-fold export
+            return False
+        elif prog["all_ok"]:
+            reason = "creases_at_pi"
+        else:
+            at_drive_pi = float(getattr(self, "folding_angle", 0.0)) >= 3.1415 - 1e-6
+            max_settle = int(getattr(self, "creases_at_pi_max_settle_steps", 3000) or 0)
+            settle = int(getattr(self, "_creases_settle_steps", 0) or 0)
+            if at_drive_pi and max_settle > 0 and settle >= max_settle:
+                reason = "creases_timeout"
+            else:
+                # Periodic progress while waiting after drive π
+                if (
+                    at_drive_pi
+                    and settle > 0
+                    and settle % 500 == 0
+                    and not getattr(self, "_sweep_draw_stopped", False)
+                ):
+                    n_lag = len(prog["lagging"])
+                    sample = prog["lagging"][:5]
+                    bits = ", ".join(
+                        f"c{i}={a:.3f}<{ thr:.3f}" for i, a, thr in sample
+                    )
+                    more = f" (+{n_lag - 5} more)" if n_lag > 5 else ""
+                    print(
+                        f"[Contact] settle {settle}/{max_settle}: "
+                        f"{prog['n_ok']}/{prog['n']} creases full-fold, "
+                        f"min|θ/π|={prog['min_abs']:.4f}"
+                        + (f"; lagging [{bits}{more}]" if sample else "")
+                    )
+                return False
+
+        if reason == "creases_at_pi" and not getattr(
+            self, "_creases_at_pi_status_logged", False
+        ):
+            self._creases_at_pi_status_logged = True
+            print(
+                f"[Contact] all {prog['n']} creases full-fold "
+                f"(min|θ/π|={prog['min_abs']:.4f} ≥ {prog['thr_default']:g}) "
+                f"→ seal + export"
+            )
+        elif reason == "creases_timeout":
+            n_lag = len(prog["lagging"])
+            sample = prog["lagging"][:8]
+            bits = ", ".join(f"c{i}={a:.3f}<{thr:.3f}" for i, a, thr in sample)
+            more = f" (+{n_lag - 8} more)" if n_lag > 8 else ""
+            print(
+                f"[Contact] settle timeout after "
+                f"{int(getattr(self, '_creases_settle_steps', 0))} steps at drive π: "
+                f"{prog['n_ok']}/{prog['n']} creases full-fold, "
+                f"min|θ/π|={prog['min_abs']:.4f}"
+                + (f"; still lagging [{bits}{more}]" if sample else "")
+                + " → force seal + export"
+            )
+        elif reason == "run_exit":
+            print(
+                f"[Contact] run exit with creases {prog['n_ok']}/{prog['n']} "
+                f"full-fold (min|θ/π|={prog['min_abs']:.4f}) → seal + export"
+            )
+
+        self._stop_sweep_drawing_at_pi(reason=reason)
+        return True
+
+    def _stop_sweep_drawing_at_pi(self, reason=None):
+        """
+        Freeze locus paint and write trimmed JSON.
+
+        Primary trigger is all creases near ±π (``reason=creases_at_pi``), not
+        the drive slider. Also used for settle timeout / run-exit force export.
         """
         if getattr(self, "_sweep_draw_stopped", False):
+            # Already frozen — still try one-shot file write if needed
+            if not getattr(self, "_trimmed_json_exported", False):
+                try:
+                    self.export_trimmed_json(reason=reason or "creases_at_pi")
+                except Exception as exc:
+                    print(f"[Contact] trimmed JSON export failed: {exc}")
             return
         self._sweep_draw_stopped = True
+        seal_reason = reason or "creases_at_pi"
         # No further canvas stamps or trail growth / reproject
         self._paint_dirty = False
         self._stamp_paint_needed = False
@@ -3503,21 +3818,21 @@ class CollisionMixin:
                         except Exception:
                             pass
             try:
-                self._seal_fixed_flat_contacts(reason="fold_pi")
+                self._seal_fixed_flat_contacts(reason=seal_reason)
             except Exception as exc:
                 if getattr(self, "verbose", False):
-                    print(f"[Contact] seal@π failed: {exc}")
+                    print(f"[Contact] seal@{seal_reason} failed: {exc}")
                 self._collision_coords_exported = True
-        # Always write panel_trimming/trimmedData/<name>-trimmed.json once θ hits π
+        # Write panel_trimming/trimmedData/<name>-trimmed.json once
         try:
-            self.export_trimmed_json(reason="fold_pi")
+            self.export_trimmed_json(reason=seal_reason)
         except Exception as exc:
-            print(f"[Contact] trimmed JSON export @π failed: {exc}")
+            print(f"[Contact] trimmed JSON export @{seal_reason} failed: {exc}")
 
     def _seal_fixed_flat_contacts(self, reason="fold_complete"):
         """Move remaining actives into fixed and stop further trail growth.
 
-        reason: fixed_reason tag for still-live contacts (e.g. fold_pi).
+        reason: fixed_reason tag for still-live contacts (e.g. creases_at_pi).
         No export / deep-copy — entries kept by reference.
         """
         if self._collision_coords_exported:
@@ -3525,6 +3840,14 @@ class CollisionMixin:
                 return
             self._collision_coords_exported = False
         seal_reason = reason or "fold_complete"
+        # Treat full-fold style seals the same for force-capture of live hits
+        full_fold_seals = (
+            "fold_pi",
+            "creases_at_pi",
+            "creases_timeout",
+            "run_exit",
+            "fold_complete",
+        )
         for key, ent in list(self._collision_active_segments.items()):
             existing = self._collision_fixed_segments.get(key)
             if existing and existing.get("coords_locked"):
@@ -3550,7 +3873,7 @@ class CollisionMixin:
                 del self._collision_fixed_points[key]
 
         if (
-            seal_reason == "fold_pi"
+            seal_reason in full_fold_seals
             and not self._collision_fixed_segments
             and getattr(self, "_collision_contact_segments_flat", None)
         ):
@@ -3562,14 +3885,14 @@ class CollisionMixin:
                 if key in self._collision_fixed_segments:
                     continue
                 s["coords_locked"] = True
-                s["fixed_reason"] = "fold_pi"
+                s["fixed_reason"] = seal_reason
                 self._collision_fixed_segments[key] = s
 
         # Mark sealed so paint / tracking stop; pack lean shaded payload for JSON
         if (
             self._collision_fixed_segments
             or self._collision_fixed_points
-            or seal_reason == "fold_pi"
+            or seal_reason in full_fold_seals
         ):
             self._collision_coords_exported = True
             try:
@@ -3650,6 +3973,9 @@ class CollisionMixin:
         if getattr(self, "_sweep_draw_stopped", False) or getattr(
             self, "_collision_coords_exported", False
         ):
+            return
+        # Overshoot π: freeze paint growth (keep already-stamped strokes)
+        if getattr(self, "_crease_overshoot_paused", False):
             return
         if not hasattr(self, "_paint_by_unit") or self._paint_by_unit is None:
             self._paint_by_unit = {}
@@ -4061,12 +4387,13 @@ class CollisionMixin:
         root = os.path.dirname(os.path.abspath(__file__))
         return os.path.join(root, "panel_trimming", "trimmedData", f"{stem}.json")
 
-    def export_trimmed_json(self, path=None, reason="fold_pi", force=False):
+    def export_trimmed_json(self, path=None, reason="creases_at_pi", force=False):
         """
         Write design JSON + dual-curve shaded_regions to
         panel_trimming/trimmedData/*-trimmed.json.
 
-        Called automatically when θ hits π (collision_shading). Source design
+        Called automatically when all measured creases reach ±π
+        (collision_shading), or on settle timeout / run exit. Source design
         ``descriptionData/<name>.json`` is left unchanged.
         """
         if not getattr(self, "collision_shading", False):
@@ -4095,12 +4422,25 @@ class CollisionMixin:
         except Exception:
             pass
 
+        prog = {}
+        try:
+            prog = self._crease_fold_progress()
+        except Exception:
+            prog = {}
         self.input_json["export_meta"] = {
             "source": str(getattr(self, "origami_name", "")),
-            "reason": str(reason or "fold_pi"),
+            "reason": str(reason or "creases_at_pi"),
             "folding_angle": float(getattr(self, "folding_angle", 0.0)),
             "schema": "dual_curve_v1",
             "n_shaded_regions": len(self.input_json.get("shaded_regions") or []),
+            "export_gate": "all_creases_at_pi",
+            "creases_at_pi_eps": float(getattr(self, "creases_at_pi_eps", 0.05)),
+            "n_creases": int(prog.get("n", 0) or 0),
+            "n_creases_full_fold": int(prog.get("n_ok", 0) or 0),
+            "min_abs_crease_angle": float(prog.get("min_abs", 0.0) or 0.0),
+            "creases_settle_steps": int(
+                getattr(self, "_creases_settle_steps", 0) or 0
+            ),
         }
 
         out_path = path or self._default_trimmed_json_path()
@@ -4114,8 +4454,9 @@ class CollisionMixin:
         self._trimmed_json_path = out_path
         n_sh = len(self.input_json.get("shaded_regions") or [])
         print(
-            f"[Contact] auto-exported trimmed JSON @π "
-            f"(shaded_regions={n_sh}) → {out_path}"
+            f"[Contact] auto-exported trimmed JSON @{reason or 'creases_at_pi'} "
+            f"(shaded_regions={n_sh}, creases={prog.get('n_ok', '?')}/{prog.get('n', '?')}) "
+            f"→ {out_path}"
         )
         return out_path
 

@@ -22,22 +22,22 @@ Writes under panel_trimming/trimmedData/stl-<stem>/:
   original.stl
   collision.stl
   support-collision.stl
-  final.stl            (panels + 0.2 mm crease connectors)
+  final.stl            (panels + crease connectors)
   support.stl
   hinges.stl / hinges-mountain.stl / hinges-valley.stl
 
-Crease connectors (living hinges):
-  mountain → 0.2 mm film on BOTTOM of crease height H
-  valley   → 0.2 mm film on TOP of crease height H
-  strip bridges crease.gap so both panels stay connected
+Crease connectors (living hinges) — YAML knobs (config.yml):
+  crease_gap        — mm each mountain/valley side pulls in (open gap ≈ 2×)
+  crease_thickness  — living-hinge film thickness (mm)
+  strip width ≈ 2·crease_gap
+  mountain → film on BOTTOM of crease height H
+  valley   → film on TOP of crease height H
   border / side-wall creases skipped
 
 Usage:
   python panel_trimming/json_to_stl/run.py
   python panel_trimming/json_to_stl/run.py --name miura-thick-trimmed
-  python panel_trimming/json_to_stl/run.py --config panel_trimming/json_to_stl/config.yml
-  python panel_trimming/json_to_stl/run.py --crease-shrink 1
-  python panel_trimming/json_to_stl/run.py --hinge-thickness 0.2
+  python panel_trimming/json_to_stl/run.py --crease-shrink 0.3 --hinge-thickness 0.2
 """
 
 from __future__ import annotations
@@ -89,10 +89,11 @@ DEFAULT_CONFIG_EXAMPLE = os.path.join(_THIS_DIR, "config.example.yml")
 
 DEFAULT_THICKNESS = 6.0
 # Inward shrink (mm) on each panel edge that is a mountain/valley crease.
+# Config: crease_gap (aliases: crease.gap, hinges.crease_gap)
 DEFAULT_CREASE_SIDE_SHRINK = 1.0
-# Thin reserved film connecting both panels across the crease gap.
+# Thin reserved film thickness (mm) connecting both panels across the gap.
+# Config: crease_thickness (aliases: hinges.crease_thickness, hinges.thickness)
 DEFAULT_HINGE_THICKNESS_MM = 0.2
-DEFAULT_HINGE_EMBED_MM = 0.3
 DEFAULT_HINGE_END_INSET_MM = 1.0
 DEFAULT_HINGE_ENABLED = True
 VERTEX_EPS = 1e-9
@@ -102,6 +103,95 @@ DEFAULT_CUT_OVERSHOOT_MM = 0.35
 # Drop residual pieces thinner / smaller than this after the boolean (mm / mm²).
 DEFAULT_MIN_RESIDUAL_WIDTH_MM = 0.4
 DEFAULT_MIN_RESIDUAL_AREA = 1.0
+
+
+def _first_present(*candidates: Any) -> Any:
+    """Return the first non-None candidate."""
+    for value in candidates:
+        if value is not None:
+            return value
+    return None
+
+
+def _resolve_crease_gap(
+    cfg: dict,
+    *,
+    stl_cfg: Optional[dict] = None,
+    hinge_cfg: Optional[dict] = None,
+    crease_cfg: Optional[dict] = None,
+    default: float = DEFAULT_CREASE_SIDE_SHRINK,
+) -> float:
+    """Read crease_gap from top-level / nested YAML (mm each side pulls in)."""
+    stl_cfg = stl_cfg or {}
+    hinge_cfg = hinge_cfg or {}
+    crease_cfg = crease_cfg or {}
+    raw = _first_present(
+        cfg.get("crease_gap"),
+        stl_cfg.get("crease_gap"),
+        hinge_cfg.get("crease_gap"),
+        hinge_cfg.get("gap"),
+        crease_cfg.get("gap"),
+        crease_cfg.get("crease_gap"),
+        cfg.get("crease_side_shrink"),
+        cfg.get("crease_shrink"),
+        stl_cfg.get("crease_side_shrink"),
+        stl_cfg.get("crease_shrink"),
+    )
+    if raw is None:
+        return float(default)
+    return float(raw)
+
+
+def _resolve_crease_thickness(
+    cfg: dict,
+    *,
+    stl_cfg: Optional[dict] = None,
+    hinge_cfg: Optional[dict] = None,
+    crease_cfg: Optional[dict] = None,
+    default: float = DEFAULT_HINGE_THICKNESS_MM,
+) -> float:
+    """Read crease_thickness (hinge film thickness mm) from YAML."""
+    stl_cfg = stl_cfg or {}
+    hinge_cfg = hinge_cfg or {}
+    crease_cfg = crease_cfg or {}
+    raw = _first_present(
+        cfg.get("crease_thickness"),
+        stl_cfg.get("crease_thickness"),
+        hinge_cfg.get("crease_thickness"),
+        hinge_cfg.get("thickness"),
+        hinge_cfg.get("film_thickness"),
+        crease_cfg.get("thickness"),
+        crease_cfg.get("crease_thickness"),
+        cfg.get("hinge_thickness"),
+        stl_cfg.get("hinge_thickness"),
+    )
+    if raw is None:
+        return float(default)
+    return float(raw)
+
+
+def _resolve_hinge_end_inset(
+    cfg: dict,
+    *,
+    stl_cfg: Optional[dict] = None,
+    hinge_cfg: Optional[dict] = None,
+    crease_cfg: Optional[dict] = None,
+    default: float = DEFAULT_HINGE_END_INSET_MM,
+) -> float:
+    """Read optional hinge end inset (mm) from YAML."""
+    stl_cfg = stl_cfg or {}
+    hinge_cfg = hinge_cfg or {}
+    crease_cfg = crease_cfg or {}
+    raw = _first_present(
+        cfg.get("hinge_end_inset"),
+        cfg.get("end_inset"),
+        stl_cfg.get("hinge_end_inset"),
+        hinge_cfg.get("end_inset"),
+        crease_cfg.get("end_inset"),
+    )
+    if raw is None:
+        return float(default)
+    return float(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +413,13 @@ def _panel_z_span(
     *,
     default_thickness: float = DEFAULT_THICKNESS,
 ) -> Tuple[float, float]:
-    """Stock Z from panel thickness offsets (same idea as visualize_3d stack)."""
+    """
+    Stock Z from panel thickness offsets (same idea as visualize_3d stack).
+
+    - ≥2 offsets → [min, max]
+    - 1 offset  → [mid − T/2, mid + T/2] where T = default_thickness
+    - 0 offsets → [−T/2, +T/2]
+    """
     offs = [float(h) for h in (offsets or [])]
     if len(offs) >= 2:
         return float(min(offs)), float(max(offs))
@@ -564,24 +660,22 @@ def collect_crease_hinges(
     data: dict,
     *,
     hinge_thickness: float = DEFAULT_HINGE_THICKNESS_MM,
-    embed: float = DEFAULT_HINGE_EMBED_MM,
     end_inset: float = DEFAULT_HINGE_END_INSET_MM,
     crease_gap: float = 0.0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     One thin connecting film per mountain/valley crease.
 
-    Strip width = 2·crease_gap + 2·embed so the film bridges the gap left by
-    panel side-shrink and slightly overlaps both panels.
+    Strip width ≈ 2·crease_gap so the film bridges the open gap left when both
+    panels pull in by crease_gap (no separate embed).
     """
     units = list(data.get("units") or [])
     lines = list(data.get("lines") or [])
     feats = list(data.get("line_features") or [])
 
     gap = max(float(crease_gap), 0.0)
-    emb = max(float(embed), 0.0)
-    # Both panels pull in by ``gap`` → open gap ≈ 2·gap; plus embed into each.
-    width = max(2.0 * gap + 2.0 * emb, 2.0 * emb, 0.4)
+    # Both panels pull in by ``gap`` → open gap ≈ 2·gap; strip bridges it.
+    width = max(2.0 * gap, 0.4)
     t_film = max(float(hinge_thickness), 1e-4)
     inset = max(float(end_inset), 0.0)
 
@@ -646,7 +740,6 @@ def collect_crease_hinges(
             "z_hi": float(z_hi),
             "thickness_mm": float(t_film),
             "width_mm": float(width),
-            "embed_mm": float(emb),
             "end_inset_mm": float(inset),
             "ring": ring,
             "area": area,
@@ -664,12 +757,12 @@ def collect_crease_hinges(
         "n_skip_geom": int(n_skip_geom),
         "hinge_thickness_mm": float(t_film),
         "hinge_width_mm": float(width),
-        "embed_mm": float(emb),
         "end_inset_mm": float(inset),
         "crease_gap_mm": float(gap),
         "rule": (
             "reserve thin film connecting both panels; "
-            "mountain=bottom of H, valley=top of H"
+            "mountain=bottom of H, valley=top of H; "
+            "width ≈ 2·crease_gap"
         ),
     }
     return hinges, info
@@ -2364,7 +2457,6 @@ def export_stl(
     crease_side_shrink: float = DEFAULT_CREASE_SIDE_SHRINK,
     export_hinges: bool = DEFAULT_HINGE_ENABLED,
     hinge_thickness: float = DEFAULT_HINGE_THICKNESS_MM,
-    hinge_embed: float = DEFAULT_HINGE_EMBED_MM,
     hinge_end_inset: float = DEFAULT_HINGE_END_INSET_MM,
     source_path: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -2424,13 +2516,12 @@ def export_stl(
         report[f"n_verts_{role}"] = int(len(V))
         report[f"n_faces_{role}"] = int(len(F))
 
-    # Thin 0.2 mm crease connectors: mountain=bottom of H, valley=top of H.
-    # Strip bridges crease.gap so both panels stay physically connected.
+    # Crease connectors: mountain=bottom of H, valley=top of H.
+    # Strip width ≈ 2·crease_gap so both panels stay physically connected.
     if bool(export_hinges):
         hinges, hinfo = collect_crease_hinges(
             data,
             hinge_thickness=hinge_thickness,
-            embed=hinge_embed,
             end_inset=hinge_end_inset,
             crease_gap=crease_side_shrink,
         )
@@ -2498,9 +2589,9 @@ def export_file(input_path: str, output_path: str, **kwargs: Any) -> Dict[str, A
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Write STLs per design into trimmedData/stl-<stem>/: "
-            "original, collision, support-collision, final (panels + "
-            "0.2 mm crease connectors), support, hinges."
+            "Write STLs per design into trimmedData/stl-<stem>/. "
+            "Fabrication knobs: crease_gap (mm each crease side pulls in) "
+            "and crease_thickness (living-hinge film thickness mm)."
         )
     )
     parser.add_argument("path", nargs="?", default=None, help="Input JSON path")
@@ -2532,15 +2623,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--default-thickness",
         type=float,
         default=None,
-        help=f"Thickness when a panel has a single offset (default {DEFAULT_THICKNESS:g})",
+        help=(
+            "Full stock thickness (mm) when a panel has a single thickness "
+            f"offset: span is [mid−T/2, mid+T/2] (default {DEFAULT_THICKNESS:g}). "
+            "Ignored when a panel has two or more offsets."
+        ),
     )
     parser.add_argument(
         "--crease-shrink",
+        "--crease-gap",
+        dest="crease_gap",
         type=float,
         default=None,
         help=(
-            "Inward shrink (mm) on each panel side that is a mountain/valley "
-            f"crease (default {DEFAULT_CREASE_SIDE_SHRINK:g}; config crease.gap)"
+            "Inward shrink (mm) on each mountain/valley side "
+            f"(default {DEFAULT_CREASE_SIDE_SHRINK:g}; config crease_gap)"
         ),
     )
     parser.add_argument(
@@ -2550,20 +2647,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument(
         "--hinge-thickness",
+        "--crease-thickness",
+        dest="crease_thickness",
         type=float,
         default=None,
         help=(
-            "Reserved film thickness mm connecting both panels "
-            f"(default {DEFAULT_HINGE_THICKNESS_MM:g}; mountain=bottom, valley=top)"
-        ),
-    )
-    parser.add_argument(
-        "--hinge-embed",
-        type=float,
-        default=None,
-        help=(
-            "How far the strip bites into each panel beyond the crease gap "
-            f"(default {DEFAULT_HINGE_EMBED_MM:g} mm)"
+            "Living-hinge film thickness mm connecting both panels "
+            f"(default {DEFAULT_HINGE_THICKNESS_MM:g}; config crease_thickness; "
+            "mountain=bottom, valley=top)"
         ),
     )
     parser.add_argument(
@@ -2595,8 +2686,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[stl] config {cfg_path}")
 
     stl_cfg = dict(cfg.get("stl") or {})
-    crease_cfg = dict(cfg.get("crease") or stl_cfg.get("crease") or {})
+    # Fabrication knobs from YAML: crease_gap + crease_thickness (and optional end_inset).
     hinge_cfg = dict(cfg.get("hinges") or stl_cfg.get("hinges") or {})
+    crease_cfg = dict(cfg.get("crease") or stl_cfg.get("crease") or {})
     defaults = {
         "thickness": stl_cfg.get("thickness", cfg.get("thickness")),
         "default_thickness": float(
@@ -2605,38 +2697,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                 cfg.get("default_thickness", DEFAULT_THICKNESS),
             )
         ),
-        "crease_side_shrink": float(
-            crease_cfg.get(
-                "gap",
-                cfg.get(
-                    "crease_side_shrink",
-                    cfg.get("crease_shrink", DEFAULT_CREASE_SIDE_SHRINK),
-                ),
-            )
+        "crease_side_shrink": _resolve_crease_gap(
+            cfg, stl_cfg=stl_cfg, hinge_cfg=hinge_cfg, crease_cfg=crease_cfg
         ),
         "export_hinges": bool(
             hinge_cfg.get("enabled", cfg.get("export_hinges", DEFAULT_HINGE_ENABLED))
         ),
-        "hinge_thickness": float(
-            hinge_cfg.get("thickness", DEFAULT_HINGE_THICKNESS_MM)
+        "hinge_thickness": _resolve_crease_thickness(
+            cfg, stl_cfg=stl_cfg, hinge_cfg=hinge_cfg, crease_cfg=crease_cfg
         ),
-        "hinge_embed": float(hinge_cfg.get("embed", DEFAULT_HINGE_EMBED_MM)),
-        "hinge_end_inset": float(
-            hinge_cfg.get("end_inset", DEFAULT_HINGE_END_INSET_MM)
+        "hinge_end_inset": _resolve_hinge_end_inset(
+            cfg, stl_cfg=stl_cfg, hinge_cfg=hinge_cfg, crease_cfg=crease_cfg
         ),
     }
     if args.thickness is not None:
         defaults["thickness"] = float(args.thickness)
     if args.default_thickness is not None:
         defaults["default_thickness"] = float(args.default_thickness)
-    if args.crease_shrink is not None:
-        defaults["crease_side_shrink"] = float(args.crease_shrink)
+    if args.crease_gap is not None:
+        defaults["crease_side_shrink"] = float(args.crease_gap)
     if args.no_hinges:
         defaults["export_hinges"] = False
-    if args.hinge_thickness is not None:
-        defaults["hinge_thickness"] = float(args.hinge_thickness)
-    if args.hinge_embed is not None:
-        defaults["hinge_embed"] = float(args.hinge_embed)
+    if args.crease_thickness is not None:
+        defaults["hinge_thickness"] = float(args.crease_thickness)
     if args.hinge_end_inset is not None:
         defaults["hinge_end_inset"] = float(args.hinge_end_inset)
 
@@ -2688,26 +2771,43 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "crease_side_shrink",
                     "export_hinges",
                     "hinge_thickness",
-                    "hinge_embed",
                     "hinge_end_inset",
                 ):
                     if k in job and job[k] is not None:
                         settings[k] = job[k]
-                if job.get("crease_shrink") is not None and "crease_side_shrink" not in job:
-                    settings["crease_side_shrink"] = job["crease_shrink"]
-                job_crease = job.get("crease")
-                if isinstance(job_crease, dict) and job_crease.get("gap") is not None:
-                    settings["crease_side_shrink"] = job_crease["gap"]
-                job_hinges = job.get("hinges")
-                if isinstance(job_hinges, dict):
-                    if job_hinges.get("enabled") is not None:
-                        settings["export_hinges"] = bool(job_hinges["enabled"])
-                    if job_hinges.get("thickness") is not None:
+                if job.get("crease_gap") is not None:
+                    settings["crease_side_shrink"] = float(job["crease_gap"])
+                elif job.get("crease_shrink") is not None:
+                    settings["crease_side_shrink"] = float(job["crease_shrink"])
+                # Per-job film thickness (preferred name + aliases)
+                if job.get("crease_thickness") is not None:
+                    settings["hinge_thickness"] = float(job["crease_thickness"])
+                elif job.get("hinge_thickness") is not None:
+                    settings["hinge_thickness"] = float(job["hinge_thickness"])
+                job_hinges = job.get("hinges") if isinstance(job.get("hinges"), dict) else None
+                if job_hinges:
+                    if job_hinges.get("crease_thickness") is not None:
+                        settings["hinge_thickness"] = float(
+                            job_hinges["crease_thickness"]
+                        )
+                    elif job_hinges.get("thickness") is not None:
                         settings["hinge_thickness"] = float(job_hinges["thickness"])
-                    if job_hinges.get("embed") is not None:
-                        settings["hinge_embed"] = float(job_hinges["embed"])
                     if job_hinges.get("end_inset") is not None:
                         settings["hinge_end_inset"] = float(job_hinges["end_inset"])
+                    if job_hinges.get("enabled") is not None:
+                        settings["export_hinges"] = bool(job_hinges["enabled"])
+                job_crease = job.get("crease") if isinstance(job.get("crease"), dict) else None
+                if job_crease:
+                    if job_crease.get("gap") is not None:
+                        settings["crease_side_shrink"] = float(job_crease["gap"])
+                    if job_crease.get("crease_gap") is not None:
+                        settings["crease_side_shrink"] = float(job_crease["crease_gap"])
+                    if job_crease.get("thickness") is not None:
+                        settings["hinge_thickness"] = float(job_crease["thickness"])
+                    if job_crease.get("crease_thickness") is not None:
+                        settings["hinge_thickness"] = float(
+                            job_crease["crease_thickness"]
+                        )
                 try:
                     in_path = _resolve_input(str(job["name"]))
                 except FileNotFoundError as exc:
@@ -2763,9 +2863,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ),
                 hinge_thickness=float(
                     settings.get("hinge_thickness", DEFAULT_HINGE_THICKNESS_MM)
-                ),
-                hinge_embed=float(
-                    settings.get("hinge_embed", DEFAULT_HINGE_EMBED_MM)
                 ),
                 hinge_end_inset=float(
                     settings.get("hinge_end_inset", DEFAULT_HINGE_END_INSET_MM)

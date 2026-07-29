@@ -2,46 +2,34 @@
 #
 #   python panel_trimming/json_to_stl/run.py
 #   python panel_trimming/json_to_stl/run.py --name miura-thick-trimmed
+#   python panel_trimming/json_to_stl/run.py --crease-gap 0.3 --crease-thickness 0.2
 #
-# Pipeline (matches visualize_3d):
-#   1) panel outline from units[]
-#   2) stock Z from thickness offsets (non-border crease heights + shade layer_h)
-#   3) collision polys from resolve_shaded_associations (fabric/dual-curve)
-#   4) extrusions (order):
-#        original            = full physical panel stock
-#        support             = full solid at missing global heights
-#        collision           = main phys+ghost solid prism (largest ghost layer)
-#        support-collision   = support solid prism (largest support layer)
-#        final               = original + support − both collisions
-#                              + crease connectors (optional)
+# Fabrication knobs (both configurable):
+#   crease_gap        — mm each mountain/valley side pulls in (open gap ≈ 2×)
+#   crease_thickness  — living-hinge film thickness (mm)
+#                       mountain → bottom of crease height H
+#                       valley   → top of H
+#   strip width ≈ 2·crease_gap (bridges the open gap)
 #
-# Outputs (all STLs in one folder per design):
-#   panel_trimming/trimmedData/stl-<stem>/
-#     original.stl
-#     collision.stl
-#     support-collision.stl
-#     final.stl              (panels ∪ connectors)
-#     support.stl
-#     hinges.stl / hinges-mountain.stl / hinges-valley.stl
+# Optional:
+#   default_thickness — stock thickness when a panel has a single offset
+#   hinge_end_inset   — inset connector ends from crease endpoints (mm)
+#   export_hinges     — false to skip hinge STLs
+#
+# Outputs → panel_trimming/trimmedData/stl-<stem>/
+#   original.stl, collision.stl, support-collision.stl,
+#   final.stl, support.stl, hinges.stl (+ mountain/valley)
 
-default_thickness: 6            # when panel has a single thickness offset
-# thickness: 6                  # force uniform thickness (optional)
+crease_gap: 0.3
+crease_thickness: 0.2
 
-# Inset each panel edge that is a mountain/valley crease (mm).
-# Border edges are not moved. Applied last on final.
-crease:
-  gap: 1
-
-# Thin reserved film connecting both panels across the crease gap.
-# mountain → bottom of crease height H; valley → top of H.
-# Strip width = 2·crease.gap + 2·embed so both stocks stay joined.
-hinges:
-  enabled: true
-  thickness: 0.2    # film thickness (mm)
-  embed: 0.3        # bite into each panel beyond the gap (mm)
-  end_inset: 1.0    # inset ends from crease endpoints (mm)
+# default_thickness: 6
+# hinge_end_inset: 1.0
+# export_hinges: true
 
 jobs:
   - name: miura-thick-trimmed
-  # - name: miura-thick-cleaned
-  # - name: mountain-thick-trimmed
+  # Per-job overrides (optional):
+  # - name: mountain-thick-cleaned
+  #   crease_gap: 0.5
+  #   crease_thickness: 0.25
