@@ -17,6 +17,41 @@ if use_gpu:
 else:
     ti.init(arch=ti.cpu, default_fp=data_type, fast_math=False, advanced_optimization=False, cpu_max_num_threads=1) #, kernel_profiler=False, verbose=True, debug=True, gdb_trigger=True)
 
+# Eager init above; track state so optimization can ti.reset() and re-init safely.
+_taichi_initialized = True
+
+
+def ensure_taichi_init(force_cpu: bool = False):
+    """Initialize Taichi if needed (used by optimization framework after ti.reset())."""
+    global _taichi_initialized
+    if _taichi_initialized:
+        return
+    if use_gpu and not force_cpu:
+        ti.init(
+            arch=ti.gpu,
+            default_fp=data_type,
+            fast_math=False,
+            advanced_optimization=False,
+            kernel_profiler=True,
+        )
+    else:
+        ti.init(
+            arch=ti.cpu,
+            default_fp=data_type,
+            fast_math=False,
+            advanced_optimization=False,
+            cpu_max_num_threads=1,
+            kernel_profiler=False,
+            verbose=False,
+        )
+    _taichi_initialized = True
+
+
+def mark_taichi_reset():
+    """Call after ti.reset() so the next ensure_taichi_init re-initializes Taichi."""
+    global _taichi_initialized
+    _taichi_initialized = False
+
 
 @ti.data_oriented
 class PD_Origami_Simulator(CollisionMixin):
@@ -609,9 +644,21 @@ class PD_Origami_Simulator(CollisionMixin):
     def start(self, filepath, unit_edge_max, thick_mode=False, occupy_memory=True):
         # 存储厚板模式标志 / Store thick mode flag
         self.thick_mode_flag = thick_mode
-        self.origami_name = filepath
+        # origami_name is the export folder key (set in __init__); filepath may be a
+        # per-worker batch JSON copy during multiprocess optimization.
 
-        with open("./descriptionData/" + filepath + ".json", 'r', encoding='utf-8') as fw:
+        if os.path.isabs(filepath):
+            json_path = filepath
+        elif os.path.isfile(filepath):
+            json_path = filepath
+        elif os.path.isfile(filepath + ".json"):
+            json_path = filepath + ".json"
+        else:
+            json_path = os.path.join("./descriptionData", filepath + ".json")
+
+        self.json_stem = os.path.splitext(os.path.basename(json_path))[0]
+
+        with open(json_path, 'r', encoding='utf-8') as fw:
             input_json = json.load(fw)
         self.input_json = input_json
         self.kps = []

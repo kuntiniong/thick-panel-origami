@@ -67,7 +67,7 @@ class ThickPanelDesignFramework:
     该框架通过优化算法来设计折痕的高度偏移量，使得厚板折纸能够尽可能完全地折叠。
 
     约束条件/Constraints:
-    1. 优化器在倍率空间搜索 [1, max_offset/min_thickness]，物理高度 = 倍率 × min_thickness
+    1. 优化器在有符号毫米空间搜索 [-max_offset, max_offset]；评估前由约束强制谷正山负并离散化
     2. 高度偏移量绝对值至少为min_thickness（默认2mm），保证板具有厚度
     3. 高度偏移量绝对值按discrete_step（默认0.4mm）离散化
     4. 对于同时包含山折痕和谷折痕的板，谷折痕的有符号高度偏移量必须大于山折痕的有符号高度偏移量，且至少相差4mm
@@ -196,9 +196,8 @@ class ThickPanelDesignFramework:
             print(f"  - 最小厚度/Min thickness: {min_thickness}mm")
             print(f"  - 离散步长/Discrete step: {discrete_step}mm")
             print(
-                f"  - 优化器倍率范围/Optimizer multiplicand range: "
-                f"[{self._optimizer_bound_lo():.4g}, {self._optimizer_bound_hi():.4g}] "
-                f"(× {min_thickness}mm)"
+                f"  - 优化器搜索范围/Optimizer signed mm range: "
+                f"[{self._optimizer_bound_lo():.4g}, {self._optimizer_bound_hi():.4g}] mm"
             )
             if self.result_prefix:
                 print(f"  - 结果前缀/Result prefix: {self.result_prefix}")
@@ -592,61 +591,63 @@ class ThickPanelDesignFramework:
         return mask
 
     def _optimizer_bound_lo(self) -> float:
-        """Lower bound for each optimizer multiplicand (dimensionless, ≥ 1)."""
-        return 1.0
+        """Lower bound for each optimizer variable (signed height, mm)."""
+        return -self.max_offset
 
     def _optimizer_bound_hi(self) -> float:
-        """Upper bound for each optimizer multiplicand: max_offset / min_thickness."""
-        return self.max_offset / self.min_thickness
+        """Upper bound for each optimizer variable (signed height, mm)."""
+        return self.max_offset
 
     def _build_optimizer_bounds(self) -> np.ndarray:
         """
-        Per-independent-variable bounds in multiplicand space.
+        Per-independent-variable bounds in signed mm space.
 
-        Optimizers search unsigned multiplicands in [1, max_offset/min_thickness];
-        physical magnitude is multiplicand × min_thickness. Valley/mountain sign is
-        applied later in _apply_constraints.
+        Optimizers search signed heights in [-max_offset, max_offset] mm.
+        Valley/mountain sign is re-enforced in _apply_constraints.
         """
         lo = self._optimizer_bound_lo()
         hi = self._optimizer_bound_hi()
         return np.array([[lo, hi] for _ in range(self.num_independent)])
 
     def _build_discrete_magnitude_values(self) -> np.ndarray:
-        """Quantised multiplicand levels for margin CMA-ES variants."""
+        """Quantised signed height levels (mm) for margin CMA-ES variants."""
         eps = self.discrete_step * 0.5
-        heights = np.arange(self.min_thickness, self.max_offset + eps, self.discrete_step)
-        return heights / self.min_thickness
+        pos = np.arange(self.min_thickness, self.max_offset + eps, self.discrete_step)
+        # Symmetric discrete grid: ..., -min-step, -min, +min, +min+step, ...
+        return np.concatenate((-pos[::-1], pos))
 
     def _optimizer_vars_to_magnitudes(self, optimizer_vars: np.ndarray) -> np.ndarray:
         """
-        Convert optimizer multiplicands to unsigned height magnitudes (mm).
+        Map optimizer variables to height values (mm) before expand/constraints.
 
-        :param optimizer_vars: Independent multiplicands (× min_thickness → mm).
-        :return: Unsigned magnitudes in mm, same shape as optimizer_vars.
+        Variables are already signed heights in mm; pass through unchanged.
         """
-        return np.asarray(optimizer_vars, dtype=float) * self.min_thickness
+        return np.asarray(optimizer_vars, dtype=float)
 
     def _magnitudes_to_optimizer_vars(self, magnitudes: np.ndarray) -> np.ndarray:
-        """Convert unsigned height magnitudes (mm) to optimizer multiplicands."""
-        return np.asarray(magnitudes, dtype=float) / self.min_thickness
+        """Map height values (mm) to optimizer variables (identity for signed mm)."""
+        return np.asarray(magnitudes, dtype=float)
 
     def _build_initial_mean(self) -> np.ndarray:
         """
         Build the initial mean vector for optimization algorithms.
 
-        Values are unsigned multiplicands in [1, max_offset/min_thickness]. When
-        initial_offsets were loaded, their constrained absolute values are converted
-        to multiplicands. Otherwise every crease starts at multiplicand 1
-        (height = min_thickness).
+        Values are signed heights in mm. When initial_offsets were loaded, their
+        constrained values are used. Otherwise valley creases start at
+        +min_thickness and mountain creases at -min_thickness.
 
         :return: Mean vector of shape (num_independent,).
         """
         if self._initial_offsets_full is not None:
             constrained = self._apply_constraints(self._initial_offsets_full)
-            multiplicands = self._magnitudes_to_optimizer_vars(np.abs(constrained))
-            return self._reduce_offsets(multiplicands)
+            return self._reduce_offsets(self._magnitudes_to_optimizer_vars(constrained))
 
-        mean = np.ones(self.num_creases, dtype=float)
+        mean = np.zeros(self.num_creases, dtype=float)
+        for i, info in enumerate(self.crease_info):
+            if info["type"] == 0:  # valley
+                mean[i] = self.min_thickness
+            else:  # mountain
+                mean[i] = -self.min_thickness
         return self._reduce_offsets(mean)
 
     def _discretize_offset(self, offset: float) -> float:
