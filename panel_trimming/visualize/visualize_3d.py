@@ -4,7 +4,13 @@ Interactive 3D explosion diagram for thick-panel origami trimming.
 Shows design-plane panel outlines and shaded/trim regions stacked at each
 thickness ``layer_h``, with an explosion slider that pulls layers apart
 along z. Drag to orbit / zoom with the mouse. Right sidebar: show/hide
-individual thickness layers (checkboxes + All / None).
+individual thickness layers (checkboxes + All / None) and four view streams
+matching clean / json_to_stl exports:
+
+  1) original          — physical panel stock (crease-height shells)
+  2) support           — support pads at missing global heights
+  3) collision         — main collision (physical + ghost shades)
+  4) support-collision — support-stream collision shades only
 
 Shaded geometry depends on the JSON type:
   *-cleaned / export_meta.cleaned
@@ -25,6 +31,9 @@ Usage:
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed
   python panel-trimming/visualize/visualize_3d.py --name miura-thick-cleaned
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --factor 2.5
+  python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --view collision
+  python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --view support-collision
+  python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --view original,support
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --collision-only
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --no-show -o out.png
   python panel-trimming/visualize/visualize_3d.py --name mountain-thick-trimmed --report-only
@@ -89,6 +98,134 @@ CREASE_BORDER = "#bbbbbb"
 GUIDE_COLOR = "#9aa0a8"
 TEXT_COLOR = "#222222"
 LAYER_CMAP = "coolwarm"
+
+# View streams matching clean / json_to_stl export split:
+#   original.stl | support.stl | collision.stl | support-collision.stl
+VIEW_ORIGINAL = "original"
+VIEW_SUPPORT = "support"
+VIEW_COLLISION = "collision"
+VIEW_SUPPORT_COLLISION = "support-collision"
+VIEW_STREAM_KEYS = (
+    VIEW_ORIGINAL,
+    VIEW_SUPPORT,
+    VIEW_COLLISION,
+    VIEW_SUPPORT_COLLISION,
+)
+# CLI / config aliases → canonical key
+_VIEW_ALIASES = {
+    "original": VIEW_ORIGINAL,
+    "orig": VIEW_ORIGINAL,
+    "physical": VIEW_ORIGINAL,
+    "phys": VIEW_ORIGINAL,
+    "panels": VIEW_ORIGINAL,
+    "stock": VIEW_ORIGINAL,
+    "support": VIEW_SUPPORT,
+    "sup": VIEW_SUPPORT,
+    "support-panels": VIEW_SUPPORT,
+    "support_panels": VIEW_SUPPORT,
+    "pad": VIEW_SUPPORT,
+    "collision": VIEW_COLLISION,
+    "coll": VIEW_COLLISION,
+    "main-collision": VIEW_COLLISION,
+    "main_collision": VIEW_COLLISION,
+z    "collision-original": VIEW_COLLISION,
+    "collision_original": VIEW_COLLISION,
+    "orig-collision": VIEW_COLLISION,
+    "original-collision": VIEW_COLLISION,
+    "support-collision": VIEW_SUPPORT_COLLISION,
+    "support_collision": VIEW_SUPPORT_COLLISION,
+    "sup-collision": VIEW_SUPPORT_COLLISION,
+    "sup_collision": VIEW_SUPPORT_COLLISION,
+    "collision-support": VIEW_SUPPORT_COLLISION,
+    "collision_support": VIEW_SUPPORT_COLLISION,
+}
+
+
+def parse_view_streams(
+    view: Optional[Any] = None,
+    *,
+    collision_only: bool = False,
+    default_all: bool = True,
+) -> Dict[str, bool]:
+    """
+    Parse view selection into the four STL-aligned streams.
+
+    ``view`` may be:
+      - None → all on (if default_all) unless collision_only
+      - str: comma/space-separated tokens (e.g. "collision,support-collision")
+      - sequence of tokens
+      - dict with boolean keys (original/support/collision/support-collision)
+
+    ``collision_only=True`` (legacy) → both collision streams only.
+    """
+    flags = {k: False for k in VIEW_STREAM_KEYS}
+
+    if collision_only and view is None:
+        flags[VIEW_COLLISION] = True
+        flags[VIEW_SUPPORT_COLLISION] = True
+        return flags
+
+    if view is None:
+        if default_all:
+            return {k: True for k in VIEW_STREAM_KEYS}
+        return flags
+
+    if isinstance(view, dict):
+        for raw_k, on in view.items():
+            key = _VIEW_ALIASES.get(str(raw_k).strip().lower())
+            if key is not None:
+                flags[key] = bool(on)
+        # Also accept show_* keys from config
+        alias_map = {
+            "show_original": VIEW_ORIGINAL,
+            "show_original_panels": VIEW_ORIGINAL,
+            "show_support": VIEW_SUPPORT,
+            "show_support_panels": VIEW_SUPPORT,
+            "show_collision": VIEW_COLLISION,
+            "show_original_collision": VIEW_COLLISION,
+            "show_support_collision": VIEW_SUPPORT_COLLISION,
+        }
+        for raw_k, canon in alias_map.items():
+            if raw_k in view:
+                flags[canon] = bool(view[raw_k])
+        if collision_only:
+            # Explicit collision-only still forces panels off unless view named them
+            if VIEW_ORIGINAL not in (view or {}) and "show_original" not in (view or {}):
+                flags[VIEW_ORIGINAL] = False
+            if VIEW_SUPPORT not in (view or {}) and "show_support" not in (view or {}):
+                flags[VIEW_SUPPORT] = False
+            if not any(flags[k] for k in (VIEW_COLLISION, VIEW_SUPPORT_COLLISION)):
+                flags[VIEW_COLLISION] = True
+                flags[VIEW_SUPPORT_COLLISION] = True
+        return flags
+
+    if isinstance(view, str):
+        tokens = [t for t in view.replace(";", ",").replace(" ", ",").split(",") if t]
+    else:
+        tokens = [str(t) for t in view]
+
+    for tok in tokens:
+        key = _VIEW_ALIASES.get(tok.strip().lower())
+        if key is None:
+            # allow "all"
+            if tok.strip().lower() in ("all", "*"):
+                return {k: True for k in VIEW_STREAM_KEYS}
+            continue
+        flags[key] = True
+
+    if not any(flags.values()) and default_all and not tokens:
+        return {k: True for k in VIEW_STREAM_KEYS}
+    return flags
+
+
+def view_streams_label(flags: Dict[str, bool]) -> str:
+    """Short label of active streams for titles / reports."""
+    on = [k for k in VIEW_STREAM_KEYS if flags.get(k)]
+    if len(on) == len(VIEW_STREAM_KEYS):
+        return "all"
+    if not on:
+        return "none"
+    return "+".join(on)
 
 
 def _shell_kind_of(entry: Optional[dict]) -> str:
@@ -327,6 +464,118 @@ def _panels_physical_at_height(
         if any(abs(float(h) - float(x)) <= eps for x in offs):
             out.add(int(i))
     return out
+
+
+def _panel_stock_span(
+    offsets: Sequence[float],
+    *,
+    default: float = 0.0,
+) -> Tuple[float, float]:
+    """
+    Continuous original-stock Z span for one panel (STL original solid).
+
+    Matches json_to_stl: original fills [min crease offset, max crease offset]
+    (without extra half-thickness; mid-layer samples use the same endpoints).
+    """
+    offs = [float(x) for x in (offsets or [])]
+    if not offs:
+        d = float(default)
+        return (d, d)
+    return (min(offs), max(offs))
+
+
+def _height_in_closed_span(
+    h: float,
+    lo: float,
+    hi: float,
+    eps: float = 1e-6,
+) -> bool:
+    a, b = (float(lo), float(hi)) if float(lo) <= float(hi) else (float(hi), float(lo))
+    return a - eps <= float(h) <= b + eps
+
+
+def _panels_original_at_height(
+    panel_offsets: Sequence[Sequence[float]],
+    h: float,
+    eps: float = 1e-6,
+) -> set:
+    """
+    Panels whose **continuous original stock** covers height h.
+
+    STL original is a solid prism on [min offset, max offset], not only the
+    discrete crease shells. Intermediate explosion layers inside the span
+    therefore show as original (not support pads).
+    """
+    out = set()
+    for i, offs in enumerate(panel_offsets or []):
+        if not offs:
+            continue
+        lo, hi = _panel_stock_span(offs)
+        if _height_in_closed_span(h, lo, hi, eps=eps):
+            out.add(int(i))
+    return out
+
+
+def _panels_support_at_height(
+    panel_offsets: Sequence[Sequence[float]],
+    h: float,
+    eps: float = 1e-6,
+) -> set:
+    """
+    Panels that have **support stock** at height h (STL support.stl).
+
+    Support fills the design outside each panel's original [lo, hi] span —
+    same partition as clean / json_to_stl (every panel is either original
+    or support at a given global height).
+    """
+    n = len(panel_offsets or [])
+    original = _panels_original_at_height(panel_offsets, h, eps=eps)
+    return {i for i in range(n) if i not in original}
+
+
+def _shade_draw_heights(
+    item: dict,
+    heights: Sequence[float],
+    *,
+    eps: float = 1e-6,
+) -> List[float]:
+    """
+    Explosion layer heights where a collision shade should be drawn.
+
+    Cleaned / merged prisms carry continuous ``h_lo``→``h_hi`` (STL collision
+    solid). Replicate the footprint on **every** stack height inside that
+    span so collision looks panel×layer like support pads — not a single
+    mid-layer plate. Unmerged samples fall back to ``layer_h`` only.
+    """
+    h_lo = item.get("h_lo")
+    h_hi = item.get("h_hi")
+    if h_lo is not None and h_hi is not None:
+        try:
+            lo, hi = float(h_lo), float(h_hi)
+        except (TypeError, ValueError):
+            lo = hi = None
+        if lo is not None:
+            if lo > hi:
+                lo, hi = hi, lo
+            span = [
+                float(h)
+                for h in heights
+                if _height_in_closed_span(float(h), lo, hi, eps=eps)
+            ]
+            if span:
+                return span
+            # Span endpoints even if not in the global layer list
+            if abs(hi - lo) <= eps:
+                return [lo]
+            return [lo, hi]
+
+    lh = item.get("layer_h")
+    if lh is not None:
+        try:
+            return [float(lh)]
+        except (TypeError, ValueError):
+            pass
+    return []
 
 
 def _collect_layer_heights(
@@ -1132,6 +1381,11 @@ def build_explosion_scene(
     shade_alpha: float = 1.0,
     title: Optional[str] = None,
     collision_only: bool = False,
+    view: Optional[Any] = None,
+    show_original: Optional[bool] = None,
+    show_support: Optional[bool] = None,
+    show_collision: Optional[bool] = None,
+    show_support_collision: Optional[bool] = None,
 ):
     """
     Build an interactive (or static) 3D explosion figure.
@@ -1140,9 +1394,15 @@ def build_explosion_scene(
     color). **Collided** regions = simplified closed dual-curve polygons
     (batched), solid red on every layer — no per-sample stroke swarm.
 
-    If ``collision_only`` is True, only shaded/collided geometry is drawn
-    (dual-curve ribbons + vertical side walls); panels, creases, and guides
-    are hidden.
+    Four view streams (same split as clean / json_to_stl STLs) can be toggled
+    independently in the sidebar or via ``view`` / the show_* kwargs:
+
+      original          — physical panel stock
+      support           — support pads at missing heights
+      collision         — main collision (physical + ghost)
+      support-collision — support-stream collision only
+
+    ``collision_only=True`` (legacy) starts with both collision streams only.
 
     Returns (fig, ax, state) where state holds redraw helpers for the slider.
     """
@@ -1151,18 +1411,77 @@ def build_explosion_scene(
     from matplotlib.widgets import Button, CheckButtons, Slider
     from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 
-    # User-requested defaults (GUI can toggle collision_only over these).
-    want_panels = bool(show_panels)
-    want_shades = bool(show_shades)
+    # Resolve four STL-aligned streams (CLI / config / kwargs).
+    has_explicit = any(
+        x is not None
+        for x in (
+            view,
+            show_original,
+            show_support,
+            show_collision,
+            show_support_collision,
+        )
+    )
+    if has_explicit:
+        view_flags = parse_view_streams(
+            view if view is not None else {},
+            collision_only=False,
+            default_all=False,
+        )
+        if show_original is not None:
+            view_flags[VIEW_ORIGINAL] = bool(show_original)
+        if show_support is not None:
+            view_flags[VIEW_SUPPORT] = bool(show_support)
+        if show_collision is not None:
+            view_flags[VIEW_COLLISION] = bool(show_collision)
+        if show_support_collision is not None:
+            view_flags[VIEW_SUPPORT_COLLISION] = bool(show_support_collision)
+        # collision_only still disables stock if caller did not name it
+        if collision_only:
+            if show_original is None and (
+                view is None
+                or (
+                    isinstance(view, str)
+                    and VIEW_ORIGINAL not in view.lower()
+                    and "orig" not in view.lower()
+                )
+            ):
+                view_flags[VIEW_ORIGINAL] = False
+            if show_support is None and (
+                view is None
+                or (
+                    isinstance(view, str)
+                    and "support" not in view.lower().replace("support-collision", "")
+                    .replace("support_collision", "")
+                )
+            ):
+                view_flags[VIEW_SUPPORT] = False
+            if not view_flags[VIEW_COLLISION] and not view_flags[VIEW_SUPPORT_COLLISION]:
+                view_flags[VIEW_COLLISION] = True
+                view_flags[VIEW_SUPPORT_COLLISION] = True
+        if not any(view_flags.values()):
+            view_flags = parse_view_streams(None, default_all=True)
+    else:
+        view_flags = parse_view_streams(
+            None, collision_only=collision_only, default_all=True
+        )
+
+    # Legacy show_panels / show_shades force-off corresponding streams
+    if not show_panels:
+        view_flags[VIEW_ORIGINAL] = False
+        view_flags[VIEW_SUPPORT] = False
+    if not show_shades:
+        view_flags[VIEW_COLLISION] = False
+        view_flags[VIEW_SUPPORT_COLLISION] = False
+
     want_lines = bool(show_lines)
     want_guides = bool(show_guides)
     want_panel_ids = bool(show_panel_ids)
-    # Side walls are always drawn for visualization (JSON export or synthesized).
+    # Side walls follow original stock by default (physical structure).
     if show_side_walls is None:
         want_side_walls = True
     else:
         want_side_walls = bool(show_side_walls)
-
     base = original or trimmed
     units = list(trimmed.get("units") or base.get("units") or [])
     if not units:
@@ -1225,10 +1544,27 @@ def build_explosion_scene(
     xmin, xmax = xmin - pad, xmax + pad
     ymin, ymax = ymin - pad, ymax + pad
 
-    # Shade count per height (for sidebar labels)
+    # Shade count per height (for sidebar labels).
+    # Merged prisms count on every layer inside [h_lo, h_hi], not only mid layer_h.
     shade_count_at: Dict[float, int] = {float(h): 0 for h in heights}
-    for h in heights:
-        shade_count_at[float(h)] = len(shades.get(_layer_key(h), []))
+    for rec in shade_records:
+        if not rec.get("drawable"):
+            continue
+        for hh in _shade_draw_heights(rec, heights):
+            # Snap to nearest known stack height key
+            best = None
+            best_d = 1e9
+            for h in heights:
+                d = abs(float(h) - float(hh))
+                if d < best_d:
+                    best_d, best = d, float(h)
+            if best is not None and best_d <= 1e-5:
+                shade_count_at[best] = shade_count_at.get(best, 0) + 1
+            else:
+                # Include midpoints that are already in heights via round key
+                k = float(hh)
+                if k in shade_count_at:
+                    shade_count_at[k] += 1
 
     fig = plt.figure(figsize=(12.5, 8.8))
     # 3D view | right sidebar for layer visibility
@@ -1236,16 +1572,16 @@ def build_explosion_scene(
     slider_ax = fig.add_axes([0.12, 0.04, 0.50, 0.035])
 
     # Sidebar layout (right column)
-    help_ax = fig.add_axes([0.74, 0.80, 0.24, 0.14])
+    help_ax = fig.add_axes([0.74, 0.88, 0.24, 0.10])
     help_ax.axis("off")
-    btn_all_ax = fig.add_axes([0.74, 0.755, 0.11, 0.032])
-    btn_none_ax = fig.add_axes([0.87, 0.755, 0.11, 0.032])
-    # Collision-only toggle (live GUI)
-    coll_check_ax = fig.add_axes([0.74, 0.708, 0.24, 0.038])
+    # Four STL-stream toggles (original / support / collision / support-collision)
+    view_check_ax = fig.add_axes([0.74, 0.72, 0.24, 0.145])
+    btn_all_ax = fig.add_axes([0.74, 0.675, 0.11, 0.032])
+    btn_none_ax = fig.add_axes([0.87, 0.675, 0.11, 0.032])
     # Check list height scales with layer count (capped)
     n_h = max(len(heights), 1)
-    check_h = min(0.44, 0.055 * n_h + 0.08)
-    check_bottom = 0.700 - check_h - 0.01
+    check_h = min(0.40, 0.055 * n_h + 0.08)
+    check_bottom = 0.665 - check_h - 0.01
     check_ax = fig.add_axes([0.74, check_bottom, 0.24, check_h])
 
     base_title = title  # may be None; resolved at draw time
@@ -1255,10 +1591,8 @@ def build_explosion_scene(
         "heights": heights,
         # layer_h → visible (explosion spacing still uses full height list)
         "layer_visible": {float(h): True for h in heights},
-        "collision_only": bool(collision_only),
-        # user defaults restored when collision-only is turned off
-        "want_panels": want_panels,
-        "want_shades": want_shades,
+        # Four streams (same as clean / json_to_stl STL split)
+        "view": dict(view_flags),
         "want_lines": want_lines,
         "want_guides": want_guides,
         "want_side_walls": want_side_walls,
@@ -1272,23 +1606,25 @@ def build_explosion_scene(
     }
 
     def _draw_flags() -> Dict[str, bool]:
-        """Effective draw flags; collision_only overrides to shades + side walls."""
-        if state["collision_only"]:
-            return {
-                "show_panels": False,
-                "show_shades": True,
-                "show_lines": False,
-                "show_guides": False,
-                "show_side_walls": True,
-                "show_panel_ids": False,
-            }
+        """Effective draw flags from the four STL-aligned view streams."""
+        v = state["view"]
+        show_orig = bool(v.get(VIEW_ORIGINAL))
+        show_sup = bool(v.get(VIEW_SUPPORT))
+        show_coll = bool(v.get(VIEW_COLLISION))
+        show_sup_coll = bool(v.get(VIEW_SUPPORT_COLLISION))
+        any_stock = show_orig or show_sup
+        any_coll = show_coll or show_sup_coll
         return {
-            "show_panels": bool(state["want_panels"]),
-            "show_shades": bool(state["want_shades"]),
-            "show_lines": bool(state["want_lines"]),
-            "show_guides": bool(state["want_guides"]),
-            "show_side_walls": bool(state["want_side_walls"]),
-            "show_panel_ids": bool(state["want_panel_ids"]),
+            "show_original": show_orig,
+            "show_support": show_sup,
+            "show_collision": show_coll,
+            "show_support_collision": show_sup_coll,
+            "show_panels": any_stock,
+            "show_shades": any_coll,
+            "show_lines": bool(state["want_lines"]) and show_orig,
+            "show_guides": bool(state["want_guides"]) and show_orig,
+            "show_side_walls": bool(state["want_side_walls"]) and show_orig,
+            "show_panel_ids": bool(state["want_panel_ids"]) and any_stock,
         }
 
     def _layer_visible(h: float, eps: float = 1e-6) -> bool:
@@ -1330,13 +1666,17 @@ def build_explosion_scene(
         factor = float(factor)
         state["factor"] = factor
         flags = _draw_flags()
-        coll_only = bool(state["collision_only"])
+        do_original = flags["show_original"]
+        do_support_panels = flags["show_support"]
+        do_orig_coll = flags["show_collision"]
+        do_sup_coll = flags["show_support_collision"]
         do_panels = flags["show_panels"]
         do_shades = flags["show_shades"]
         do_lines = flags["show_lines"]
         do_guides = flags["show_guides"]
         do_side_walls = flags["show_side_walls"]
         do_panel_ids = flags["show_panel_ids"]
+        coll_only = do_shades and not do_panels
 
         vis_heights = _visible_heights()
         zs_all: List[float] = []
@@ -1351,11 +1691,15 @@ def build_explosion_scene(
         # Explosion mapping keeps full stack so toggles don't jump positions
         z_of = {h: _explode_z(h, heights, factor) for h in heights}
 
-        # --- panels: full set at every global height ---
-        # Physical = layer colormap; missing = green support pads (like 2D viz).
+        # --- panels: split like original.stl / support.stl ---
+        # Continuous stock span per panel (not only exact crease shells):
+        #   original  = every layer h inside [min_off, max_off]
+        #   support   = every layer h outside that span
+        # So every design panel appears at every stack height (panel×layer).
         if do_panels:
-            phys_by_h: Dict[float, List[np.ndarray]] = {}
-            support_by_h: Dict[float, List[np.ndarray]] = {}
+            # (h, panel_idx, xy) kept per stream for panel-by-panel drawing
+            phys_items: List[Tuple[float, int, np.ndarray]] = []
+            support_items: List[Tuple[float, int, np.ndarray]] = []
             for h in heights:
                 hf = float(h)
                 if not _layer_visible(hf):
@@ -1364,15 +1708,20 @@ def build_explosion_scene(
                     abs(hf - float(w)) < 1e-6 for w in layers
                 ):
                     continue
-                phys_ids = _panels_physical_at_height(panel_offsets, hf)
+                orig_ids = _panels_original_at_height(panel_offsets, hf)
                 for i, xy in enumerate(panel_xy):
                     if len(xy) < 3:
                         continue
-                    if i in phys_ids:
-                        phys_by_h.setdefault(hf, []).append(xy)
+                    if i in orig_ids:
+                        if do_original:
+                            phys_items.append((hf, i, xy))
                     else:
-                        # Pad so every layer has all design panels
-                        support_by_h.setdefault(hf, []).append(xy)
+                        if do_support_panels:
+                            support_items.append((hf, i, xy))
+            # Original: one plate per (panel, layer) — color by layer
+            phys_by_h: Dict[float, List[np.ndarray]] = {}
+            for hf, _pi, xy in phys_items:
+                phys_by_h.setdefault(hf, []).append(xy)
             for h, xylist in phys_by_h.items():
                 z = _explode_z(h, heights, factor)
                 zs_all.append(z)
@@ -1388,10 +1737,13 @@ def build_explosion_scene(
                 )
                 ax.add_collection3d(coll)
                 state["collections"].append(coll)
-            # Green support pads (missing physical shells at this height)
-            if support_by_h:
+            # Support: green pad per (panel, layer) outside original span
+            if support_items:
                 sup_rgb = to_rgb(SUPPORT_PANEL_FACE)
                 sup_edge = to_rgb(SUPPORT_PANEL_EDGE)
+                support_by_h: Dict[float, List[np.ndarray]] = {}
+                for hf, _pi, xy in support_items:
+                    support_by_h.setdefault(hf, []).append(xy)
                 for h, xylist in support_by_h.items():
                     z = _explode_z(h, heights, factor)
                     zs_all.append(z)
@@ -1412,10 +1764,13 @@ def build_explosion_scene(
 
         # --- shaded fills ---
         # cleaned → purple final trim (fabric/cut); trimmed → dual-curve colors
+        # Streams: collision = phys+ghost; support-collision = support (STL split)
         n_shade_vis = 0
         n_shade_ghost_vis = 0
         n_shade_side_vis = 0
         n_shade_phys_vis = 0
+        n_shade_support_vis = 0
+        n_shade_merged_vis = 0
         if do_shades:
             use_final_trim = bool(
                 state_assoc.get("final_trim_only")
@@ -1454,37 +1809,83 @@ def build_explosion_scene(
             support_verts: List[np.ndarray] = []
             side_verts: List[np.ndarray] = []
             merged_verts: List[np.ndarray] = []
-            for key, items in shades.items():
-                try:
-                    h = float(key)
-                except (TypeError, ValueError):
+            prism_wall_verts: List[np.ndarray] = []
+            # Flatten all shade items, then stamp each on every layer in its
+            # continuous [h_lo, h_hi] span (panel×layer, same idea as support pads).
+            all_shade_items: List[Dict[str, Any]] = []
+            for _key, items in shades.items():
+                all_shade_items.extend(items)
+
+            labeled_panels: set = set()  # one label per (panel, stream) mid span
+            for item in all_shade_items:
+                poly = item.get("poly")
+                if poly is None or len(poly) < 3:
                     continue
-                if not _layer_visible(h):
+                if float(item.get("area") or 0.0) < 1e-3:
                     continue
-                z_panel = _explode_z(h, heights, factor)
-                z_bias = z_panel + z_lift
-                for item in items:
-                    poly = item.get("poly")
-                    if poly is None or len(poly) < 3:
+                sk = _shell_kind_of(item)
+                is_merged = bool(
+                    item.get("viz_merged_stack") or item.get("layer_stack_merged")
+                )
+                # Cleaned: merged / final export only — no ghost/support/side ribbons
+                if use_final_trim:
+                    if sk == "side":
                         continue
-                    if float(item.get("area") or 0.0) < 1e-3:
+                    if sk in ("ghost", "support") and not is_merged:
                         continue
-                    sk = _shell_kind_of(item)
-                    is_merged = bool(
-                        item.get("viz_merged_stack") or item.get("layer_stack_merged")
+                    if item.get("pre_merge_layer") and not is_merged:
+                        continue
+                # Stream filter matches json_to_stl kinds split:
+                #   collision.stl         → physical + ghost
+                #   support-collision.stl → support
+                if sk == "side":
+                    if not do_orig_coll:
+                        continue
+                elif sk == "support":
+                    if not do_sup_coll:
+                        continue
+                else:
+                    if not do_orig_coll:
+                        continue
+
+                draw_hs = _shade_draw_heights(item, heights)
+                if not draw_hs:
+                    continue
+
+                # Optional vertical prism walls for continuous h_lo→h_hi solids
+                if (
+                    is_merged
+                    and item.get("h_lo") is not None
+                    and item.get("h_hi") is not None
+                    and len(draw_hs) >= 2
+                ):
+                    try:
+                        h0 = float(item["h_lo"])
+                        h1 = float(item["h_hi"])
+                    except (TypeError, ValueError):
+                        h0 = h1 = None
+                    if h0 is not None and abs(h1 - h0) > 1e-9:
+                        z0 = _explode_z(min(h0, h1), heights, factor)
+                        z1 = _explode_z(max(h0, h1), heights, factor)
+                        # Only if either bounding layer is visible
+                        if _layer_visible(min(h0, h1)) or _layer_visible(max(h0, h1)):
+                            prism_wall_verts.extend(
+                                _ring_side_faces(poly, z0, z1)
+                            )
+                            zs_all.extend([z0, z1])
+
+                for h in draw_hs:
+                    if not _layer_visible(h):
+                        continue
+                    z_panel = _explode_z(h, heights, factor)
+                    # Merged stack sits slightly above its layer for clarity
+                    z_item = z_panel + z_lift + (
+                        0.6 * z_lift if is_merged else 0.0
                     )
-                    # Cleaned: merged / final export only — no ghost/support/side ribbons
-                    if use_final_trim:
-                        if sk == "side":
-                            continue
-                        if sk in ("ghost", "support") and not is_merged:
-                            continue
-                        if item.get("pre_merge_layer") and not is_merged:
-                            continue
-                    # Merged stack sits slightly above its mid layer for clarity
-                    z_item = z_bias + (0.6 * z_lift if is_merged else 0.0)
                     verts3 = _xy_to_verts3d(poly, z_item)
-                    if is_merged:
+                    if is_merged and sk == "support":
+                        support_verts.append(verts3)
+                    elif is_merged:
                         merged_verts.append(verts3)
                     elif sk == "ghost":
                         ghost_verts.append(verts3)
@@ -1498,35 +1899,43 @@ def build_explosion_scene(
                     xs_all.extend(poly[:, 0].tolist())
                     ys_all.extend(poly[:, 1].tolist())
                     zs_all.append(z_item)
-                    if show_shade_labels and item.get("panel") is not None:
+
+                # One panel label at span mid (avoid N copies across layers)
+                if show_shade_labels and item.get("panel") is not None:
+                    pid = int(item["panel"])
+                    lab_key = (pid, sk, is_merged)
+                    if lab_key not in labeled_panels:
+                        labeled_panels.add(lab_key)
                         c = poly.mean(axis=0)
+                        h_lab = float(draw_hs[len(draw_hs) // 2])
+                        z_lab = _explode_z(h_lab, heights, factor) + z_lift
                         if is_merged:
                             hlo, hhi = item.get("h_lo"), item.get("h_hi")
                             if hlo is not None and hhi is not None:
                                 tag = (
-                                    f"P{int(item['panel'])}·M"
+                                    f"P{pid}·M"
                                     f"[{float(hlo):g}→{float(hhi):g}]"
                                 )
                             else:
-                                tag = f"P{int(item['panel'])}·M"
-                            tcolor = "#6a0dad"
+                                tag = f"P{pid}·M"
+                            tcolor = "#0a4a0a" if sk == "support" else "#6a0dad"
                         elif use_final_trim and not item.get("pre_merge_layer"):
-                            tag = f"P{int(item['panel'])}·T"
+                            tag = f"P{pid}·T"
                             tcolor = "#4a1a6a"
                         elif sk == "ghost":
-                            tag = f"P{int(item['panel'])}·G"
+                            tag = f"P{pid}·G"
                             tcolor = "#0a2a5a"
                         elif sk == "support":
-                            tag = f"P{int(item['panel'])}·Sup"
+                            tag = f"P{pid}·Sup"
                             tcolor = "#0a4a0a"
                         elif sk == "side":
-                            tag = f"P{int(item['panel'])}·Side"
+                            tag = f"P{pid}·Side"
                             tcolor = "#1a4a1a"
                         else:
-                            tag = f"P{int(item['panel'])}"
+                            tag = f"P{pid}"
                             tcolor = "#5a0a0a"
                         t = ax.text(
-                            float(c[0]), float(c[1]), z_item,
+                            float(c[0]), float(c[1]), z_lab,
                             tag,
                             color=tcolor,
                             fontsize=5.5, ha="center", va="center",
@@ -1565,18 +1974,20 @@ def build_explosion_scene(
                 )
                 ax.add_collection3d(coll)
                 state["collections"].append(coll)
-            if support_verts and not use_final_trim:
+            if support_verts:
+                # support-collision stream (green) — cleaned or raw
+                s_alpha = FABRIC_FACE_ALPHA if use_final_trim else shade_alpha
                 coll = Poly3DCollection(
                     support_verts,
-                    facecolors=[(*support_rgb, shade_alpha)] * len(support_verts),
+                    facecolors=[(*support_rgb, s_alpha)] * len(support_verts),
                     edgecolors=[support_edge] * len(support_verts),
-                    linewidths=0.7,
+                    linewidths=0.9 if use_final_trim else 0.7,
                     zsort="average",
                 )
                 ax.add_collection3d(coll)
                 state["collections"].append(coll)
             if merged_verts:
-                # Continuous min→max merge outline (distinct from per-layer fills)
+                # Continuous min→max merge outline (main / original-collision stream)
                 m_rgb = to_rgb(FABRIC_EDGE) if use_final_trim else to_rgb("#6a0dad")
                 m_face = (*m_rgb, 0.12)
                 m_edge = (*m_rgb, 0.95)
@@ -1595,6 +2006,20 @@ def build_explosion_scene(
                     facecolors=[(*side_rgb, shade_alpha)] * len(side_verts),
                     edgecolors=[side_edge] * len(side_verts),
                     linewidths=0.7,
+                    zsort="average",
+                )
+                ax.add_collection3d(coll)
+                state["collections"].append(coll)
+            if prism_wall_verts:
+                # Vertical walls of continuous min→max collision prisms
+                w_rgb = support_rgb if do_sup_coll and not do_orig_coll else (
+                    to_rgb(FABRIC_EDGE) if use_final_trim else phys_edge
+                )
+                coll = Poly3DCollection(
+                    prism_wall_verts,
+                    facecolors=[(*w_rgb, 0.18)] * len(prism_wall_verts),
+                    edgecolors=[(*w_rgb, 0.55)] * len(prism_wall_verts),
+                    linewidths=0.3,
                     zsort="average",
                 )
                 ax.add_collection3d(coll)
@@ -1721,13 +2146,18 @@ def build_explosion_scene(
                 hf = float(h)
                 if not _layer_visible(hf):
                     continue
-                phys_ids = _panels_physical_at_height(panel_offsets, hf)
+                orig_ids = _panels_original_at_height(panel_offsets, hf)
                 z = _explode_z(hf, heights, factor)
                 for i, xy in enumerate(panel_xy):
                     if len(xy) < 3:
                         continue
+                    # Only label panels that belong to an active stock stream
+                    is_sup = i not in orig_ids
+                    if is_sup and not do_support_panels:
+                        continue
+                    if (not is_sup) and not do_original:
+                        continue
                     c = xy.mean(axis=0)
-                    is_sup = i not in phys_ids
                     label = f"{i}·Sup" if is_sup else str(i)
                     t = ax.text(
                         float(c[0]), float(c[1]),
@@ -1776,13 +2206,14 @@ def build_explosion_scene(
         n_vis = len(vis_heights)
         n_side_reg = len(side_panels_reg)
         side_src = "synth" if side_panels_synthesized else "export"
+        view_tag = view_streams_label(state["view"])
         if base_title:
             ttl = base_title
         elif coll_only:
-            ttl = "Collision regions only"
+            ttl = "Collision streams only"
         else:
             ttl = "Thick-panel explosion"
-        mode_tag = "  [collision only]" if coll_only else ""
+        mode_tag = f"  [{view_tag}]" if view_tag != "all" else ""
         ax.set_title(
             f"{ttl}{mode_tag}\n"
             f"layers {n_vis}/{len(heights)} visible  panels={n_panels}  "
@@ -1790,6 +2221,7 @@ def build_explosion_scene(
             f"shades={n_shade_vis}/{n_shade} "
             f"(phys={n_shade_phys_vis}/{n_phys_all} "
             f"ghost={n_shade_ghost_vis}/{n_ghost_all} "
+            f"sup={n_shade_support_vis if do_shades else 0} "
             f"merged={n_shade_merged_vis if do_shades else 0}/{n_merged_all} "
             f"side={n_shade_side_vis}/{n_side_all})  "
             f"assoc {n_assoc}/{n_tot}  explosion={factor:.2f}",
@@ -1848,22 +2280,18 @@ def build_explosion_scene(
     side_src_help = "synth" if side_panels_synthesized else "export"
 
     def _update_help_text():
-        coll = bool(state["collision_only"])
-        mode_line = "Mode: collision only\n" if coll else "Mode: full stack\n"
-        panel_line = "Panels: hidden\n" if coll else "Panels: color / layer\n"
+        v = state["view"]
+        streams = view_streams_label(v)
         body = (
-            "Layers\n"
-            "────────\n"
-            f"{mode_line}"
+            "STL streams (panel×layer)\n"
+            "────────────────\n"
+            f"view: {streams}\n"
+            "original = stock span\n"
+            "support  = outside span\n"
+            "collision= phys+ghost\n"
+            "  (all layers in h_lo→h_hi)\n"
+            "sup-coll = support cut\n"
             "Top = tallest h\n"
-            "Bottom = lowest h\n"
-            f"{panel_line}"
-            "Phys panel: layer color\n"
-            "Support pad: green ·Sup\n"
-            "Phys shade: red  P#\n"
-            "Ghost shade: blue P#·G\n"
-            "Support shade: green P#·Sup\n"
-            "Side walls: olive green\n"
             f"phys={n_phys_help} ghost={n_ghost_help}\n"
             f"support={n_support_help} side={n_side_help}\n"
             f"walls={n_side_walls} src:{side_src_help}\n"
@@ -1874,10 +2302,10 @@ def build_explosion_scene(
             art = help_ax.text(
                 0.0, 1.0, body,
                 transform=help_ax.transAxes,
-                va="top", ha="left", fontsize=7.5, color="#333333",
+                va="top", ha="left", fontsize=7.0, color="#333333",
                 family="monospace",
                 bbox=dict(
-                    boxstyle="round,pad=0.4", facecolor="#f7f7f9",
+                    boxstyle="round,pad=0.35", facecolor="#f7f7f9",
                     edgecolor="#cccccc", alpha=0.95,
                 ),
             )
@@ -1888,6 +2316,47 @@ def build_explosion_scene(
     # Must exist before first _draw (title path calls it).
     state["help_text"] = None
     _update_help_text()
+
+    # --- four stream checkboxes (order matches VIEW_STREAM_KEYS) ---
+    view_labels = [
+        "original",
+        "support",
+        "collision",
+        "support-collision",
+    ]
+    view_actives = [
+        bool(state["view"].get(VIEW_ORIGINAL, True)),
+        bool(state["view"].get(VIEW_SUPPORT, True)),
+        bool(state["view"].get(VIEW_COLLISION, True)),
+        bool(state["view"].get(VIEW_SUPPORT_COLLISION, True)),
+    ]
+    view_check = CheckButtons(view_check_ax, view_labels, actives=view_actives)
+    _view_label_colors = {
+        0: "#3366aa",   # original — blue-ish stock
+        1: "#148a14",   # support — green
+        2: "#a32020",   # collision — red
+        3: "#1a6b1a",   # support-collision — dark green
+    }
+    try:
+        for i, label in enumerate(view_check.labels):
+            label.set_fontsize(8.5)
+            label.set_fontweight("bold")
+            if i in _view_label_colors:
+                label.set_color(_view_label_colors[i])
+    except Exception:
+        pass
+
+    def _sync_view_from_checks():
+        status = list(view_check.get_status())
+        for i, key in enumerate(VIEW_STREAM_KEYS):
+            on = bool(status[i]) if i < len(status) else True
+            state["view"][key] = on
+
+    def _on_view_check(_label):
+        _sync_view_from_checks()
+        _draw(state["factor"])
+
+    view_check.on_clicked(_on_view_check)
 
     check_labels = [
         f"h={h:g}  ({shade_count_at.get(float(h), 0)} sh)"
@@ -1910,18 +2379,6 @@ def build_explosion_scene(
     except Exception:
         pass
 
-    coll_check = CheckButtons(
-        coll_check_ax,
-        ["Collision only"],
-        actives=[bool(state["collision_only"])],
-    )
-    try:
-        coll_check.labels[0].set_fontsize(9)
-        coll_check.labels[0].set_fontweight("bold")
-        coll_check.labels[0].set_color("#a32020")
-    except Exception:
-        pass
-
     def _sync_visibility_from_checks():
         status = list(check.get_status()) if check_labels else []
         for i, h in enumerate(heights_ui):
@@ -1934,19 +2391,8 @@ def build_explosion_scene(
 
     check.on_clicked(_on_check)
 
-    def _on_collision_check(_label):
-        # CheckButtons toggles before callback; read current status.
-        try:
-            on = bool(coll_check.get_status()[0])
-        except Exception:
-            on = not bool(state["collision_only"])
-        state["collision_only"] = on
-        _draw(state["factor"])
-
-    coll_check.on_clicked(_on_collision_check)
-
     def _set_all_checks(value: bool):
-        """Force every checkbox to on/off and redraw."""
+        """Force every layer checkbox to on/off and redraw."""
         if not check_labels:
             return
         status = list(check.get_status())
@@ -1962,7 +2408,7 @@ def build_explosion_scene(
     btn_none.on_clicked(lambda _evt: _set_all_checks(False))
 
     state["layer_check"] = check
-    state["collision_check"] = coll_check
+    state["view_check"] = view_check
     state["heights_ui"] = heights_ui  # tallest → lowest (sidebar order)
     state["btn_all"] = btn_all
     state["btn_none"] = btn_none
@@ -1970,8 +2416,28 @@ def build_explosion_scene(
         state["layer_visible"].__setitem__(float(h), bool(on)),
         _draw(state["factor"]),
     )
+
+    def _set_view_stream(key: str, on: bool):
+        canon = _VIEW_ALIASES.get(str(key).strip().lower(), str(key))
+        if canon not in state["view"]:
+            return
+        state["view"][canon] = bool(on)
+        # Keep GUI checkboxes in sync
+        try:
+            idx = VIEW_STREAM_KEYS.index(canon)
+            status = list(view_check.get_status())
+            if idx < len(status) and bool(status[idx]) != bool(on):
+                view_check.set_active(idx)
+        except Exception:
+            pass
+        _draw(state["factor"])
+
+    state["set_view_stream"] = _set_view_stream
     state["set_collision_only"] = lambda on: (
-        state.__setitem__("collision_only", bool(on)),
+        state["view"].__setitem__(VIEW_ORIGINAL, not bool(on)),
+        state["view"].__setitem__(VIEW_SUPPORT, not bool(on)),
+        state["view"].__setitem__(VIEW_COLLISION, True),
+        state["view"].__setitem__(VIEW_SUPPORT_COLLISION, True),
         _draw(state["factor"]),
     )
 
@@ -1998,11 +2464,18 @@ def visualize_explosion_3d(
     save_path: Optional[str] = None,
     print_report: bool = True,
     collision_only: bool = False,
+    view: Optional[Any] = None,
+    show_original: Optional[bool] = None,
+    show_support: Optional[bool] = None,
+    show_collision: Optional[bool] = None,
+    show_support_collision: Optional[bool] = None,
 ) -> Any:
     """
     Create the explosion figure; optionally save a PNG and/or show interactive UI.
 
-    ``collision_only=True`` draws only shaded/collided regions (and side walls).
+    Four view streams (STL split): original, support, collision,
+    support-collision. ``collision_only=True`` starts with both collision
+    streams only.
 
     Returns the matplotlib Figure.
     """
@@ -2054,6 +2527,11 @@ def visualize_explosion_3d(
         color_shades_by_panel=color_shades_by_panel,
         title=title,
         collision_only=collision_only,
+        view=view,
+        show_original=show_original,
+        show_support=show_support,
+        show_collision=show_collision,
+        show_support_collision=show_support_collision,
     )
 
     if save_path:
@@ -2143,18 +2621,51 @@ def _run_one(
         return None
 
     collision_only = bool(sim.get("collision_only", False))
+    view_arg = sim.get("view")
+    # Optional per-stream booleans from config / CLI
+    show_original = sim.get("show_original")
+    show_support = sim.get("show_support")
+    show_collision = sim.get("show_collision")
+    show_support_collision = sim.get("show_support_collision")
+    view_flags = parse_view_streams(
+        view_arg,
+        collision_only=collision_only and view_arg is None,
+        default_all=True,
+    )
+    if show_original is not None:
+        view_flags[VIEW_ORIGINAL] = bool(show_original)
+    if show_support is not None:
+        view_flags[VIEW_SUPPORT] = bool(show_support)
+    if show_collision is not None:
+        view_flags[VIEW_COLLISION] = bool(show_collision)
+    if show_support_collision is not None:
+        view_flags[VIEW_SUPPORT_COLLISION] = bool(show_support_collision)
+    if collision_only and view_arg is None and show_original is None and show_support is None:
+        view_flags[VIEW_ORIGINAL] = False
+        view_flags[VIEW_SUPPORT] = False
+        view_flags[VIEW_COLLISION] = True
+        view_flags[VIEW_SUPPORT_COLLISION] = True
+
     out_path = None
     if save:
         os.makedirs(output_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(trimmed_path))[0]
-        suffix = "_collision_3d" if collision_only else "_explosion_3d"
+        tag = view_streams_label(view_flags)
+        if tag == "all":
+            suffix = "_explosion_3d"
+        elif tag == "collision+support-collision":
+            suffix = "_collision_3d"
+        else:
+            safe = tag.replace("+", "_").replace("-", "")
+            suffix = f"_{safe}_3d"
         out_path = os.path.join(output_dir, f"{stem}{suffix}.png")
 
     title = os.path.basename(trimmed_path)
     if final_trim_only:
         title = f"{title} — final trim (purple)"
-    if collision_only:
-        title = f"{title} — collision only"
+    view_tag = view_streams_label(view_flags)
+    if view_tag != "all":
+        title = f"{title} — {view_tag}"
 
     visualize_explosion_3d(
         trimmed=trimmed,
@@ -2174,7 +2685,12 @@ def _run_one(
         interactive=show,
         save_path=out_path,
         print_report=False,  # already printed above
-        collision_only=collision_only,
+        collision_only=False,  # already folded into view_flags
+        view=view_flags,
+        show_original=view_flags[VIEW_ORIGINAL],
+        show_support=view_flags[VIEW_SUPPORT],
+        show_collision=view_flags[VIEW_COLLISION],
+        show_support_collision=view_flags[VIEW_SUPPORT_COLLISION],
     )
     return out_path
 
@@ -2226,11 +2742,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Only print panel×layer association table (no figure)",
     )
     parser.add_argument(
+        "--view",
+        default=None,
+        help=(
+            "Comma-separated STL streams to show: "
+            "original, support, collision, support-collision "
+            "(default: all four). Examples: --view collision  |  "
+            "--view original,support  |  --view support-collision"
+        ),
+    )
+    parser.add_argument(
         "--collision-only",
         action="store_true",
         help=(
-            "Show only collision/shaded regions (phys/ghost/side ribbons "
-            "and side walls); hide panels, creases, and guides"
+            "Legacy alias for --view collision,support-collision "
+            "(hide original + support stock panels)"
         ),
     )
     args = parser.parse_args(argv)
@@ -2265,6 +2791,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             sim["show_panel_ids"] = True
         if args.no_shade_labels:
             sim["show_shade_labels"] = False
+        if args.view is not None:
+            sim["view"] = args.view
         if args.collision_only:
             sim["collision_only"] = True
 
